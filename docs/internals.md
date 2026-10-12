@@ -564,6 +564,54 @@ tells you the 128-bit vectorizer fired), a synthesized 256-bit kernel prints as
 and every function/block parameter list; plain arithmetic prints untyped (`v5 = fadd v1, v2`), so read
 the operand's defining line for its type.
 
+### Typed textual MIR (`--emit=mir-text`, `.mir` input)
+
+`wukong_mir::text` is the form of MIR that reads back. `print_program_typed` prints
+`print_function`'s lines with what a reader needs added:
+
+- a first line `; wukong mir text v1`, and `;` comment lines anywhere;
+- `declare extern "C" fn NAME(i32 signed, ptr) -> i32 signed`, with the C signedness explicit;
+- `static NAME = hex <bytes>` for each `.rodata` blob;
+- parameter promises on the function header, `v0 ptr noalias slice extent=64x4`;
+- `  entry bbK` when the entry block is not `bb0`;
+- `  values N` when the value arena outlives the last defined value;
+- a type on every result, `v7: <4 x f32> = fadd v5, v6`;
+- every float constant as its `f64` bits, `const.f32 0x8000000000000000` (`Display` drops a NaN's
+  payload).
+
+`parse_program` reads it back: ids are kept verbatim (the arena is sized to the largest id plus one,
+or `values N`), blocks must come in id order, and names are split right-anchored, so a generic
+instance such as `f$[f32; 4]` survives. The printer post-processes `print_function` in lockstep and
+asserts its line count, so a layout change in `print.rs` fails loudly instead of producing text the
+parser misreads. A synthesized 256-bit vector-kernel recipe has no textual form: a `veckernel` line
+is a parse error, and `--target-cpu=x86-64-v2` (below x86-64-v3, no recipe is built) gives a
+dumpable program.
+
+`wukongc --emit=mir-text f.wk` prints the optimized program in this form. Given an input ending in
+`.mir`, `wukongc` skips the front end: it parses the file (a syntax error is
+`<file>:<line>: invalid MIR: <msg>`, exit 1), verifies it (an invalid program is the verifier's ICE,
+exit 1), runs the `-O` level's pass list or `--passes` (with `--print-after` and `--verify-each`) and
+prints `--emit=mir` or `--emit=mir-text`, the only two stages a `.mir` input takes. The laws,
+checked per program over the `tests/run` corpus through the binary
+(`crates/wukongc/tests/mir_text.rs`, with `-O2 --target-cpu=x86-64-v2`). Laws 1-2 run on every
+program and laws 3-5, which compile it three more times, on every second one by default;
+`WUKONG_MIR_TEXT_ALL=1` runs all five everywhere, and all five held on all 548 programs when the
+harness landed:
+
+1. `--emit=mir-text` of a dump is the dump, byte for byte;
+2. `--emit=mir` of a dump is the original compile's `--emit=mir`;
+3. `-O0 --passes=<the -O2 list>` is `-O2` (the replica law of "Running a chosen pass list");
+4. `-O2` of the *unoptimized* dump is `-O2` of the program;
+5. the `-O2` list cut in two through a dump (its function passes, then
+   `unroll,slp,form-switches` on the `.mir`) is `-O2`. About a third of those halfway dumps need
+   their `values N` line for this to hold.
+
+Laws 4 and 5 are what make a dump a reproducer: the rest of the pipeline does to the parsed program
+exactly what it did to the original. `wukong_mir`'s own tests round-trip a program with every `Op`
+variant (built through an exhaustive match, so a new variant does not compile there until it is
+covered), every operator kind and terminator, NaN payloads, `-0.0`, `i64::MIN`, statics, signed
+externs and parameter promises.
+
 ## Optimizer
 
 `wukong_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
@@ -652,7 +700,8 @@ Each `-O` level is one such list (`passes::standard_spec`):
 inlining, the loop passes, complete unrolling, SLP, switch formation and tail calls). It makes the
 list syntax an executable specification of the standard pipeline, and it is what catches drift: a
 pass added to `PassManager::standard`, or a new stage in `optimize_preserving`, fails it until
-`standard_spec` and `passes::Step` follow. `-O` still sets the Cranelift level when `--passes` names
+`standard_spec` and `passes::Step` follow; `crates/wukongc/tests/mir_text.rs` checks the same law
+at the CLI for every corpus program. `-O` still sets the Cranelift level when `--passes` names
 the list. On this path `--time-passes` reports the optimize stage as one interval, without the
 per-pass split `optimize_timed` gives.
 

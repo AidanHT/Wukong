@@ -18,6 +18,10 @@ Inspect any stdout-printing stage with `--emit=tokens|ast|mir-high|mir|grad|llvm
 cargo run -p wukongc -- --emit=mir -O3 examples/dot.wk
 ```
 
+`--emit=mir-text` prints the same MIR with every type spelled out, in a form `wukongc` reads back:
+`--emit=mir-text --target-cpu=x86-64-v2 examples/fib.wk > fib.mir`, then
+`--emit=mir --passes=inline,mem2reg,simplify,dce fib.mir` runs a chosen pass list on the dump.
+
 `--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
 them, so the combination is rejected rather than silently discarding half the work.
 

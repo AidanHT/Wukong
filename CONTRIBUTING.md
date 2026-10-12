@@ -231,6 +231,34 @@ multiple-accumulator reduction unroll — computes a different number, which bre
 interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. `wukong_opt::unroll` unrolls without
 reassociating for exactly this reason, and takes the smaller win.
 
+## Debugging an optimizer bug
+
+When `-O0` and `-O2` disagree (`cargo test -p wukongc --test run` names the program), reduce the
+problem to MIR and a pass list:
+
+```sh
+# 1. Dump the unoptimized program in the typed form. Below x86-64-v3 no vector-kernel recipe is
+#    built, and a recipe has no textual form.
+wukongc --emit=mir-text -O0 --target-cpu=x86-64-v2 bug.wk > bug.mir
+# 2. The -O2 list (docs/internals.md, "Running a chosen pass list") reproduces -O2 exactly. Delete
+#    names until the output stops changing: the last one removed is the culprit, or one it feeds.
+wukongc --emit=mir --passes=inline,sroa,mem2reg,simplify,...,form-switches bug.mir
+# 3. Watch it: every run of that pass, per function, on stderr.
+wukongc --emit=mir --passes=<the reduced list> --print-after=licm bug.mir
+# 4. A pass that leaves invalid MIR: --verify-each names it and the function.
+wukongc --emit=mir --passes=<the reduced list> --verify-each bug.mir
+```
+
+A dump is a faithful reproducer: `-O2` of a parsed `-O0` dump, and the `-O2` list cut in two
+through a dump, both equal `-O2` byte for byte over the whole run corpus
+(`crates/wukongc/tests/mir_text.rs`). To cut the program down, delete functions and blocks from the
+`.mir` file itself and re-run step 2 (`wukongc --emit=mir bug.mir` first, to make sure it still
+verifies). The reduced `.mir` and its list are the regression test: a Rust test can read it with
+`wukong_mir::text::parse_program`, run `wukong_driver::passes::run_steps`, and compare the result
+through `wukong_interp`, with no `Builder` code. Any future post-pipeline stage in
+`optimize_preserving` must become a `passes::Step` (see "Adding an optimizer pass"), or step 2 stops
+reproducing `-O2`.
+
 ## Adding a language feature
 
 Prefer to land it end to end: parse → type/shape-check → lower → run via the interpreter, with a

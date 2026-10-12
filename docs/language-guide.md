@@ -2342,8 +2342,12 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
                       aliases: interpreter = interp, cranelift = native, cuda = gpu,
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
---emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
-                      (default: exe)
+--emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | mir-text | grad |
+                      llvm-ir | obj | exe   (default: exe)
+                      mir-text = the optimized MIR with every type, float constant bits, static,
+                      extern signedness and parameter promise spelled out. An input ending in
+                      .mir is such a dump: `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
+                      f.mir` parses, verifies, optimizes and prints it (no other stage, no --run)
 --target-cpu=<c>      native | x86-64 | x86-64-v2 | x86-64-v3 | x86-64-v4   (default: native)
                       instruction-set level for native code (--emit=obj/exe, --backend=native).
                       native = every feature of the compiling host; a named level is exact and

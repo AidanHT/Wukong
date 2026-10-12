@@ -12,13 +12,21 @@
 //!
 //! The replica has no autodiff roots (`inline_program_preserving` is crate-private), so the CLI
 //! refuses both flags on a gradient compile, which always runs the standard pipeline.
+//!
+//! [`compile_mir_text`] is the other half of the tool: it reads a typed MIR dump
+//! (`--emit=mir-text`, `wukong_mir::text`) back, verifies it, runs the `-O` level's list (or
+//! `--passes`) through the same replica, and prints `--emit=mir` or `--emit=mir-text`. An optimizer
+//! bug is then a `.mir` file and a pass list, with no front end in the way.
 
 use std::io::Write as _;
 use std::rc::Rc;
 
+use wukong_diag::Renderer;
 use wukong_mir::{Function, Program};
 use wukong_opt::{CfgAnalyses, Pass, PassManager, VerificationFailure};
-use wukong_span::{Interner, Symbol};
+use wukong_span::{Interner, SourceMap, Symbol};
+
+use crate::{exit, EmitStage, Options};
 
 /// Every function pass `--passes` accepts, by its `Pass::name()`, in standard-pipeline order.
 pub const FUNCTION_PASSES: &[&str] = &[
@@ -192,11 +200,13 @@ fn to_stderr(s: &str) {
 struct Printer {
     filter: String,
     interner: Interner,
+    /// Print the typed form (`--emit=mir-text`) instead of `--emit=mir`'s.
+    typed: bool,
     sink: Sink,
 }
 
 impl Printer {
-    fn new(filter: &str, interner: &Interner, sink: Sink) -> Printer {
+    fn new(filter: &str, interner: &Interner, typed: bool, sink: Sink) -> Printer {
         // Symbols are dense indices in minting order, so re-interning every string in order gives
         // each one the same `Symbol` it has in the original.
         let mut copy = Interner::new();
@@ -208,6 +218,7 @@ impl Printer {
         Printer {
             filter: filter.to_string(),
             interner: copy,
+            typed,
             sink,
         }
     }
@@ -221,7 +232,11 @@ impl Printer {
     fn function(&self, pass: &str, f: &Function, changed: bool) {
         let name = self.interner.resolve(f.name);
         if changed {
-            let text = wukong_mir::print::print_function(f, &self.interner);
+            let text = if self.typed {
+                wukong_mir::text::print_function_typed(f, &self.interner)
+            } else {
+                wukong_mir::print::print_function(f, &self.interner)
+            };
             (self.sink)(&format!("; *** MIR after {pass} (fn {name}) ***\n{text}"));
         } else {
             (self.sink)(&format!(
@@ -231,7 +246,11 @@ impl Printer {
     }
 
     fn program(&self, step: &str, p: &Program) {
-        let text = wukong_mir::print::print_program(p, &self.interner);
+        let text = if self.typed {
+            wukong_mir::text::print_program_typed(p, &self.interner)
+        } else {
+            wukong_mir::print::print_program(p, &self.interner)
+        };
         (self.sink)(&format!("; *** MIR after {step} ***\n{text}"));
     }
 }
@@ -262,13 +281,15 @@ impl Pass for Observed {
 /// after each run of the named function pass, the function it changed (or a one-line
 /// `unchanged` note), and after the named program step, the whole program. The fixpoint driver
 /// skips a pass that has nothing new to see, so a pass runs on a function only as often as the
-/// rest of its group keeps changing it.
+/// rest of its group keeps changing it. `typed` prints the snapshots in the `--emit=mir-text`
+/// form.
 pub fn run_steps(
     program: &mut Program,
     steps: &[Step],
     verify_each: bool,
     print_after: Option<&str>,
     interner: &Interner,
+    typed: bool,
 ) -> Result<(), VerificationFailure> {
     run_steps_to(
         program,
@@ -276,6 +297,7 @@ pub fn run_steps(
         verify_each,
         print_after,
         interner,
+        typed,
         Box::new(to_stderr),
     )
 }
@@ -287,9 +309,10 @@ fn run_steps_to(
     verify_each: bool,
     print_after: Option<&str>,
     interner: &Interner,
+    typed: bool,
     sink: Sink,
 ) -> Result<(), VerificationFailure> {
-    let printer = print_after.map(|filter| Rc::new(Printer::new(filter, interner, sink)));
+    let printer = print_after.map(|filter| Rc::new(Printer::new(filter, interner, typed, sink)));
     if verify_each {
         wukong_opt::verify_program_stage(program, "optimization input")?;
     }
@@ -361,10 +384,98 @@ fn run_steps_to(
     Ok(())
 }
 
+/// `wukongc [--emit=mir|mir-text] [-O<n>] [--passes=..] [--print-after=..] <file>.mir`: read a
+/// typed MIR dump back, verify it, optimize it, and print it. A syntax error is
+/// `<file>:<line>: invalid MIR: <msg>` and an invalid program is the verifier's ICE report, both
+/// exit 1. `wukongc`'s `parse_args` admits only the two MIR stages for a `.mir` input.
+pub(crate) fn compile_mir_text(opts: &Options) -> i32 {
+    let mut timer = crate::report::PassTimer::new(opts);
+    timer.begin("read");
+    let src = match std::fs::read_to_string(&opts.input) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::emit_driver_error(
+                opts,
+                format!("could not read `{}`: {e}", opts.input.display()),
+            );
+            return exit::IO_ERROR;
+        }
+    };
+    timer.begin("parse");
+    let mut interner = Interner::new();
+    let mut program = match wukong_mir::text::parse_program(&src, &mut interner) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::emit_driver_error(
+                opts,
+                format!(
+                    "{}:{}: invalid MIR: {}",
+                    opts.input.display(),
+                    e.line,
+                    e.msg
+                ),
+            );
+            return exit::COMPILE_ERROR;
+        }
+    };
+    drop(src);
+    // Nothing the optimizer could make of an invalid program would mean anything.
+    timer.begin("verify");
+    if crate::verify_or_ice(&program) {
+        return exit::COMPILE_ERROR;
+    }
+    timer.begin("optimize");
+    let spec = opts
+        .passes
+        .as_deref()
+        .unwrap_or_else(|| standard_spec(opts.opt_level));
+    let steps = match parse_spec(spec) {
+        Ok(steps) => steps,
+        Err(e) => {
+            crate::emit_driver_error(opts, format!("--passes: {e}"));
+            return exit::UNIMPLEMENTED;
+        }
+    };
+    let typed = opts.emit == EmitStage::MirText;
+    if let Err(failure) = run_steps(
+        &mut program,
+        &steps,
+        opts.verify_each,
+        opts.print_after.as_deref(),
+        &interner,
+        typed,
+    ) {
+        crate::emit_diag(
+            &crate::optimization_failure_diag(&failure, &interner),
+            opts.error_format,
+            &Renderer::new(opts.color),
+            &SourceMap::new(),
+        );
+        return exit::COMPILE_ERROR;
+    }
+    timer.mir_summary(&program, &interner);
+    timer.begin("emit-mir");
+    let verify_failed = match opts.emit {
+        EmitStage::MirText => crate::emit_mir_text(&program, &interner),
+        EmitStage::Mir => crate::emit_mir(&program, &interner),
+        _ => {
+            crate::emit_driver_error(
+                opts,
+                "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`",
+            );
+            return exit::UNIMPLEMENTED;
+        }
+    };
+    if verify_failed {
+        exit::COMPILE_ERROR
+    } else {
+        exit::OK
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wukong_span::SourceMap;
 
     /// Every name the CLI accepts builds the pass it names.
     #[test]
@@ -486,7 +597,7 @@ mod tests {
                 let steps = parse_spec(standard_spec(level)).unwrap();
                 for verify_each in [false, true] {
                     let mut got = program.clone();
-                    run_steps(&mut got, &steps, verify_each, None, &interner).unwrap();
+                    run_steps(&mut got, &steps, verify_each, None, &interner, false).unwrap();
                     let got = wukong_mir::print::print_program(&got, &interner);
                     assert!(
                         got == want,
@@ -504,11 +615,20 @@ mod tests {
     }
 
     /// Run the -O2 list over `rel` with `--print-after=<filter>`, returning the snapshots.
-    fn snapshots(rel: &str, filter: &str) -> (String, String, String) {
+    fn snapshots(rel: &str, filter: &str, typed: bool) -> (String, String, String) {
         let (program, interner) = lower(rel);
         let steps = parse_spec(standard_spec(2)).unwrap();
         let mut plain = program.clone();
-        run_steps_to(&mut plain, &steps, false, None, &interner, Box::new(|_| {})).unwrap();
+        run_steps_to(
+            &mut plain,
+            &steps,
+            false,
+            None,
+            &interner,
+            false,
+            Box::new(|_| {}),
+        )
+        .unwrap();
         let log = Rc::new(std::cell::RefCell::new(String::new()));
         let sink = Rc::clone(&log);
         let mut watched = program;
@@ -518,6 +638,7 @@ mod tests {
             false,
             Some(filter),
             &interner,
+            typed,
             Box::new(move |s| sink.borrow_mut().push_str(s)),
         )
         .unwrap();
@@ -530,10 +651,11 @@ mod tests {
     }
 
     /// Printing is observation only: a watched run leaves the same MIR. A function pass prints
-    /// the function after each run that changed it; a program step prints the whole program.
+    /// the function after each run that changed it and a note after each run that did not; a
+    /// program step prints the whole program, in the typed form under `--emit=mir-text`.
     #[test]
     fn print_after_prints_the_named_pass_and_changes_nothing() {
-        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "simplify");
+        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "simplify", false);
         assert_eq!(watched, plain);
         assert!(log.starts_with("; *** MIR after simplify (fn "), "{log}");
         let headers: Vec<&str> = log.lines().filter(|l| l.starts_with("; ***")).collect();
@@ -548,12 +670,23 @@ mod tests {
             "{headers:?}"
         );
 
-        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "unroll");
+        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "unroll", false);
         assert_eq!(watched, plain);
         let headers: Vec<&str> = log.lines().filter(|l| l.starts_with("; ***")).collect();
         assert_eq!(headers, ["; *** MIR after unroll ***"]);
 
-        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "all");
+        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "unroll", true);
+        assert_eq!(watched, plain);
+        assert!(
+            log.starts_with("; *** MIR after unroll ***\n; wukong mir text v1\n"),
+            "{log}"
+        );
+        assert!(
+            log.contains(": i32 = "),
+            "a typed snapshot types its results"
+        );
+
+        let (log, plain, watched) = snapshots("tests/run/loop_unroll.wk", "all", false);
         assert_eq!(watched, plain);
         for want in [
             "after inline ***",
@@ -575,11 +708,11 @@ mod tests {
         let mut interner = Interner::new();
         let names = ["main", "f$[f32; 4]", "wukong$rodata$0", "main"];
         let syms: Vec<Symbol> = names.iter().map(|n| interner.intern(n)).collect();
-        let printer = Printer::new("all", &interner, Box::new(|_| {}));
+        let printer = Printer::new("all", &interner, false, Box::new(|_| {}));
         for (sym, name) in syms.iter().zip(names) {
             assert_eq!(printer.interner.resolve(*sym), name);
         }
         assert!(printer.wants("dce") && printer.wants("inline"));
-        assert!(!Printer::new("dce", &interner, Box::new(|_| {})).wants("cse"));
+        assert!(!Printer::new("dce", &interner, true, Box::new(|_| {})).wants("cse"));
     }
 }

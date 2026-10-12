@@ -35,6 +35,8 @@ wukongc --run --backend=native tests/run/tensor_matmul.wk
 wukongc --emit=mir -O2 tests/run/transcendental_kernel.wk   # inspect lowered MIR
 wukongc --emit=mir -O2 --print-after=licm tests/run/saxpy.wk  # MIR after each LICM run
 wukongc --emit=mir --passes=mem2reg,simplify,dce examples/fib.wk  # a chosen pass list
+wukongc --emit=mir-text --target-cpu=x86-64-v2 examples/fib.wk > fib.mir  # MIR that reads back
+wukongc --emit=mir -O2 fib.mir                       # optimize a MIR dump, no front end
 wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
 ```
 
@@ -44,7 +46,9 @@ require building with `--features gpu` and a CUDA device. See `wukongc --help` f
 compile's time went, and `--depfile=<f>` writes a Make dependency rule over the imported files.
 `--passes=<list>` runs a chosen optimizer pass list instead of the `-O` level's, and
 `--print-after=<pass>` prints the MIR to stderr after each run of a named pass (`docs/internals.md`,
-"Running a chosen pass list").
+"Running a chosen pass list"). `--emit=mir-text` prints MIR with every type spelled out, and
+`wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
+(`docs/internals.md`, "Typed textual MIR").
 
 ## Why Wukong
 

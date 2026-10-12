@@ -66,6 +66,10 @@ pub enum EmitStage {
     Check,
     MirHigh,
     Mir,
+    /// The optimized MIR in its typed, parseable form (`--emit=mir-text`, `wukong_mir::text`):
+    /// what `--emit=mir` prints plus every result's type, float constants as bits, the statics,
+    /// the `extern` signedness and the parameter promises. `wukongc <file>.mir` reads it back.
+    MirText,
     /// The **backward** MIR of a designated loss function (reverse-mode autodiff): the forward
     /// function followed by its `{name}_grad` twin (see `--grad-of` / `--grad-wrt`). Additive to
     /// the other stages — it runs after optimization (forcing at least `-O1`, which the autodiff
@@ -84,6 +88,7 @@ impl EmitStage {
             "check" => EmitStage::Check,
             "mir-high" => EmitStage::MirHigh,
             "mir" | "mir-low" => EmitStage::Mir,
+            "mir-text" => EmitStage::MirText,
             "grad" => EmitStage::Grad,
             "llvm-ir" => EmitStage::LlvmIr,
             "obj" => EmitStage::Obj,
@@ -375,6 +380,11 @@ fn source_name(opts: &Options) -> String {
 /// Run the pipeline for `opts`, printing artifacts to stdout and diagnostics to stderr.
 /// Returns a process exit code.
 pub fn compile(opts: &Options) -> i32 {
+    // A typed MIR dump (`--emit=mir-text`) is read back, optimized and printed; it has no front
+    // end, so nothing below applies to it (`passes::compile_mir_text`).
+    if opts.source.is_none() && opts.input.extension().is_some_and(|e| e == "mir") {
+        return passes::compile_mir_text(opts);
+    }
     // Autodiff over a recognition-free program is refused, loudly, before anything else runs: the
     // VJP rules in `wukong_autodiff` are keyed on the recognized kernel calls (`wukong_sgemm` &c),
     // so a taped program built without them meets buffer-writing loops it has no rule for. The
@@ -745,6 +755,7 @@ pub fn compile(opts: &Options) -> i32 {
             opts.verify_each,
             opts.print_after.as_deref(),
             &interner,
+            opts.emit == EmitStage::MirText,
         ) {
             emit_diag(
                 &optimization_failure_diag(&failure, &interner),
@@ -906,10 +917,15 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
 
-    if opts.emit == EmitStage::Mir {
+    if matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
         timer.begin("emit-mir");
         // A verifier failure means we just printed an internal-compiler-error; never report success.
-        return if emit_mir(&program, &interner) {
+        let verify_failed = if opts.emit == EmitStage::MirText {
+            emit_mir_text(&program, &interner)
+        } else {
+            emit_mir(&program, &interner)
+        };
+        return if verify_failed {
             exit::COMPILE_ERROR
         } else {
             exit::OK
@@ -3041,6 +3057,13 @@ fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
     let verify_failed = verify_or_ice(program);
     print_artifact(&wukong_mir::print::print_program(program, interner));
     verify_failed
+}
+
+/// [`emit_mir`]'s typed twin (`--emit=mir-text`): print the parseable form, then verify. A program
+/// the verifier rejects still prints, so the dump shows what is wrong, and the exit is non-zero.
+fn emit_mir_text(program: &wukong_mir::Program, interner: &Interner) -> bool {
+    print_artifact(&wukong_mir::text::print_program_typed(program, interner));
+    verify_or_ice(program)
 }
 
 /// Run the MIR verifier over the program, including internal call signatures, reporting each violation as an

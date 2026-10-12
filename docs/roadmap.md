@@ -911,6 +911,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
   edges: neither works on a gradient compile (the replica has no autodiff roots), `--time-passes`
   does not split the optimize stage per pass on that path, and the cleanup sweeps inside `unroll`
   and `slp` print only as part of their step.
+- Typed textual MIR: `--emit=mir-text` prints MIR that `wukongc <file>.mir` reads back, verifies,
+  optimizes (`-O`, `--passes`) and prints, round-trip-checked over the whole run corpus. Sharp
+  edges: a vector-kernel recipe has no textual form (dump with `--target-cpu=x86-64-v2`), and a
+  `.mir` input only prints MIR — it cannot be run, linked or emitted as LLVM IR or an object yet.
 
 ## GPU backend (NVIDIA, behind `--features gpu`) — RTX 4050 (`sm_89`) and H100 (`sm_90a`)
 

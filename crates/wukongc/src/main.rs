@@ -23,7 +23,12 @@ OPTIONS:
                        read (the root and each import); its target is the -o artifact for
                        --emit=obj/exe, otherwise <f> itself (not with --emit=tokens/ast)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
-                       tokens, ast, check, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
+                       tokens, ast, check, mir-high, mir, mir-text, grad, llvm-ir, obj, exe
+                       (default: exe)
+                       (mir-text = the optimized MIR with every type, float bits and parameter
+                       promise spelled out; `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
+                       f.mir` reads it back, verifies, optimizes and prints it. A .mir input takes
+                       no other stage and no --run)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
                        (check = run lex/parse/imports/sema only, report diagnostics, no lowering)
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
@@ -736,6 +741,29 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
 
+    // A `.mir` input is a typed MIR dump (`--emit=mir-text`): the driver reads it back, optimizes
+    // it and prints MIR. It has no front end to lint or link against, so every other stage — and
+    // running it — is out of scope rather than silently something else.
+    if opts.source.is_none() && opts.input.extension().is_some_and(|e| e == "mir") {
+        if opts.run {
+            return Err(
+                "a `.mir` input cannot be run: it is read only by `--emit=mir` and \
+                 `--emit=mir-text`"
+                    .to_string(),
+            );
+        }
+        if !emit_explicit || !matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
+            return Err(
+                "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`".to_string(),
+            );
+        }
+        if opts.depfile.is_some() {
+            return Err(
+                "`--depfile` needs an import graph, which a `.mir` input has none of".into(),
+            );
+        }
+    }
+
     // The dependency set is the import graph, and these two stages stop before imports are loaded:
     // a depfile written there would silently omit every imported file.
     if opts.depfile.is_some() && matches!(opts.emit, EmitStage::Tokens | EmitStage::Ast) {
@@ -1114,6 +1142,38 @@ mod tests {
             assert!(USAGE.contains(name), "USAGE must list {name}");
         }
         assert!(USAGE.contains("--passes=<list>") && USAGE.contains("--print-after=<p>"));
+    }
+
+    /// `--emit=mir-text` is a stage, and a `.mir` input admits exactly the two MIR stages: no
+    /// other stage, no default `exe`, no `--run`.
+    #[test]
+    fn mir_text_stage_and_mir_input_parse() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--emit=mir-text", "-O2", "p.wk"]).unwrap().unwrap();
+        assert_eq!(o.emit, EmitStage::MirText);
+        for stage in ["mir", "mir-text"] {
+            let emit = format!("--emit={stage}");
+            let o = parse(&[&emit, "-O2", "--passes=dce", "--print-after=dce", "x.mir"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(o.input, PathBuf::from("x.mir"));
+        }
+        for bad in [
+            &["x.mir"][..],
+            &["--run", "x.mir"][..],
+            &["--emit=exe", "x.mir"][..],
+            &["--emit=obj", "-o", "x.o", "x.mir"][..],
+            &["--emit=llvm-ir", "x.mir"][..],
+            &["--emit=mir-high", "x.mir"][..],
+            &["--emit=ast", "x.mir"][..],
+            &["--emit=mir", "--depfile=x.d", "x.mir"][..],
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains(".mir"), "{bad:?}: {err}");
+        }
+        assert!(parse(&["--run", "--emit=mir-text", "p.wk"]).is_err());
+        assert!(parse(&["--emit=mir-text", "-o", "p.txt", "p.wk"]).is_err());
+        assert!(USAGE.contains("mir-text") && USAGE.contains("f.mir"));
     }
 
     #[test]
