@@ -269,7 +269,12 @@ past every length a row pins down). A name bound inside an or-pattern (`mir_buil
 after the arm's test like any other, so some alternative is known to match: the alternatives before
 the last are re-tested in order (a test only loads and compares), each binds its names in a scope of
 its own and branches to a join block with each name's value — a scalar's value, an aggregate's
-address — as block parameters, and the join binds each name once. A guard whose `&&` fold holds an
+address — as block parameters, and the join binds each name once. A `match` arm with a guard
+instead expands its binding or-patterns (`or_pat::expand_binding_ors`, leftmost slowest, at most 64
+combinations) and tries each expansion's test, bindings and guard in turn, joining at the body
+block, as Rust tries a guard once per matching alternative; an `if let` / `while let` match (it has
+a `LetFallthrough` arm) keeps the first rule, since a let chain's `&&` is no guard. A guard whose
+`&&` fold holds an
 `ExprKind::Let` — the later `let`s of an `if let` / `while let` chain — is lowered operand by
 operand (`mir_build::let_chain`): a condition branches to the next operand or the arm's failure
 block, a `let` evaluates its scrutinee, tests it with `pattern_cond` and binds on success into the

@@ -21640,6 +21640,12 @@ impl FnLowerer<'_> {
         } else {
             None
         };
+        // A guard is tried with each alternative of a binding or-pattern, as Rust does — but the
+        // "guard" of an `if let` / `while let` (whose fall-through arm says so) is its chain's
+        // `&&` operands, which see only the first alternative that matched (`or_pat.rs`).
+        let guard_per_alternative = !arms
+            .iter()
+            .any(|a| a.origin == ast::ArmOrigin::LetFallthrough);
         for (i, arm) in arms.iter().enumerate() {
             let unconditional = (matches!(
                 &arm.pat.kind,
@@ -21666,7 +21672,7 @@ impl FnLowerer<'_> {
             self.emit_match_arm_test(
                 &arm.pat,
                 (scrut, &scrut_mir, &scrut_ty),
-                arm.guard.as_ref(),
+                arm.guard.as_ref().map(|g| (g, guard_per_alternative)),
                 body_bb,
                 next_bb,
             );
@@ -21939,14 +21945,26 @@ impl FnLowerer<'_> {
     /// It used to be lowered in the test block and ANDed with the pattern test, so it ran for every
     /// value that reached the arm: `match x { E::A(v) if noisy(v) => .., _ => .. }` called
     /// `noisy` on an `E::B`, with `v` read out of the wrong variant's payload.
+    ///
+    /// `guard` carries whether it is a `match` guard proper, which Rust tries with each
+    /// alternative of a binding or-pattern in turn (`or_pat::emit_guarded_or_arm`:
+    /// `(v, _) | (_, v) if v > 4` takes `v = 5` from `(2, 5)`), rather than an `if let` chain's
+    /// `&&` operands, which see the first alternative that matched.
     fn emit_match_arm_test(
         &mut self,
         pat: &Pattern,
         (scrut, scrut_mir, scrut_ty): (ValueId, &MirType, &Ty),
-        guard: Option<&Expr>,
+        guard: Option<(&Expr, bool)>,
         body_bb: wukong_mir::BlockId,
         next_bb: wukong_mir::BlockId,
     ) {
+        if let Some((g, true)) = guard {
+            if or_pat::has_binding_or(pat) {
+                self.emit_guarded_or_arm(pat, (scrut, scrut_mir, scrut_ty), g, body_bb, next_bb);
+                return;
+            }
+        }
+        let guard = guard.map(|(g, _)| g);
         let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
         let Some(g) = guard else {
             let c = pat_cond.unwrap_or_else(|| {

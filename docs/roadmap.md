@@ -218,8 +218,8 @@ line table built from them is not emitted yet.
   fixed-size array or — as a run-time length test, exhaustive only when every length is covered — a
   `[]T` slice, with **`rest @ ..`** binding a sub-array or sub-slice in place, and or-patterns whose
   alternatives bind the same names at the same types (`E0423` / `E0424` otherwise; the first
-  alternative that matches binds them), each with an optional `if` guard that runs only after its
-  pattern matched.
+  alternative that matches binds them, and a `match` guard is tried with each matching alternative
+  in turn, as in Rust), each with an optional `if` guard that runs only after its pattern matched.
   `if let`, `while let` and `let … else` (whose `else` must diverge) are rewritten by the parser into
   a `match`; `if let P = e && c1 && c2` / `while let P = e && c` put the `&&` chain on the pattern's
   arm as its guard (Rust's let chains: a later `let Q = f` operand tests and binds for the operands

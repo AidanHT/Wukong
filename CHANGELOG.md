@@ -27,8 +27,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `(0, v) | (v, 0) => v` and `[x] | [x, _] => x` now compile; a binding inside an or-pattern was
   `C0001` at the pattern. Every alternative must bind the same names (`E0423`) at the same types
   (`E0424`); the arm reads each name from the first alternative that matches, left to right, as in
-  Rust. The lowering re-tests the alternatives in order after the arm's test passed and joins each
-  name through a block parameter (`tests/run/or_pattern_bindings.wk`,
+  Rust. A `match` guard is tried with each alternative that matches in turn, also as in Rust:
+  `(v, _) | (_, v) if v > 4` takes `v = 5` from `(2, 5)` rather than leaving the arm after
+  `v = 2` fails the guard, and nested binding or-patterns are tried leftmost first; an or-pattern
+  that binds nothing is tested whole, so a guard with side effects can run fewer times than in
+  Rust. The `&&` of an `if let` chain is not a guard and, as in Rust, sees only the first
+  alternative. The lowering re-tests the alternatives in order after the arm's test passed and joins
+  each name through a block parameter, and lowers a guarded arm once per expansion of its binding
+  or-patterns (at most 64; past that the arm is `C0001`) (`tests/run/or_pattern_bindings.wk`,
   `tests/fail/or_pattern_unbound.wk`, `tests/fail/or_pattern_type_mismatch.wk`). Or-patterns also
   bind in `if let`, `while let` and an irrefutable `let`.
 - **`if let` / `while let` chains with more than one `let` (N26).**

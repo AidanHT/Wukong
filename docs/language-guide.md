@@ -727,7 +727,12 @@ must be of that type — `E0401` otherwise, in a `match`, a `let` and a `for` he
 An **or-pattern may bind names** (✅) when every alternative binds the same ones at the same types:
 `Shape::Circle(r) | Shape::Square(r) => r * 10`, `(0, v) | (v, 0) => v`, `[x] | [x, _] => x`. The arm
 reads each name from the **first** alternative that matches, left to right (`(v, 1) | (_, v)`
-against `(5, 1)` binds `v = 5`), and an aggregate name binds in place like any other. A name one
+against `(5, 1)` binds `v = 5`), and an aggregate name binds in place like any other. Under a
+`match` **guard**, as in Rust, the guard is tried with each alternative that matches in turn and the
+arm takes the first that passes: `(v, _) | (_, v) if v > 4 => v` against `(2, 5)` is `5`. Nested
+binding or-patterns are tried leftmost first; an or-pattern that binds nothing is tested whole, so a
+guard with side effects may run fewer times than Rust would run it. The `&&` of an `if let` chain is
+not a guard: `if let (v, _) | (_, v) = (2, 5) && v > 4` binds `v = 2` and fails, as in Rust. A name one
 alternative leaves out is `E0423`, and a name bound at two types (`Num::Int(v) | Num::Real(v)` over
 `i32` and `f32` payloads) is `E0424`; split such alternatives into arms of their own
 (`tests/run/or_pattern_bindings.wk`, `tests/fail/or_pattern_unbound.wk`,

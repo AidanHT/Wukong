@@ -26,11 +26,22 @@
 // EXPECT-OUT: 80
 // EXPECT-OUT: 1
 // EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 53
+// EXPECT-OUT: 0
+// EXPECT-OUT: 82
+// EXPECT-OUT: 0
+// EXPECT-OUT: 6
 module tests.run.or_pattern_bindings
 
 // Names bound inside an or-pattern. Every alternative binds the same names at the same types
 // (E0423, E0424), and the arm reads each name from whichever alternative matched — the FIRST that
-// matches, left to right, as in Rust. An aggregate name binds in place, like any aggregate binding.
+// matches, left to right, as in Rust. A `match` guard is tried with each alternative that matches,
+// in turn, again as in Rust; an `if let` chain's `&&` is no guard and does not retry. An aggregate
+// name binds in place, like any aggregate binding.
 
 enum Shape {
     Circle(i32),
@@ -89,6 +100,33 @@ fn nested(x: (Shape, i32)) -> i32 {
     };
 }
 
+// A guard is tried with each alternative that matches, in order: `(2, 5)` binds `v = 2` from the
+// first alternative, fails `v > 4`, and is tried again as `v = 5` from the second.
+fn later(t: (i32, i32)) -> i32 {
+    return match t {
+        (v, _) | (_, v) if v > 4 => v,
+        _ => 0,
+    };
+}
+
+// Two binding or-patterns: the leftmost varies slowest. `((5, 9), (7, 3))` tries (a, b) = (5, 7),
+// which fails `a > b`, then (5, 3), which passes — before (9, 7) is ever tried.
+fn pairs(t: ((i32, i32), (i32, i32))) -> i32 {
+    return match t {
+        ((a, _) | (_, a), (b, _) | (_, b)) if a > b => a * 10 + b,
+        _ => 0,
+    };
+}
+
+// The `&&` of an `if let` chain is not a guard: it reads the first alternative that matched and
+// nothing retries, so `(2, 5)` binds `v = 2` and the chain fails.
+fn chained(t: (i32, i32)) -> i32 {
+    if let (v, _) | (_, v) = t && v > 4 {
+        return v;
+    }
+    return 0;
+}
+
 // Alternatives over a slice, of different lengths.
 fn ends(s: []i32) -> i32 {
     return match s {
@@ -143,5 +181,16 @@ fn main() -> i32 {
         k = k + 1;
         println(k);
     }
+
+    // A guard retries the alternatives; an `if let` chain does not.
+    println(later((2, 5)));
+    println(later((6, 1)));
+    println(later((7, 9)));
+    println(later((1, 2)));
+    println(pairs(((5, 9), (7, 3))));
+    println(pairs(((1, 2), (3, 4))));
+    println(pairs(((8, 1), (2, 9))));
+    println(chained((2, 5)));
+    println(chained((6, 1)));
     return 0;
 }
