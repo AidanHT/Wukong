@@ -16,13 +16,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   subcommand only as the first argument; compile a file literally named `fmt` as `./fmt`.
 - **It never changes what a program means.** Every output is re-lexed and re-parsed and must give
   the identical AST (NodeIds and symbols compared exactly, spans masked), the same comments in
-  order, and the same identifier and literal tokens, with no parse error or `W0030`/`W0031` lint.
-  Otherwise the file is refused (exit 2) and left untouched. Source text the AST drops — a struct
-  field's or trait method's attributes, an enum's `: u8` repr — is refused for that reason. The
-  whole corpus (`tests/run` with `lib/`, `examples`, `tests/imports`, `tests/warn`, `tests/fail`)
-  formats with zero refusals, and formatting `tests/run` and `examples` leaves every program's
-  `--emit=mir-high -O0` (and the examples' `--emit=mir -O2`) byte-identical. The corpus itself is
-  not reformatted by this change.
+  order, and the same identifier, literal, keyword and `@` tokens, with no parse error or
+  `W0030`/`W0031` lint. Otherwise the file is refused (exit 2) and left untouched. Source text the
+  AST drops is refused for that reason. That covers a struct field's or trait method's attributes,
+  even a bare `@extern` with no identifier in it, and an enum's `: u8` repr. It also covers a
+  `pub` before `import` or `impl`, which the parser accepts and discards, and any keyword or
+  punctuation inside an `extern { .. }` block that is not part of a declaration, which the parser
+  skips without a diagnostic. A `pub` written on a declaration inside a `pub extern` block, and an
+  empty `where`, are kept as written. The whole corpus (`tests/run` with `lib/`, `examples`,
+  `tests/imports`, `tests/warn`, `tests/fail`) formats with zero refusals, and formatting
+  `tests/run` and `examples` leaves every program's `--emit=mir-high -O0` (and the examples'
+  `--emit=mir -O2`) byte-identical. The corpus itself is not reformatted by this change.
 - **New crate `wukong_fmt`** (`format_source`, `FmtOptions { max_width }`, `FmtError::{Syntax,
   Unsupported}`), and **`wukong_lexer::tokenize_with_comments`**, which returns the comments the
   lexer used to discard (`Comment { kind: Line | Block, span }`, `Comment::text`, `Comment::is_doc`);

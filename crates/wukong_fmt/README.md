@@ -26,7 +26,7 @@ same program.
 | `src/lib.rs` | `format_source`, `FmtOptions`, `FmtError`; line endings (CRLF if the input's first line break is CRLF) and a leading BOM |
 | `src/printer.rs` | the printer: exhaustive over every AST enum (no `_ =>` arm), source-preserved spellings, desugar reconstruction, minimal parentheses, wrapping |
 | `src/comments.rs` | comment placement (one cursor, own-line elements, trailing comments) and blank lines |
-| `src/check.rs` | the four self-check laws: (a) clean re-parse, no lint; (b) identical AST, NodeIds included, spans masked; (c) same comments; (d) same identifier/literal tokens |
+| `src/check.rs` | the four self-check laws: (a) clean re-parse, no lint; (b) identical AST, NodeIds included, spans masked; (c) same comments; (d) same identifier, literal, keyword and `@` tokens (every `TokenKind` classified exhaustively) |
 | `src/tests.rs` | golden input/output pairs for every rule, each checked for idempotence; refusals; the self-check's own teeth |
 | `tests/corpus.rs` | every `.wk` in the corpus formats with zero refusals and is a fixed point; comments inserted at token boundaries never cause a refusal |
 

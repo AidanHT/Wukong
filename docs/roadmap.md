@@ -1436,15 +1436,17 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 - **`wukongc fmt` refuses what it cannot reprint, and keeps a few comments only approximately.**
   The formatter never changes a program's meaning (every output must re-parse to the identical AST,
-  keep every comment and every identifier and literal; see `docs/internals.md`, Formatter), so its
-  limits are layout and coverage, never correctness. A comment *inside* an expression moves to the
-  end of that expression's line, and one inside a signature's generics or return type moves into
-  the body. Only signatures, the outermost call or struct literal of a statement, and array
+  keep every comment and every identifier, literal and keyword; see `docs/internals.md`,
+  Formatter), so its limits are layout and coverage, never correctness. A comment *inside* an
+  expression moves to the end of that expression's line, and one inside a signature's generics or
+  return type moves into the body. Only signatures, the outermost call or struct literal of a statement, and array
   literals wrap; a long binary-operator chain, a nested call or an `if` condition stays on one line
   however wide. A file that writes text the AST does not keep is refused (exit 2, untouched): a
-  struct field's or trait method's attributes (`@align(16) x: f32`), and an enum's discriminant repr
-  (`enum E: u8 { .. }`). The corpus and `examples/` are not reformatted yet, so `wukongc fmt --check`
-  on the repository lists files.
+  struct field's or trait method's attributes (`@align(16) x: f32`, `@extern x: f32`), an enum's
+  discriminant repr (`enum E: u8 { .. }`), a `pub` before `import` or `impl` (the parser accepts it
+  and discards it), and any token inside an `extern { .. }` block that is not part of a declaration
+  (the parser skips it silently). The corpus and `examples/` are not reformatted yet, so
+  `wukongc fmt --check` on the repository lists files.
 
 - **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
   `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time

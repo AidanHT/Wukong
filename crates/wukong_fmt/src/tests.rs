@@ -1000,23 +1000,100 @@ fn signatures_calls_struct_literals_and_arrays_wrap_at_max_width() {
 
 #[test]
 fn text_the_ast_drops_is_refused_not_lost() {
-    for src in [
-        "struct S {\n    @align(16) x: f32,\n}\n",
-        "enum E: u8 {\n    A,\n    B,\n}\n",
-        "trait T {\n    @inline fn m(self);\n}\n",
-        "extern {\n    junk fn f();\n}\n",
+    for (src, why) in [
+        ("struct S {\n    @align(16) x: f32,\n}\n", "self-check (d)"),
+        // The repr type also takes a node id, so the enum is caught by (b) first.
+        ("enum E: u8 {\n    A,\n    B,\n}\n", "self-check (b)"),
+        ("trait T {\n    @inline fn m(self);\n}\n", "self-check (d)"),
+        // The printer walks an extern body the way the parser does and refuses first.
+        (
+            "extern {\n    junk fn f();\n}\n",
+            "`junk` inside an `extern` block",
+        ),
     ] {
         match fmt(src) {
-            // The repr type also takes a node id, so the enum is caught by (b) first.
-            Err(FmtError::Unsupported(m)) => {
-                assert!(
-                    m.contains("self-check (b)") || m.contains("self-check (d)"),
-                    "{src}: {m}"
-                );
-            }
+            Err(FmtError::Unsupported(m)) => assert!(m.contains(why), "{src}: {m}"),
             other => panic!("{src}: expected Unsupported, got {other:?}"),
         }
     }
+}
+
+/// Text the AST drops that holds no identifier or literal. A bare `@extern` is an `@` and a
+/// keyword. The parser eats a `pub` before `import` or `impl` and discards it. `parse_extern`
+/// skips keyword or punctuation junk without a diagnostic. None of these takes a node id, so only
+/// a keyword-aware law (d), or the printer, can see them. Each must be refused, never deleted.
+#[test]
+fn keyword_and_punctuation_text_the_ast_drops_is_refused_not_lost() {
+    for (src, why) in [
+        ("struct S {\n    @extern x: f32,\n}\n", "self-check (d)"),
+        ("trait T {\n    @extern fn m(self);\n}\n", "self-check (d)"),
+        ("pub import a.b;\n", "`pub import`"),
+        ("@inline pub import a.b;\n", "`pub import`"),
+        ("pub impl V {}\n", "`pub impl`"),
+        (
+            "extern {\n    ; fn f();\n}\n",
+            "`;` inside an `extern` block",
+        ),
+        (
+            "extern {\n    fn f();;\n}\n",
+            "`;` inside an `extern` block",
+        ),
+        (
+            "extern {\n    fn f() {} ;\n}\n",
+            "`;` inside an `extern` block",
+        ),
+        (
+            "extern {\n    fn f(); struct\n}\n",
+            "`struct` inside an `extern` block",
+        ),
+        (
+            "extern {\n    @extern fn f();\n}\n",
+            "`@` inside an `extern` block",
+        ),
+        (
+            "pub extern {\n    pub pub fn f();\n}\n",
+            "`pub` inside an `extern` block",
+        ),
+    ] {
+        match fmt(src) {
+            Err(FmtError::Unsupported(m)) => assert!(m.contains(why), "{src}: {m}"),
+            other => panic!("{src}: expected Unsupported, got {other:?}"),
+        }
+    }
+}
+
+/// What the refusals above must not catch: every declaration shape `parse_extern` accepts,
+/// including a `where` clause, a trailing `,` after it, an `= e` body and a block body.
+#[test]
+fn extern_declarations_of_every_shape_are_covered() {
+    golden(
+        "extern {
+    fn a<T: A>(x: T) -> T where T: B, N > 0,;
+    fn b() where;
+    fn c() -> i32 = (1);
+    fn d() = 2
+    fn e() {}
+    fn g(x: (i32),) -> (f32)
+}
+",
+        "extern {
+    fn a<T: A>(x: T) -> T where T: B, N > 0;
+    fn b() where;
+    fn c() -> i32 = 1;
+    fn d() = 2;
+    fn e() {}
+    fn g(x: (i32)) -> (f32);
+}
+",
+    );
+}
+
+/// A `pub` written on a declaration inside a `pub extern { .. }` is kept as written: the block's
+/// own `pub` already exports every declaration, so the AST cannot tell the two apart, and dropping
+/// one would delete source text.
+#[test]
+fn a_pub_written_inside_a_pub_extern_block_is_kept() {
+    fixed("pub extern {\n    pub fn f();\n    fn g();\n}\n");
 }
 
 #[test]
@@ -1064,4 +1141,43 @@ fn each_self_check_law_rejects_a_wrong_output() {
     // (d) `vec[f32, 8]` is the same AST as `f32x8`, but not the same source tokens.
     let e = check("// c\nfn f(a: (i32), b: vec[f32, 8]) -> i32 {\n    return a;\n}\n").unwrap_err();
     assert!(e.contains("self-check (d)"), "{e}");
+}
+
+/// Law (d) counts keywords and `@`, not only identifiers and literals: each output below re-parses
+/// to the same AST as its source, so only (d) can see the text it lost, and it must name it.
+#[test]
+fn law_d_sees_a_lost_keyword_or_at_sign() {
+    use crate::check::{self_check, Original};
+    for (src, out, lost) in [
+        // Both tokens are lost; (d) names the first in sorted order.
+        (
+            "struct S {\n    @extern x: f32,\n}\n",
+            "struct S {\n    x: f32,\n}\n",
+            "extern",
+        ),
+        ("pub import a.b;\n", "import a.b;\n", "pub"),
+        ("pub impl V {}\n", "impl V {}\n", "pub"),
+        ("fn f() where {}\n", "fn f() {}\n", "where"),
+        (
+            "pub extern {\n    pub fn f();\n}\n",
+            "pub extern {\n    fn f();\n}\n",
+            "pub",
+        ),
+    ] {
+        let (tokens, comments, _) = wukong_lexer::tokenize_with_comments(src, SourceId(0));
+        let mut interner = wukong_span::Interner::new();
+        let parsed = wukong_parser::parse_module_tokens_with_lints(&tokens, src, &mut interner, 0);
+        assert!(parsed.diags.is_empty(), "{src}: {:?}", parsed.diags);
+        let orig = Original {
+            src,
+            tokens: &tokens,
+            comments: &comments,
+            module: &parsed.module,
+            source: SourceId(0),
+        };
+        assert_eq!(self_check(&orig, &mut interner, src), Ok(()), "{src}");
+        let e = self_check(&orig, &mut interner, out).unwrap_err();
+        assert!(e.contains("self-check (d)"), "{src}: {e}");
+        assert!(e.contains(&format!("`{lost}`")), "{src}: {e}");
+    }
 }

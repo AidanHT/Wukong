@@ -440,6 +440,24 @@ impl<'a> Printer<'a> {
     fn item(&mut self, it: &Item, methods: &[Item], next_lo: u32) {
         self.leading(it.span.lo);
         let body_lo = self.attrs_line(&it.attrs, it.span.lo);
+        // `parse_item` eats a `pub` before any item, but `import` and `impl` do not store it.
+        let pub_dropped = match &it.kind {
+            ItemKind::Import(_) => Some("import"),
+            ItemKind::Impl(_) => Some("impl"),
+            ItemKind::Fn(_)
+            | ItemKind::Struct(_)
+            | ItemKind::Enum(_)
+            | ItemKind::Const(_)
+            | ItemKind::Extern(_)
+            | ItemKind::Trait(_)
+            | ItemKind::TypeAlias(_) => None,
+        };
+        if let Some(kw) = pub_dropped.filter(|_| self.s.kind_at(body_lo) == Some(T::Pub)) {
+            self.unsupported(format!(
+                "`pub {kw}`: the parser accepts a `pub` here but does not store it"
+            ));
+            return;
+        }
         match &it.kind {
             ItemKind::Fn(f) => self.fn_decl(f, &f.name),
             ItemKind::Struct(d) => self.struct_decl(d, it.span),
@@ -696,6 +714,13 @@ impl<'a> Printer<'a> {
             Some(T::LBrace) => {
                 let open = after.map(|t| t.span.lo).unwrap_or(kw.span.hi);
                 let close = span.hi - 1;
+                if let Some(junk) = self.extern_junk(open, close, &x.items) {
+                    let text = self.s.text(junk).to_string();
+                    self.unsupported(format!(
+                        "`{text}` inside an `extern` block: the parser skips it without storing it"
+                    ));
+                    return;
+                }
                 if x.items.is_empty() && !self.s.has_comment_in(open, close) {
                     self.w("{}");
                     return;
@@ -708,8 +733,10 @@ impl<'a> Printer<'a> {
                     self.leading(starts[k]);
                     let mut g = f.clone();
                     if outer_pub {
-                        // The block's `pub` exports every declaration in it already.
-                        g.is_pub = false;
+                        // The block's `pub` exports every declaration in it already, so the AST
+                        // marks them all `pub`. Print a declaration's own `pub` only where it was
+                        // written: the AST cannot tell, and dropping it would delete source text.
+                        g.is_pub = self.s.kind_at(starts[k]) == Some(T::Pub);
                     }
                     self.fn_decl(&g, &f.name);
                     let end = self.end_before(next);
@@ -731,6 +758,88 @@ impl<'a> Printer<'a> {
                 }
             }
         }
+    }
+
+    /// The first token between an `extern` block's `{` (at `open`) and `}` (at `close`) that no
+    /// declaration covers. `parse_extern` skips any token that does not start a declaration and
+    /// reports nothing, so the AST keeps no trace of it, and printing the block would delete it.
+    /// This walks the body the way that loop does: an optional `pub` directly before `fn`, then
+    /// the declaration `parse_fn` reads, then the next. A declaration whose extent cannot be
+    /// worked out counts as uncovered, so the block is refused rather than guessed at.
+    fn extern_junk(&self, open: u32, close: u32, items: &[FnDecl]) -> Option<Span> {
+        let mut decls = items.iter();
+        let mut i = self.s.tok_from(open + 1);
+        loop {
+            let t = *self.s.tokens.get(i)?;
+            if t.span.lo >= close || t.kind == T::Eof {
+                // Every declaration in the AST must have been walked over.
+                return decls.next().map(|_| t.span);
+            }
+            let fn_at = match self.s.tokens.get(i + 1) {
+                Some(n) if t.kind == T::Pub && n.kind == T::Fn => i + 1,
+                _ => i,
+            };
+            if self.s.tokens[fn_at].kind != T::Fn {
+                return Some(t.span);
+            }
+            let Some(f) = decls.next() else {
+                return Some(t.span);
+            };
+            let named_here = self
+                .s
+                .tokens
+                .get(fn_at + 1)
+                .is_some_and(|n| n.span.lo == f.name.span.lo);
+            match self.fn_decl_end(f) {
+                Some(end) if named_here && end > t.span.lo => i = self.s.tok_from(end),
+                _ => return Some(t.span),
+            }
+        }
+    }
+
+    /// Where the declaration `parse_fn` read for `f` ends: after its `{ .. }` body; after its
+    /// `= e` body and the optional `;`; or, with no body, after its signature and the optional `;`.
+    fn fn_decl_end(&self, f: &FnDecl) -> Option<u32> {
+        let semi = |p: u32| match self.s.tok_after(p) {
+            Some(t) if t.kind == T::Semi => t.span.hi,
+            _ => p,
+        };
+        if let Some(b) = &f.body {
+            return Some(match b.tail.as_deref() {
+                Some(t) if b.stmts.is_empty() && b.span == t.span => semi(b.span.hi),
+                _ => b.span.hi,
+            });
+        }
+        let mut end = match &f.ret {
+            Some(r) => r.span.hi,
+            None => self.param_parens(f)?.1 + 1,
+        };
+        if let Some(w) = self.where_kw(f) {
+            end = w.span.hi;
+            for g in &f.generics {
+                for b in g.bounds.iter().filter(|b| b.span.lo >= g.span.hi) {
+                    end = end.max(b.span.hi);
+                }
+            }
+            for p in &f.where_preds {
+                end = end.max(p.span.hi);
+            }
+            // The clause's loop eats one `,` after each entry, so a trailing one is the clause's.
+            if let Some(c) = self.s.tok_after(end).filter(|c| c.kind == T::Comma) {
+                end = c.span.hi;
+            }
+        }
+        Some(semi(end))
+    }
+
+    /// The `where` keyword of `f`'s clause, if it has one: the token after its return type, or
+    /// after its parameter list's `)` when there is no return type.
+    fn where_kw(&self, f: &FnDecl) -> Option<Token> {
+        let after = match &f.ret {
+            Some(r) => r.span.hi,
+            None => self.param_parens(f)?.1 + 1,
+        };
+        self.s.tok_after(after).filter(|t| t.kind == T::Where)
     }
 
     // ---- Functions ----
@@ -785,6 +894,11 @@ impl<'a> Printer<'a> {
             entries.push((p.span.lo, W::Pred(p)));
         }
         if entries.is_empty() {
+            // `fn f() where { .. }` parses, to the same AST as no clause at all; keep the keyword
+            // rather than delete it.
+            if self.where_kw(f).is_some() {
+                self.w(" where");
+            }
             return;
         }
         entries.sort_by_key(|(lo, _)| *lo);

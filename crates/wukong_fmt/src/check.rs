@@ -6,10 +6,12 @@
 //!   original's once every span is masked (`lo..hi@src` → `_`). NodeIds and symbols are compared
 //!   exactly, so a reformat that would renumber a node, or intern a different name, is caught.
 //! - **(c) It has the same comments**, in the same order, with the same text.
-//! - **(d) It has the same identifier and literal tokens** (sorted multiset of `Ident`, `Int`,
-//!   `Float`, `Str`, `Char` and `Label` texts). This catches source text the AST does not keep: a
-//!   struct field's or trait method's attributes, an enum's discriminant repr, tokens skipped
-//!   inside an `extern` block.
+//! - **(d) It has the same identifier, literal, keyword and `@` tokens** (the sorted multiset of
+//!   `Ident`, `Int`, `Float`, `Str`, `Char` and `Label` texts, every keyword, and `@`). This catches
+//!   source text the AST does not keep: a struct field's or trait method's attributes (a bare
+//!   `@extern` holds no identifier at all), an enum's discriminant repr, a `pub` the parser
+//!   discards before `import` or `impl`, and keyword tokens skipped inside an `extern` block.
+//!   Punctuation is not counted; the printer refuses punctuation junk in an `extern` block itself.
 //!
 //! A failure names the law and about 80 characters of context. These laws are never relaxed to
 //! let a file through: the printer is fixed instead, or the file stays refused.
@@ -92,15 +94,7 @@ pub(crate) fn self_check(
         let mut v: Vec<(u8, String)> = ts
             .iter()
             .filter_map(|t| {
-                let k = match t.kind {
-                    TokenKind::Ident => 0,
-                    TokenKind::Int => 1,
-                    TokenKind::Float => 2,
-                    TokenKind::Str => 3,
-                    TokenKind::Char => 4,
-                    TokenKind::Label => 5,
-                    _ => return None,
-                };
+                let k = law_d_class(t.kind)?;
                 Some((k, src[t.span.lo as usize..t.span.hi as usize].to_string()))
             })
             .collect();
@@ -108,20 +102,146 @@ pub(crate) fn self_check(
         v
     };
     let (tw, tg) = (multiset(orig.src, orig.tokens), multiset(out, &tokens));
-    if tw != tg {
-        let missing = tw.iter().find(|t| !tg.contains(t));
-        let extra = tg.iter().find(|t| !tw.contains(t));
-        let what = match (missing, extra) {
-            (Some(m), _) => format!("`{}` is missing from the output", m.1),
-            (None, Some(x)) => format!("`{}` was added to the output", x.1),
-            (None, None) => "a token occurs a different number of times".to_string(),
-        };
+    if let Some((text, want, got)) = first_count_difference(&tw, &tg) {
         return Err(format!(
-            "self-check (d) failed: the identifier/literal tokens differ: {what} (the AST does \
-             not keep some source text here)"
+            "self-check (d) failed: `{text}` occurs {want} time(s) in the source but {got} in the \
+             output (the AST does not keep some source text here)"
         ));
     }
     Ok(())
+}
+
+/// The tokens law (d) counts, by class: identifiers, literals, labels, every keyword, and `@`.
+/// These are what the printer must reproduce exactly. A keyword or an `@` can carry text the AST
+/// never stores: a bare `@extern` field attribute, a `pub` the parser discards before `import`, a
+/// keyword `parse_extern` skips. Punctuation, delimiters and operators are not counted: the
+/// printer adds and removes `;`, `,` and parentheses as the canonical style requires, and law (b)
+/// covers what they mean.
+///
+/// The match is exhaustive with no `_ =>` arm, so a new token kind fails this crate's build until
+/// it is classified here.
+fn law_d_class(k: TokenKind) -> Option<u8> {
+    use TokenKind as T;
+    Some(match k {
+        T::Ident => 0,
+        T::Int => 1,
+        T::Float => 2,
+        T::Str => 3,
+        T::Char => 4,
+        T::Label => 5,
+        T::Fn
+        | T::Let
+        | T::Mut
+        | T::If
+        | T::Else
+        | T::While
+        | T::For
+        | T::In
+        | T::Loop
+        | T::Match
+        | T::Return
+        | T::Break
+        | T::Continue
+        | T::Struct
+        | T::Enum
+        | T::Impl
+        | T::Trait
+        | T::Module
+        | T::Import
+        | T::As
+        | T::Const
+        | T::Defer
+        | T::Pub
+        | T::Extern
+        | T::Step
+        | T::Where
+        | T::True
+        | T::False => 6,
+        T::At => 7,
+        T::LParen
+        | T::RParen
+        | T::LBrace
+        | T::RBrace
+        | T::LBracket
+        | T::RBracket
+        | T::Comma
+        | T::Semi
+        | T::Colon
+        | T::ColonColon
+        | T::Dot
+        | T::DotDot
+        | T::DotDotEq
+        | T::Arrow
+        | T::FatArrow
+        | T::Question
+        | T::Plus
+        | T::Minus
+        | T::Star
+        | T::Slash
+        | T::Percent
+        | T::Amp
+        | T::Pipe
+        | T::Caret
+        | T::Bang
+        | T::Tilde
+        | T::Shl
+        | T::Shr
+        | T::AmpAmp
+        | T::PipePipe
+        | T::Eq
+        | T::EqEq
+        | T::Ne
+        | T::Lt
+        | T::Le
+        | T::Gt
+        | T::Ge
+        | T::PlusEq
+        | T::MinusEq
+        | T::StarEq
+        | T::SlashEq
+        | T::PercentEq
+        | T::AmpEq
+        | T::PipeEq
+        | T::CaretEq
+        | T::ShlEq
+        | T::ShrEq
+        | T::Eof
+        | T::Error => return None,
+    })
+}
+
+/// The first token text (in sorted order) whose count differs between two sorted multisets, with
+/// its count in each.
+fn first_count_difference(
+    want: &[(u8, String)],
+    got: &[(u8, String)],
+) -> Option<(String, usize, usize)> {
+    let count = |v: &[(u8, String)], at: usize| v[at..].iter().take_while(|t| **t == v[at]).count();
+    let (mut i, mut j) = (0, 0);
+    while i < want.len() || j < got.len() {
+        let next = match (want.get(i), got.get(j)) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let w = if want.get(i) == Some(next) {
+            count(want, i)
+        } else {
+            0
+        };
+        let g = if got.get(j) == Some(next) {
+            count(got, j)
+        } else {
+            0
+        };
+        if w != g {
+            return Some((next.1.clone(), w, g));
+        }
+        i += w;
+        j += g;
+    }
+    None
 }
 
 /// Replace every `Span` debug rendering (`lo..hi@src`, or `<dummy>`) with `_`.
@@ -194,7 +314,51 @@ fn clip(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_spans;
+    use super::{first_count_difference, law_d_class, mask_spans};
+    use wukong_lexer::TokenKind;
+
+    /// `@` and every keyword are counted (a bare `@extern` holds no identifier); punctuation is
+    /// not, because the printer adds and removes it.
+    #[test]
+    fn law_d_counts_keywords_and_at_but_not_punctuation() {
+        for k in [
+            TokenKind::At,
+            TokenKind::Extern,
+            TokenKind::Pub,
+            TokenKind::Where,
+        ] {
+            assert!(law_d_class(k).is_some(), "{k:?}");
+        }
+        for k in [
+            TokenKind::Semi,
+            TokenKind::Comma,
+            TokenKind::LParen,
+            TokenKind::Eof,
+        ] {
+            assert!(law_d_class(k).is_none(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn a_count_difference_names_the_token_and_both_counts() {
+        let v = |xs: &[(u8, &str)]| -> Vec<(u8, String)> {
+            xs.iter().map(|(k, s)| (*k, s.to_string())).collect()
+        };
+        let a = v(&[(0, "x"), (6, "pub"), (6, "pub"), (7, "@")]);
+        assert_eq!(first_count_difference(&a, &a), None);
+        assert_eq!(
+            first_count_difference(&a, &v(&[(0, "x"), (6, "pub"), (7, "@")])),
+            Some(("pub".to_string(), 2, 1))
+        );
+        assert_eq!(
+            first_count_difference(&a, &v(&[(0, "x"), (6, "pub"), (6, "pub")])),
+            Some(("@".to_string(), 1, 0))
+        );
+        assert_eq!(
+            first_count_difference(&v(&[(0, "x")]), &v(&[(0, "x"), (0, "y")])),
+            Some(("y".to_string(), 0, 1))
+        );
+    }
 
     #[test]
     fn spans_are_masked_and_nothing_else() {

@@ -2,9 +2,9 @@
 //!
 //! An AST pretty-printer that keeps comments. Its one guarantee is that it never changes what a
 //! program means: every result is re-lexed and re-parsed and must reproduce the input's AST
-//! exactly (NodeIds included, spans aside), every comment in order, and every identifier and
-//! literal token. When any of that fails the source is refused with [`FmtError::Unsupported`] and
-//! nothing is rewritten — the formatter never emits a guess.
+//! exactly (NodeIds included, spans aside), every comment in order, and every identifier, literal,
+//! keyword and `@` token. When any of that fails the source is refused with
+//! [`FmtError::Unsupported`] and nothing is rewritten — the formatter never emits a guess.
 //!
 //! The pipeline ([`format_source`]):
 //!

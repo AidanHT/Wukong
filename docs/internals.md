@@ -2267,12 +2267,28 @@ before `}`.
 2. **(b)** the re-parsed module's `Debug` equals the original's with every span masked — NodeIds
    and symbols compared exactly, so a renumbered node or a different name is caught;
 3. **(c)** the comment texts are identical, in order;
-4. **(d)** the sorted multiset of `Ident`/`Int`/`Float`/`Str`/`Char`/`Label` token texts is
-   identical — the law for source text the AST drops: a struct field's or trait method's
-   attributes, an enum's discriminant repr (`enum E: u8`), tokens skipped inside an `extern` block.
+4. **(d)** the sorted multiset of `Ident`/`Int`/`Float`/`Str`/`Char`/`Label` token texts, every
+   keyword and every `@` is identical. This is the law for source text the AST drops and no
+   `NodeId` records: a struct field's or trait method's attributes (a bare `@extern` is an `@` and
+   a keyword, with no identifier in it), an enum's discriminant repr (`enum E: u8`), the `pub` that
+   `parse_item` eats and discards before `import` and `impl`, and keywords skipped inside an
+   `extern` block. Punctuation is not counted, because the printer adds and removes `;`, `,` and
+   parentheses on purpose. `check.rs` classifies every `TokenKind` in an exhaustive match, so a new
+   token kind fails the build until someone decides whether (d) counts it.
 
-The message names the first failing law with about 80 characters of context. These laws are never
-relaxed to let a file through; the printer is fixed instead, or the file stays refused.
+The message names the first failing law with about 80 characters of context (for (d), the token and
+its count on each side). These laws are never relaxed to let a file through; the printer is fixed
+instead, or the file stays refused.
+
+Two kinds of dropped text are refused by the printer before the self-check runs, with a message
+naming the construct. A `pub` before `import` or `impl` is one. The other is any token in an
+`extern { .. }` body that no declaration covers: `parse_extern` skips such tokens without a
+diagnostic, so the printer walks the body as that loop does (an optional `pub` before `fn`, then
+the declaration through its body or signature and the optional `;`). This catches punctuation
+junk, which law (d) cannot see. To satisfy law (d), the printer keeps two spellings the AST cannot
+distinguish. A `pub` written on a declaration inside a `pub extern { .. }` stays, even though the
+block's `pub` already exports it. An empty `where` (`fn f() where { .. }`) is kept rather than
+deleted.
 
 **Adding syntax means extending `wukong_fmt` in the same commit.** The exhaustive matches fail the
 build on a new AST variant, and `crates/wukong_fmt/tests/corpus.rs` — every `.wk` under `tests/run`

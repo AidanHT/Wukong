@@ -1,9 +1,9 @@
 //! `wukongc fmt` — format Wukong source files with `wukong_fmt`.
 //!
 //! The formatter refuses rather than change a program's meaning: a file it cannot reprint with an
-//! identical AST, the same comments and the same identifier/literal tokens is left untouched and
-//! reported (exit 2). Files are rewritten only when their formatted text differs, through a
-//! `<file>.fmt.tmp` written next to the file and renamed over it.
+//! identical AST, the same comments and the same identifier, literal and keyword tokens is left
+//! untouched and reported (exit 2). Files are rewritten only when their formatted text differs,
+//! through a `<file>.fmt.tmp` written next to the file and renamed over it.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -30,8 +30,8 @@ OPTIONS:
     -h, --help  Print this help
 
 The formatter never changes what a program means: every result is re-parsed and must give the
-identical AST, keep every comment, and keep every identifier and literal. A file it cannot prove
-that for is left unchanged and reported.
+identical AST, keep every comment, and keep every identifier, literal and keyword. A file it cannot
+prove that for is left unchanged and reported.
 
 EXIT CODES:
     0  every file is formatted (or was rewritten)
