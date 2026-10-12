@@ -133,7 +133,8 @@ line table built from them is not emitted yet.
   (`tests/run/turbofish_runtime_snapshot.wk`, `tests/fail/turbofish_runtime_two_reads.wk`). With it:
   a call compares, never re-binds, a callee dimension already bound to one of the caller's (`dot(a,
   b)` over `Tensor[i32, P]` and `Tensor[i32, Q]` checked clean and read past `b`;
-  `tests/fail/call_two_generic_dims.wk`); a turbofish dimension must
+  `tests/fail/call_two_generic_dims.wk`); a local that reuses a generic dimension's name no longer
+  changes that dimension's extents (`tests/run/generic_dim_shadowed.wk`); a turbofish dimension must
   be an integer (`E0401`); and the canonicalizer counts a turbofish as a
   mention of the local it reads (it sank `let mut n = 3;` below `f::<n>(..)`, a `C0001`, or a read of
   an outer `n`).

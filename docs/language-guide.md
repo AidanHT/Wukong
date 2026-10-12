@@ -1074,7 +1074,10 @@ hidden runtime `i64` parameters, so `a[i, j]`'s row stride (`i*N + j`, with `N` 
 the loop bounds (`0..M`) resolve at run time, and a turbofish supplies them (`add::<2, 3>(…)`)
 (`tests/run/generic_shape.wk`). Because the symbolic address arithmetic matches the constant-shape
 form, it is byte-identical to the same kernels written with literal dims — and even a matmul with
-runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.wk`).
+runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.wk`). A local may
+reuse a generic dimension's name (`let N = 2;` in `fn f<N>(..)`): the name in an *expression* is then
+the local, but `N` in a *type* is still the generic, so the extents and strides of `f`'s tensors do not
+change (`tests/run/generic_dim_shadowed.wk`).
 
 The turbofish also accepts a **runtime integer value**, not just a literal: `rowsum::<m, n>(a, out)`
 with `n` computed at run time threads the live value through the same hidden dim parameters, so a

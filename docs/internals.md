@@ -605,8 +605,9 @@ in `SemaResult::dim_snapshots`. Every shape the call returns names that symbol, 
 another read only when both read that one binding. `lower_call` reads each such local before the
 call's arguments into an `i64` slot bound under the symbol in the function's outermost scope (zeroed
 in the entry block), and `call_dim_args` passes the slot's value as the hidden dimension.
-`dim_var_value` resolves a type's dimension through that slot, so neither a later assignment nor a
-shadowing of `n` changes an extent or a stride. The canonicalizer's mention tests
+`dim_var_value` resolves a type's dimension, and takes a function's own generic from the outermost
+scope `bind_dim_params` bound it in, so neither a later assignment of `n` nor a local that shadows `n`
+or a generic's name changes an extent or a stride. The canonicalizer's mention tests
 (`expr_mentions`, `canon`'s use scan) count a turbofish name as a read of the local it names.
 
 The **verifier** (`wukong_mir::verify`) enforces true SSA plus per-op typing: every value is defined

@@ -124,9 +124,24 @@ fn expr_rebinds(e: &Expr, name: Symbol) -> bool {
 
 impl FnLowerer<'_> {
     /// A dimension variable's run-time value as an `i64`: its binding (a hidden dimension parameter,
-    /// or any local of that name the shape refers to), coerced.
+    /// or a run-time turbofish value's slot, `turbofish.rs`), coerced.
+    ///
+    /// A dimension in a TYPE names one of this function's generics, which `bind_dim_params` bound
+    /// in the outermost scope, never a local the body declares later under the same name: sema
+    /// resolves `Tensor[i32, N]` to the generic whatever is in scope. Looked up innermost-first, a
+    /// `let N = 2;` in `fn g<N>(a: Tensor[i32, N])` made every later `a.dim(0)` and every bound on
+    /// `a` read 2.
     pub(crate) fn dim_var_value(&mut self, sym: Symbol) -> Option<ValueId> {
-        let (slot, ty) = self.lookup(sym)?;
+        let own = self
+            .scopes
+            .first()
+            .filter(|_| self.type_params.contains(&sym))
+            .and_then(|s| s.get(&sym))
+            .cloned();
+        let (slot, ty) = match own {
+            Some(b) => b,
+            None => self.lookup(sym)?,
+        };
         let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
         Some(self.coerce_to(v, &ty, &MirType::I64, true))
     }

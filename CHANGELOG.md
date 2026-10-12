@@ -25,6 +25,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `b` (interpreter 14, native garbage). It is `E0502` now (`tests/fail/call_two_generic_dims.wk`), as
   is a caller's generic passed by turbofish against an array of a fixed length; a run-time turbofish
   value against a fixed length stays the caller's claim, as before.
+- **A local named like a generic dimension no longer changes it.** `let N = 2;` in `fn f<N>(a:
+  Tensor[i32, N])` made every later extent and stride of `a` read 2 (`a.dim(0)` printed 2); a type's
+  `N` is the generic again (`tests/run/generic_dim_shadowed.wk`).
 - **A turbofish dimension names an integer.** A float local (`first::<x>(a)` with `x = 2.5`) was
   converted and ran with `N = 2`; it is `E0401` (`tests/fail/turbofish_dim_not_integer.wk`).
 - **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
