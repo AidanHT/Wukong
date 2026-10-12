@@ -1677,12 +1677,18 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **What the general MIR loop vectorizer still leaves scalar** (`wukong_opt::vectorize`): a loop
   stepping by anything but `+1` or `-1`, and a negative stride on an ascending counter
   (`x[n - 1 - i]`); a strided access outside a *complete* interleave group (a gap, or a stride above
-  4), or any interleave group in a countdown; a scatter (a store through a data-dependent index); and a gather whose
+  4), or any interleave group in a countdown; a scatter (a store through a data-dependent index)
+  that something else in the loop may touch — a read-modify-write histogram (`h[q[i]] += x`), two
+  scatters into one object, a scatter beside another access of its object, a scatter in an `if`
+  arm, a checked scatter, or an unpromised destination (when nothing else can touch the object, a
+  `@noalias` destination or a local table, the loop widens around the store, which runs once per
+  lane in iteration order: 2026-10-12, `gap5/vectorizer-scatter-slp`); and a gather whose
   index is bounds-checked (a checked slice keeps a data-dependent check no guard can cover — the
   gather widens from an array, or under `@unchecked`) or whose object a store in the loop may reach
   (two unpromised slices may be one buffer). Replication is a heuristic, not a measurement: a body
   whose only work is the replicated step (`o[i] = lut[q[i]]`, `o[i] = x[i] as i64` from `f64`)
-  stays scalar, and no AVX2 `vgatherdps` is ever emitted. None of these forms has been timed.
+  stays scalar, and every replicated gather or scatter lane is still a scalar load or store: no AVX2
+  `vgatherdps` is ever emitted. None of these forms has been timed.
 - **An aliased call to a recognized kernel means what the source loop means.** Every multi-buffer
   recognizer emit site — GEMM in all its forms, GEMV/GEVM, transpose, pooling, the column/row/arg
   reductions, the losses, the norm backwards, RoPE, the scans, embedding/scatter, the fused norms,
