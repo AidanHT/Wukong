@@ -54,7 +54,17 @@
 //! lane's own operands, and its results are packed for the widened steps that read them. A scatter's
 //! `W` stores go out in lane order, which is iteration order, so of two lanes that write one element
 //! the later iteration lands last — the scalar loop's answer, given that nothing else in the loop
-//! touches the scattered object (`loop_info::dependence`).
+//! touches the scattered object (`loop_info::dependence`). A call to a side-effect-free function is
+//! replicated the same way ([`Plan::Call`], [`call_verdict`]).
+//!
+//! When something else in the loop may touch a gathered or scattered object — a read-modify-write
+//! histogram, two scatters into one object, a gather beside a store it may read — no vector order is
+//! the scalar loop's, but one order is: lane by lane. Those accesses, and every step reading what
+//! they computed, run lane 0's, then lane 1's, ... ([`SerialRegion`]), while the rest of the body
+//! stays wide. A body that checks a gathered index on every iteration tests the group's indices at
+//! once and hands a failing group to the scalar loop ([`linearize_spine`]). A two-deep nest whose
+//! inner loop carries a row's own float sum or recurrence is widened across its rows instead
+//! ([`outer`]).
 //!
 //! # If-conversion
 //!
@@ -235,6 +245,10 @@ impl Vectorize {
 #[path = "vec256.rs"]
 mod vec256;
 
+/// Outer-loop vectorization: a two-deep nest widened across its outer counter.
+#[path = "outer_vec.rs"]
+mod outer;
+
 /// The SIMD register width the backend can legalize, in bytes. Cranelift's x64 vector ISA tops out
 /// at 128 bits — see the module docs for the measurement that established it.
 const VEC_BYTES: u32 = 16;
@@ -293,6 +307,10 @@ impl Pass for Vectorize {
                 Some(Picked::Kernel(plan, kernel)) => {
                     done.kernels.insert(plan.header.0);
                     vec256::apply(f, &plan, &kernel);
+                }
+                Some(Picked::Outer(plan)) => {
+                    done.widened.insert(plan.header.0);
+                    outer::apply(f, &plan);
                 }
             }
             cache.invalidate();
@@ -955,6 +973,35 @@ fn pick(
             eprintln!("vectorize: declined loop at bb{header}: {why}");
         }
     };
+    // A two-deep nest whose inner loop carries a row's own state (a float sum, a recurrence) is
+    // widened across its outer counter first, before the inner path widens the inner loop along
+    // its own ([`outer`]).
+    if outer::enabled() {
+        for id in forest.innermost_first() {
+            let l = forest.get(id);
+            if l.children.len() != 1
+                || done.widened.contains(&l.header.0)
+                || already_vector(f, l)
+                || is_someones_epilogue(f, forest, l)
+            {
+                continue;
+            }
+            let header = l.header.0;
+            match outer::plan(f, forest, id.0 as usize) {
+                Ok(p) => {
+                    if trace {
+                        eprintln!("vectorize: OUTER bb{header} w={}", p.w);
+                    }
+                    return Some(Picked::Outer(p));
+                }
+                Err(why) => {
+                    if trace {
+                        eprintln!("vectorize: no outer-loop plan for bb{header}: {why}");
+                    }
+                }
+            }
+        }
+    }
     for id in forest.innermost_first() {
         let idx = id.0 as usize;
         // Structure first: no value analysis has run yet, and none of these checks needs one.
@@ -1048,6 +1095,8 @@ enum Picked {
     Widen(VecPlan),
     /// Call a 256-bit kernel ahead of it, its trip and width already the kernel's ([`vec256`]).
     Kernel(VecPlan, vec256::KernelPlan),
+    /// Widen a two-deep nest across its outer counter ([`outer`]).
+    Outer(outer::OuterPlan),
 }
 
 /// `p`, after printing its `WUKONG_VEC_TRACE` line.
@@ -3786,7 +3835,7 @@ struct BodyPlan {
 /// form still widens everything else. The step runs once per lane on the lane's own scalar
 /// operands — extracted from a vector, or taken per lane from another replicated value — and its
 /// results are packed back into vectors (`Op::InsertLane`) only where a widened step reads them.
-/// Three things are replicated:
+/// Four things are replicated:
 ///
 /// * a **gather** — a `gep` whose index varies per lane becomes one address per lane
 ///   ([`Plan::LaneGep`]), and the load through it one scalar load per lane ([`Plan::Gather`]).
@@ -3797,7 +3846,8 @@ struct BodyPlan {
 ///   packed form exists, and MIR's scalar forms never trap (`x / 0` is `0`);
 /// * a **cast with no vector route**, and any `Bin`/`Cast` whose only readers are `gep` indices: an
 ///   index widened to `i64` only ever feeds per-lane addresses, so computing it per lane keeps an
-///   `i64` value out of the group width at no cost.
+///   `i64` value out of the group width at no cost;
+/// * a **call** to a function the effect summaries prove side-effect free ([`Plan::Call`]).
 ///
 /// A **scatter** — a store through a per-lane address — is replicated too ([`Plan::Scatter`]): one
 /// scalar store per lane, in lane order. `loop_info::dependence` has proved that nothing else in
@@ -5374,22 +5424,34 @@ fn apply(f: &mut Function, p: &VecPlan) {
 /// predicate the header uses; once `start < end` holds, the mathematical count is positive and a
 /// wrapped difference can only read as negative, which the `>= W` test already turns into zero.
 fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> ValueId {
-    match &p.trip {
-        TripPlan::Const(n) => e.int(guard, &p.iv_ty, *n as i64),
+    trip_count(e, &p.trip, &p.iv_ty, p.w, guard, start)
+}
+
+/// [`emit_trip`] for a counter of type `iv_ty` stepping in groups of `w`.
+fn trip_count(
+    e: &mut Emit<'_>,
+    trip: &TripPlan,
+    iv_ty: &MirType,
+    w: u32,
+    guard: BlockId,
+    start: ValueId,
+) -> ValueId {
+    match trip {
+        TripPlan::Const(n) => e.int(guard, iv_ty, *n as i64),
         TripPlan::Runtime { end, signed } => {
-            let count = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Sub, *end, start));
+            let count = e.push(guard, iv_ty.clone(), Op::Bin(BinOp::Sub, *end, start));
             // `count & !(W-1)` rounds down for a non-negative count; the compare below is what
             // keeps a negative one (an already-finished loop) from producing a negative `n_vec`
             // and rewinding the scalar loop's induction variable behind its start.
-            let mask = e.int(guard, &p.iv_ty, !((p.w as i64) - 1));
-            let masked = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::And, count, mask));
-            let min = e.int(guard, &p.iv_ty, p.w as i64 * MIN_TRIP_GROUPS as i64);
+            let mask = e.int(guard, iv_ty, !((w as i64) - 1));
+            let masked = e.push(guard, iv_ty.clone(), Op::Bin(BinOp::And, count, mask));
+            let min = e.int(guard, iv_ty, w as i64 * MIN_TRIP_GROUPS as i64);
             let big = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sge, count, min));
             let lt = if *signed { CmpOp::Slt } else { CmpOp::Ult };
             let runs = e.push(guard, MirType::I1, Op::Cmp(lt, start, *end));
             let ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, runs, big));
-            let zero = e.int(guard, &p.iv_ty, 0);
-            e.push(guard, p.iv_ty.clone(), Op::Select(ok, masked, zero))
+            let zero = e.int(guard, iv_ty, 0);
+            e.push(guard, iv_ty.clone(), Op::Select(ok, masked, zero))
         }
         // A countdown runs `start - end` iterations (one more when the test is `iv >= end`). The
         // same order test comes first — the loop runs at all only if `start > end` (`>=`) under
@@ -5400,7 +5462,7 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
             signed,
             inclusive,
         } => {
-            let diff = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Sub, start, *end));
+            let diff = e.push(guard, iv_ty.clone(), Op::Bin(BinOp::Sub, start, *end));
             let gt = match (signed, inclusive) {
                 (true, false) => CmpOp::Sgt,
                 (true, true) => CmpOp::Sge,
@@ -5409,24 +5471,24 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
             };
             let runs = e.push(guard, MirType::I1, Op::Cmp(gt, start, *end));
             let (count, fits) = if *inclusive {
-                let one = e.int(guard, &p.iv_ty, 1);
-                let count = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, diff, one));
+                let one = e.int(guard, iv_ty, 1);
+                let count = e.push(guard, iv_ty.clone(), Op::Bin(BinOp::Add, diff, one));
                 // `diff + 1 > diff` fails exactly at the signed maximum.
                 let fits = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sgt, count, diff));
                 (count, Some(fits))
             } else {
                 (diff, None)
             };
-            let mask = e.int(guard, &p.iv_ty, !((p.w as i64) - 1));
-            let masked = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::And, count, mask));
-            let min = e.int(guard, &p.iv_ty, p.w as i64 * MIN_TRIP_GROUPS as i64);
+            let mask = e.int(guard, iv_ty, !((w as i64) - 1));
+            let masked = e.push(guard, iv_ty.clone(), Op::Bin(BinOp::And, count, mask));
+            let min = e.int(guard, iv_ty, w as i64 * MIN_TRIP_GROUPS as i64);
             let big = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sge, count, min));
             let mut ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, runs, big));
             if let Some(fits) = fits {
                 ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, ok, fits));
             }
-            let zero = e.int(guard, &p.iv_ty, 0);
-            e.push(guard, p.iv_ty.clone(), Op::Select(ok, masked, zero))
+            let zero = e.int(guard, iv_ty, 0);
+            e.push(guard, iv_ty.clone(), Op::Select(ok, masked, zero))
         }
     }
 }
@@ -11052,5 +11114,167 @@ mod tests {
              k(o, p, q, x, 19, 0); j = 0; while j < 7 {{ print(o[j]); j = j + 1; }} \
              return 0; }}"
         ));
+    }
+
+    // ---- outer-loop vectorization ----------------------------------------------------------------
+
+    /// Was a nest of `func` widened across its rows? The mark is the vector nest's shape: a loop
+    /// header carrying a vector parameter (each lane a row's own accumulator) that is then stored
+    /// whole — the inner path never stores a carried vector, it folds one to a scalar first.
+    fn outer_widened(src: &str, func: &str) -> bool {
+        let (program, mut interner) = optimized(src, 2);
+        let sym = interner.intern(func);
+        let f = program
+            .function(sym)
+            .unwrap_or_else(|| panic!("no fn {func}"));
+        let carried: FxHashSet<u32> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter())
+            .filter(|p| f.value_type(**p).is_vector())
+            .map(|p| p.0)
+            .collect();
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(&i.op, Op::Store { value, .. } if carried.contains(&value.0)))
+    }
+
+    /// The out-of-line driver every outer-loop case shares: `k` and `again` call each other.
+    const AGAIN: &str = "fn again(z: i64) { let mut t: []f32 = alloc_f32(1); \
+                         let mut u: []f32 = alloc_f32(1); k(t, t, u, 1, 1, z); } ";
+
+    /// A row-major matrix-vector product: per row a float sum the inner path can only fold
+    /// serially. Widened across rows, each lane keeps its own row's sum in order.
+    #[test]
+    fn a_matrix_vector_product_widens_across_its_rows() {
+        let k = format!(
+            "@unchecked fn k(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64, \
+             z: i64) {{ if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0; \
+             while r < rows {{ let mut s: f32 = 0.0; let mut c: i64 = 0; \
+               while c < cols {{ s = s + a[r * cols + c] * x[c]; c = c + 1; }} \
+               y[r] = s; r = r + 1; }} }} {AGAIN}"
+        );
+        assert!(
+            outer_widened(&format!("{k} fn main() -> i32 {{ return 0; }}"), "k"),
+            "the matrix-vector product was not widened across its rows"
+        );
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut a: []f32 = alloc_f32(63); \
+             let mut x: []f32 = alloc_f32(7); let mut y: []f32 = alloc_f32(9); \
+             let mut j: i64 = 0; \
+             while j < 63 {{ a[j] = ((j * 7) % 11) as f32 * 0.3 - 1.1; j = j + 1; }} j = 0; \
+             while j < 7 {{ x[j] = (j as f32) * 0.7 - 2.0; j = j + 1; }} \
+             k(a, x, y, 9, 7, 0); j = 0; while j < 9 {{ print(y[j]); j = j + 1; }} \
+             return 0; }}"
+        ));
+    }
+
+    /// A per-row recurrence, `h = h·t + a[c·rows + r]`: the inner path cannot widen it along `c`
+    /// at all. Column-major, so the group's rows are contiguous and each step is one vector load.
+    #[test]
+    fn a_per_row_recurrence_widens_across_its_rows() {
+        let k = format!(
+            "@unchecked fn k(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64, \
+             z: i64) {{ if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0; \
+             while r < rows {{ let mut h: f32 = x[0]; let mut c: i64 = 0; \
+               while c < cols {{ h = h * 0.75 + a[c * rows + r]; c = c + 1; }} \
+               y[r] = h; r = r + 1; }} }} {AGAIN}"
+        );
+        assert!(
+            outer_widened(&format!("{k} fn main() -> i32 {{ return 0; }}"), "k"),
+            "the per-row recurrence was not widened across its rows"
+        );
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut a: []f32 = alloc_f32(70); \
+             let mut x: []f32 = alloc_f32(1); let mut y: []f32 = alloc_f32(10); \
+             let mut j: i64 = 0; \
+             while j < 70 {{ a[j] = ((j * 3) % 17) as f32 * 0.37 - 2.5; j = j + 1; }} \
+             x[0] = 0.125; k(a, x, y, 10, 7, 0); j = 0; \
+             while j < 10 {{ print(y[j]); j = j + 1; }} return 0; }}"
+        ));
+    }
+
+    /// The same recurrence over a row-major matrix: each inner step would gather one element per
+    /// lane, and `unroll_jam` already runs four rows as four scalar chains without the packing, so
+    /// the nest is left to it.
+    #[test]
+    fn a_recurrence_over_gathered_rows_is_left_to_unroll_and_jam() {
+        let src = format!(
+            "@unchecked fn k(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64,              z: i64) {{ if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0;              while r < rows {{ let mut h: f32 = x[0]; let mut c: i64 = 0;                while c < cols {{ h = h * 0.75 + a[r * cols + c]; c = c + 1; }}                y[r] = h; r = r + 1; }} }} {AGAIN} fn main() -> i32 {{ return 0; }}"
+        );
+        assert!(
+            !outer_widened(&src, "k"),
+            "a recurrence over gathered rows took the outer path"
+        );
+    }
+
+    /// The inner trip depends on the row (a triangle): the rows of a group would run different
+    /// iterations, so the nest stays with the inner path.
+    #[test]
+    fn a_triangular_nest_is_not_widened_across_its_rows() {
+        let src = format!(
+            "@unchecked fn k(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64, \
+             z: i64) {{ if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0; \
+             while r < rows {{ let mut s: f32 = 0.0; let mut c: i64 = 0; \
+               while c < r {{ s = s + a[r * cols + c] * x[c]; c = c + 1; }} \
+               y[r] = s; r = r + 1; }} }} {AGAIN} fn main() -> i32 {{ return 0; }}"
+        );
+        assert!(
+            !outer_widened(&src, "k"),
+            "a triangular nest widened across its rows"
+        );
+    }
+
+    /// A store inside the inner loop would run row `r + 1`'s step `c` before row `r`'s step
+    /// `c + 1`; declined.
+    #[test]
+    fn a_store_inside_the_inner_loop_keeps_the_nest_off_the_outer_path() {
+        let src = format!(
+            "@unchecked fn k(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64, \
+             z: i64) {{ if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0; \
+             while r < rows {{ let mut h: f32 = 0.0; let mut c: i64 = 0; \
+               while c < cols {{ h = h * 0.5 + a[r * cols + c]; y[r * cols + c] = h; \
+               c = c + 1; }} r = r + 1; }} }} {AGAIN} fn main() -> i32 {{ return 0; }}"
+        );
+        assert!(
+            !outer_widened(&src, "k"),
+            "a nest storing in its inner loop widened"
+        );
+    }
+
+    /// Without the promise `y` may be `a` or `x`: a lane's store could change what another lane
+    /// reads.
+    #[test]
+    fn a_nest_whose_output_may_be_its_input_is_not_widened_across_its_rows() {
+        let src = format!(
+            "@unchecked fn k(a: []f32, x: []f32, mut y: []f32, rows: i64, cols: i64, z: i64) {{ \
+             if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0; \
+             while r < rows {{ let mut s: f32 = 0.0; let mut c: i64 = 0; \
+               while c < cols {{ s = s + a[r * cols + c] * x[c]; c = c + 1; }} \
+               y[r] = s; r = r + 1; }} }} {AGAIN} fn main() -> i32 {{ return 0; }}"
+        );
+        assert!(
+            !outer_widened(&src, "k"),
+            "an unpromised output widened across rows"
+        );
+    }
+
+    /// An integer row sum is reassociable: the inner path keeps `W` lane partials and folds them
+    /// once, which already runs in parallel — the nest is left to it.
+    #[test]
+    fn an_integer_row_sum_is_left_to_the_inner_path() {
+        let src = "@unchecked fn k(a: []i32, @noalias mut y: []i32, rows: i64, cols: i64, \
+                   z: i64) { if z > 0 { again(z - 1); return; } let mut r: i64 = 0; \
+                   while r < rows { let mut s: i32 = 0; let mut c: i64 = 0; \
+                     while c < cols { s = s + a[r * cols + c] * 3; c = c + 1; } \
+                     y[r] = s; r = r + 1; } } \
+                   fn again(z: i64) { let mut t: []i32 = alloc_i32(1); \
+                   let mut u: []i32 = alloc_i32(1); k(t, u, 1, 1, z); } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !outer_widened(src, "k"),
+            "an integer row sum took the outer path"
+        );
     }
 }
