@@ -50,6 +50,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   program at every `-O` level (and a release build vectorized over an `i128` counter by accident).
   Both now decline such a counter, as the kernel recognizers and `parallel_spec` already did; the
   loop stays scalar and serial (`tests/run/i128_loop_counters.wk`).
+- **Fixed (review): a 128-bit shift or rotate count keeps its low bits.** The clamp for 128-bit
+  indices and extents also caught the count of `<<=`/`>>=` and `rotl`/`rotr`, so on a 64-bit value a
+  count at or past 2^63 became a shift by 63 (`x_i64 <<= 2^64 + 3` gave `i64::MIN`, not 8) while a
+  32-bit value truncated correctly. A count is taken modulo the width, so it now narrows by
+  truncation at every width (`tests/run/i128_shift_counts.wk`).
 - **Tests.** `tests/run/i128_{arith,casts,aggregates,match_builtins,index_clamp}.wk` pin every
   operation at both range ends with operands the optimizer cannot fold, interpreter == native at
   every `-O` (expected values from Python's integers, not compiler output); six new `tests/fail`

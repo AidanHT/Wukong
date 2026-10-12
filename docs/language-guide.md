@@ -500,7 +500,9 @@ literal, and reach exactly the full ranges: `-1701411834604692317316873037158841
   a constant index past `i64` is `E0501` on an array (`tests/run/i128_index_clamp.wk`). So is a
   128-bit count or extent handed to a builtin that takes a 64-bit one (`alloc_i32(n)`, `ldexp`'s
   exponent): `alloc_i32(2^64 + 4)` asks for `i64::MAX` elements, not 4. An explicit `as i64` still
-  keeps the low 64 bits.
+  keeps the low 64 bits, and so does a **shift or rotate count**, which is taken modulo the width of
+  the value it shifts: `x_i64 <<= n` with `n = 2^64 + 3` shifts by 3 and `rotl(x_u64, 2^64 + 1)`
+  rotates by 1, exactly as on a 32-bit value (`tests/run/i128_shift_counts.wk`).
 - **`as`** converts to and from every integer and float type: narrowing keeps the low bits,
   widening extends by the source's signedness, an integer-to-float conversion rounds once (straight
   to `f32`, never through `f64`), and a float-to-integer one truncates and saturates, NaN to `0`

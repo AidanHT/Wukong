@@ -1579,7 +1579,8 @@ value as two `i64` halves (`text_rt`'s `Abi::I128` class splits the one MIR argu
 never truncates a 128-bit index or count implicitly: `wukong_mir_build`'s `lower_index_i64` and
 `coerce_to` clamp an `i128` to `i64`'s range (`saturate_i128_to_i64`) before it becomes an address
 or a builtin's 64-bit operand, so an index past `i64` stays out of bounds; only an explicit `as`
-truncates. The loop
+truncates — and a shift or rotate count, which is taken modulo the width and so narrows by its low
+bits (`coerce_count`, used by `<<=`/`>>=` and `rotl`/`rotr`). The loop
 vectorizers have no 128-bit lane (`lane_bytes`/`vector_width` decline it), so a loop over `i128`
 data stays scalar, and a `for` loop with a 128-bit counter is declined by name everywhere a bound is
 computed at the counter's width — `try_vectorize_for`, every kernel recognizer

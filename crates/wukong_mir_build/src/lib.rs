@@ -10603,8 +10603,14 @@ impl FnLowerer<'_> {
                 let (ptr, elem) = self.lower_place(target);
                 // Coerce the value to the place's type before storing, so a narrowing store (e.g.
                 // an `f32` value into a `[bf16; N]` slot) carries the element type — the backends
-                // then store the right width and round to bf16. A no-op when the types match.
-                let rhs = self.coerce_to(rhs0, &rhs_ty, &elem, self.signed(value));
+                // then store the right width and round to bf16. A no-op when the types match. A
+                // `<<=`/`>>=` count is the one operand sema lets be WIDER than the place: it is
+                // taken modulo the width, so it narrows by its low bits (`coerce_count`).
+                let rhs = if matches!(op, ast::AssignOp::Shl | ast::AssignOp::Shr) {
+                    self.coerce_count(rhs0, &rhs_ty, &elem, self.signed(value))
+                } else {
+                    self.coerce_to(rhs0, &rhs_ty, &elem, self.signed(value))
+                };
                 let store_val = match op {
                     ast::AssignOp::Assign => rhs,
                     _ => {
@@ -21628,6 +21634,20 @@ impl FnLowerer<'_> {
         }
         self.builder
             .build(MirType::I64, Op::Cast(CastKind::Trunc, c, MirType::I64))
+    }
+
+    /// A shift or rotate COUNT `v` of type `from`, converted to the shifted value's type `to`. The
+    /// count is taken modulo `to`'s width, which only its low bits decide, so a 128-bit count
+    /// narrows by truncation — never by [`Self::coerce_to`]'s clamp of a 128-bit index or extent
+    /// into `i64`'s range, which turned `x_i64 <<= 2^64 + 3` into a shift by 63 instead of 3 (and
+    /// disagreed with a 32-bit place, which already truncated). Any other pair is `coerce_to`'s.
+    fn coerce_count(&mut self, v: ValueId, from: &MirType, to: &MirType, signed: bool) -> ValueId {
+        if *from == MirType::I128 && to.is_int() && *to != MirType::I128 {
+            return self
+                .builder
+                .build(to.clone(), Op::Cast(CastKind::Trunc, v, to.clone()));
+        }
+        self.coerce_to(v, from, to, signed)
     }
 
     /// Lower a multi-dimensional tensor index `base[i0, i1, …]` to a single `Gep` at the row-major

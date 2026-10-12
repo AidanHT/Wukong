@@ -119,7 +119,10 @@ impl FnLowerer<'_> {
             Rotl | Rotr => {
                 let rty = self.sb_int_ty(e)?;
                 let x = self.sb_operand(&args[0], &rty);
-                let n = self.sb_operand(&args[1], &rty);
+                // The count is taken modulo the width: a wider one keeps its low bits.
+                let nv = self.lower_expr(&args[1]);
+                let nty = self.operand_mir(nv, &args[1]);
+                let n = self.coerce_count(nv, &nty, &rty, self.signed(&args[1]));
                 Some(self.sb_rotate(x, n, &rty, b == Rotl))
             }
             SatAdd | SatSub => {
