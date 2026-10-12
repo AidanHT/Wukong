@@ -502,6 +502,72 @@ fn vector_recipe_checks_reads_but_leaves_tail_and_output_only_slots_alone() {
     }
 }
 
+/// Two streams of one recipe may share a base: `wukong_opt::vectorize`'s alias guard admits two
+/// slices that are the same buffer when every access sits at one element. A load of one after a
+/// store to the other then names the element just stored, and the machine code — which re-reads
+/// memory — returns the stored value, so the marshalling must too. Stream 0 and stream 1 both start
+/// at slot 4 here: `x = s0; s1 = x * 3; y = s0 + 3; s2 = y` must leave `2 * 3 + 3 = 9` in every
+/// lane of stream 2, where reading stream 0 from the lane's snapshot gave `2 + 3 = 5`.
+#[test]
+fn vector_recipe_streams_sharing_a_base_forward_stores_between_them() {
+    let mut interner = Interner::new();
+    let name = interner.intern("shared_base");
+    let mut b = Builder::new(name, MirType::Void);
+    let ptrs = b.add_param(MirType::Ptr);
+    let scalars = b.add_param(MirType::Ptr);
+    let n = b.add_param(MirType::I64);
+    b.build_void(Op::VecKernelCall {
+        kernel: 0,
+        ptrs,
+        scalars,
+        n,
+    });
+    b.ret(None);
+    let mut func = b.finish();
+    func.vec_kernels.push(VecKernel {
+        name,
+        lane: wukong_mir::VecLane::F32,
+        streams: 3,
+        scalars: 1,
+        unroll: 1,
+        reduce: None,
+        ops: vec![
+            VecOp::Load { stream: 0 },
+            VecOp::Splat { scalar: 0 },
+            VecOp::Bin {
+                op: VecBin::Mul,
+                a: 0,
+                b: 1,
+            },
+            VecOp::Store { stream: 1, val: 2 },
+            VecOp::Load { stream: 0 },
+            VecOp::Bin {
+                op: VecBin::Add,
+                a: 4,
+                b: 1,
+            },
+            VecOp::Store { stream: 2, val: 5 },
+        ],
+    });
+    let mut program = Program::new();
+    program.funcs.push(func);
+    assert!(wukong_mir::verify::verify_program(&program).is_empty());
+    let mut interp = interpreter(&program, &interner);
+    let mut memory = vec![Value::Unit; 25];
+    memory[0] = P(4);
+    memory[1] = P(4);
+    memory[2] = P(16);
+    memory[3] = F(3.0);
+    memory[4..12].fill(F(2.0));
+    memory[16..24].fill(F(0.0));
+    interp.memory = memory;
+    interp
+        .run_function(&program.funcs[0], &[P(0), P(3), I(8)])
+        .unwrap();
+    assert_eq!(&interp.memory[4..12], &[F(6.0); 8]);
+    assert_eq!(&interp.memory[16..24], &[F(9.0); 8]);
+}
+
 #[test]
 fn host_float_buffers_reject_pointer_copyback_and_preserve_untouched_nan_bits() {
     let mut interner = Interner::new();

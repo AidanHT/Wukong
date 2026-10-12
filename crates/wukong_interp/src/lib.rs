@@ -1800,7 +1800,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
             // run the recipe, write its stores back. Load-before-store within a lane keeps
             // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
-            // precondition), so no hazard. Every stream the recipe loads or stores is checked
+            // precondition), so no hazard. Two streams may share a BASE, though — the optimizer's
+            // runtime alias guard admits two slices that are the same buffer when every access
+            // sits at one element (`wukong_opt::vectorize`'s `guard_allows_equal`) — and then a
+            // load that follows a store to the other stream names the element just stored. The
+            // machine code re-reads memory and sees it, so the load here takes this lane's latest
+            // earlier store to any stream with the same base (the recipe itself forwards only
+            // within one stream). Every stream the recipe loads or stores is checked
             // over all `count` elements first, so a stream that would run past its allocation is
             // refused before the first store.
             //
@@ -1823,7 +1829,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     self.slots.live.check("veckernel stream", s, b, count)?;
                 }
             }
-            let mut stores: Vec<(u32, T)> = Vec::new();
+            let stores: std::cell::RefCell<Vec<(u32, T)>> = std::cell::RefCell::new(Vec::new());
             let mut loads: Vec<T> = kernel_scratch(streams, "veckernel loads")?;
             let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::<T>::default();
             for i in 0..count {
@@ -1841,14 +1847,22 @@ impl<'a, 'k> Interp<'a, 'k> {
                         T::unused()
                     });
                 }
-                stores.clear();
+                stores.borrow_mut().clear();
                 kern.eval_lane_with_scratch(
                     &mut scratch,
-                    |s| loads[s as usize],
+                    |s| {
+                        let base = stream_bases[s as usize];
+                        stores
+                            .borrow()
+                            .iter()
+                            .rev()
+                            .find(|(t, _)| stream_bases[*t as usize] == base)
+                            .map_or(loads[s as usize], |&(_, v)| v)
+                    },
                     |k| scalar_vals[k as usize],
-                    |s, v| stores.push((s, v)),
+                    |s, v| stores.borrow_mut().push((s, v)),
                 );
-                for &(s, v) in &stores {
+                for &(s, v) in stores.borrow().iter() {
                     let slot = stream_bases[s as usize] + i;
                     *self
                         .memory

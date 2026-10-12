@@ -599,6 +599,12 @@ impl VecKernel {
     /// element-by-element — the two must agree bit-for-bit (all arithmetic is in the lane type `T`,
     /// which must model [`Self::lane`]; a float `Fma` is single-rounded via `mul_add`; a float `Neg`
     /// flips the sign bit; each compare follows the matching Rust operator — see [`VecCmp`]).
+    ///
+    /// A store is forwarded to a later load of its own stream. Two streams whose bases are equal at
+    /// run time (the general vectorizer's alias guard admits that for two buffers accessed at one
+    /// element) name one element per lane, and the machine code, which re-reads memory, lets a load
+    /// of one observe an earlier store to the other: that is the `load` callback's job — the
+    /// interpreter returns the lane's latest earlier store to any stream with the same base.
     pub fn eval_lane<T: VecValue>(
         &self,
         load: impl FnMut(u32) -> T,
