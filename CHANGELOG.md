@@ -61,6 +61,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `exit`s, which also ends the thread inside a called function. The run reports `assertion failed`
   as the interpreter does when an `assert(false)` came first, and the interpreter's
   ``execution reached `unreachable` `` for a bare one.
+
 ### int4: packing builtins and group-wise dequantization (`gap7/f8-types`, N25)
 
 - **Added: `pack_i4(lo, hi)`, `pack_u4(lo, hi)`, `unpack_i4(b)`, `unpack_u4(b)`.** Two 4-bit
