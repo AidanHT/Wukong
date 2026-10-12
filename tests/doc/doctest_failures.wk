@@ -1,0 +1,48 @@
+//! Every way a doc example fails, one per example: `wukongc --doctest` reports each as FAILED,
+//! counts the one that passes, and exits 1.
+module tests.doc.doctest_failures
+
+/// A failed assertion:
+///
+/// ```wk
+/// assert(one() == 2);
+/// ```
+///
+/// A non-zero exit status:
+///
+/// ```wk
+/// return one() + 6;
+/// ```
+///
+/// A compile error in an example that must run:
+///
+/// ```wk
+/// let x: i32 = undefined_name;
+/// ```
+///
+/// A `compile_fail` example that compiles:
+///
+/// ```wk,compile_fail
+/// let x = one();
+/// ```
+///
+/// A `compile_fail` example that fails with another code:
+///
+/// ```wk,compile_fail,E0503
+/// let x: i32 = undefined_name;
+/// ```
+///
+/// An unknown tag:
+///
+/// ```wk,compile-fail
+/// let x = one();
+/// ```
+///
+/// One that passes:
+///
+/// ```wk
+/// assert(one() == 1);
+/// ```
+fn one() -> i32 {
+    return 1;
+}

@@ -16,6 +16,7 @@ use TokenKind as T;
 
 mod docs;
 mod items;
+pub use docs::{parse_doctest_tokens, DoctestOutput};
 pub use items::{
     parse_module, parse_module_tokens, parse_module_tokens_from, parse_module_tokens_with_lints,
     ParseOutput,

@@ -46,6 +46,7 @@ fn run() {
         "tests/imports",
         "tests/warn",
         "tests/fail",
+        "tests/doc",
     ];
     let mut files = Vec::new();
     for d in dirs {

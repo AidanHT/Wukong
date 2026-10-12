@@ -12,10 +12,53 @@
 //! an expression — and is `E0210`, rustc's E0585, one error per run of consecutive comments.
 
 use super::Parser;
-use wukong_ast::{DocLine, Docs};
+use wukong_ast::{Block, DocLine, Docs, Item};
 use wukong_diag::{Applicability, Diagnostic};
 use wukong_lexer::{Token, TokenKind};
-use wukong_span::Span;
+use wukong_span::{Interner, Span};
+
+/// What [`parse_doctest_tokens`] produces.
+pub struct DoctestOutput {
+    /// The example's items, in order.
+    pub items: Vec<Item>,
+    /// The statements after them (with the tail expression, when the example ends in one).
+    pub block: Block,
+    /// Parser errors (the lexer's diagnostics are the caller's).
+    pub diags: Vec<Diagnostic>,
+    /// The first `NodeId` after the last one allocated.
+    pub next_node: u32,
+}
+
+/// Parse a doc example (`wukongc --doctest`): its items first — anything that starts like one
+/// (`fn`, `struct`, `enum`, `const`, `type`, `trait`, `impl`, `extern`, `import`, `pub`, after any
+/// attributes) — then statements to the end of input, the body of the `main` the runner wraps
+/// them in. `NodeId`s are allocated from `first_node_id`, as for
+/// [`crate::parse_module_tokens_from`].
+pub fn parse_doctest_tokens(
+    tokens: &[Token],
+    src: &str,
+    interner: &mut Interner,
+    first_node_id: u32,
+) -> DoctestOutput {
+    let mut p = Parser::new(tokens, src, interner);
+    p.next_node = first_node_id;
+    let mut items = Vec::new();
+    while p.at_item_start() {
+        let before = p.pos;
+        items.extend(p.parse_item());
+        if p.pos == before {
+            break;
+        }
+    }
+    let block = p.stmts_to_eof();
+    p.report_stray_docs();
+    DoctestOutput {
+        items,
+        block,
+        diags: std::mem::take(&mut p.diags),
+        next_node: p.next_node,
+    }
+}
 
 /// One doc comment of the source being parsed.
 pub(crate) struct DocSlot {
@@ -167,6 +210,49 @@ impl Parser<'_> {
                 Applicability::MachineApplicable,
             ),
             _ => d.help("make each line a plain comment: `//`"),
+        }
+    }
+
+    /// Does an item start here: an item keyword (or `type Name`), after any `@attributes`?
+    fn at_item_start(&self) -> bool {
+        let kind = |i: usize| self.tokens.get(i).map_or(TokenKind::Eof, |t| t.kind);
+        let mut i = self.pos;
+        // Skip `@name` and `@name(..)`.
+        while kind(i) == TokenKind::At {
+            i += 2;
+            if kind(i) == TokenKind::LParen {
+                let mut depth = 0usize;
+                loop {
+                    match kind(i) {
+                        TokenKind::LParen => depth += 1,
+                        TokenKind::RParen => depth -= 1,
+                        TokenKind::Eof => return false,
+                        _ => {}
+                    }
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        let word = |i: usize| {
+            self.tokens
+                .get(i)
+                .map_or("", |t| &self.src[t.span.lo as usize..t.span.hi as usize])
+        };
+        match kind(i) {
+            TokenKind::Fn
+            | TokenKind::Struct
+            | TokenKind::Enum
+            | TokenKind::Const
+            | TokenKind::Import
+            | TokenKind::Extern
+            | TokenKind::Trait
+            | TokenKind::Impl
+            | TokenKind::Pub => true,
+            TokenKind::Ident => word(i) == "type" && kind(i + 1) == TokenKind::Ident,
+            _ => false,
         }
     }
 

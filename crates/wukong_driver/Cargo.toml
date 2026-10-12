@@ -19,6 +19,8 @@ wukong_diag = { workspace = true }
 wukong_lexer = { workspace = true }
 wukong_ast = { workspace = true }
 wukong_parser = { workspace = true }
+# `--emit=doc` renders each item's signature with the formatter's printer (`wukong_fmt::doc`).
+wukong_fmt = { workspace = true }
 wukong_sema = { workspace = true }
 # `--train` reads the loss function's parameter buffer sizes from the resolved semantic types.
 wukong_types = { workspace = true }

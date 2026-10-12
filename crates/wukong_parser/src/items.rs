@@ -115,7 +115,7 @@ impl Parser<'_> {
 
     /// One source item. Usually exactly one AST item; an `impl` block yields its marker item plus
     /// one flattened `fn` item per method, and an unparseable item yields none.
-    fn parse_item(&mut self) -> Vec<Item> {
+    pub(crate) fn parse_item(&mut self) -> Vec<Item> {
         let start = self.span();
         let first = self.pos;
         let attrs = self.parse_attrs();

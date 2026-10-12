@@ -48,6 +48,10 @@ mod loader;
 /// runs any chosen pass list and prints the MIR after a named pass.
 pub mod passes;
 
+/// `wukongc --doctest`: compile and run the code examples in a file's doc comments
+/// ([`doctest::run`]).
+pub mod doctest;
+
 /// Whole-program reachability pruning ahead of optimization (`--run`, `--emit=exe`).
 mod prune;
 
@@ -67,6 +71,11 @@ mod report;
 pub enum EmitStage {
     Tokens,
     Ast,
+    /// The root file's documentation as Markdown (`--emit=doc`, `wukong_fmt::doc`): its `//!`
+    /// docs, then every item in source order with its signature (as `wukongc fmt` prints it) and
+    /// its `///` docs, with fields, variants and methods listed under their item. Like `tokens`
+    /// and `ast` it reads the root file only, after the parse.
+    Doc,
     /// Run the front end only — lex, parse, import resolution, sema and the lints — and stop
     /// before MIR lowering (`--emit=check`). Reports every diagnostic sema and the lints produce and
     /// exits 0 when nothing is an error (a denied lint is one), with no lowering (`C0001`) limits in
@@ -93,6 +102,7 @@ impl EmitStage {
         Some(match s {
             "tokens" => EmitStage::Tokens,
             "ast" => EmitStage::Ast,
+            "doc" => EmitStage::Doc,
             "check" => EmitStage::Check,
             "mir-high" => EmitStage::MirHigh,
             "mir" | "mir-low" => EmitStage::Mir,
@@ -111,6 +121,7 @@ impl EmitStage {
         match self {
             EmitStage::Tokens => "tokens",
             EmitStage::Ast => "ast",
+            EmitStage::Doc => "doc",
             EmitStage::Check => "check",
             EmitStage::MirHigh => "mir-high",
             EmitStage::Mir => "mir",
@@ -131,6 +142,7 @@ impl EmitStage {
         Some(match self {
             EmitStage::Tokens => "tokens",
             EmitStage::Ast => "ast",
+            EmitStage::Doc => "md",
             EmitStage::Check => return None,
             EmitStage::MirHigh => "mir-high",
             EmitStage::Mir => "mir-low",
@@ -154,12 +166,12 @@ impl EmitStage {
     ///
     /// A list is refused where no single compile could honour it: an unknown or empty element, a
     /// stage named twice (an alias included: `mir,mir-low`), `check` or `grad` with any stage but
-    /// `tokens`/`ast` (`check` stops before lowering; `grad` is a pipeline of its own — at least
+    /// `tokens`/`ast`/`doc` (`check` stops before lowering; `grad` is a pipeline of its own — at least
     /// `-O1`, autodiff lowering, no pruning — that ends where it prints the backward MIR, before
     /// any MIR or IR stage prints), and `obj` with `exe` (a library object exports every function
     /// under its source name, an executable keeps what `main` reaches, mangled: two different
-    /// builds). `tokens` and `ast` dump the root file before anything else runs, so they combine
-    /// with every stage. The last stage decides what is compiled, so a list ending in `exe` shows
+    /// builds). `tokens`, `ast` and `doc` read the root file before anything else runs, so they
+    /// combine with every stage. The last stage decides what is compiled, so a list ending in `exe` shows
     /// the pruned executable's MIR and IR, and one ending in `obj` with `--grad-of` the gradient
     /// export's (`<fn>_grad` appended) — neither is what that stage prints alone.
     pub fn parse_list(list: &str) -> Result<(EmitStage, Vec<EmitStage>), String> {
@@ -183,12 +195,12 @@ impl EmitStage {
         for lone in [EmitStage::Check, EmitStage::Grad] {
             if several
                 && stages.contains(&lone)
-                && stages
-                    .iter()
-                    .any(|s| !matches!(*s, EmitStage::Tokens | EmitStage::Ast) && *s != lone)
+                && stages.iter().any(|s| {
+                    !matches!(*s, EmitStage::Tokens | EmitStage::Ast | EmitStage::Doc) && *s != lone
+                })
             {
                 return Err(format!(
-                    "`--emit={}` combines only with `tokens` and `ast`: {}",
+                    "`--emit={}` combines only with `tokens`, `ast` and `doc`: {}",
                     lone.name(),
                     if lone == EmitStage::Check {
                         "it stops before lowering, so no later stage runs"
@@ -258,6 +270,9 @@ pub struct Options {
     /// session honours the backend (`interp`/`native`), `-O`, `--fp`, `--target-cpu`, the lint
     /// levels and the diagnostic format; `input` is unused.
     pub repl: bool,
+    /// `wukongc --doctest`: compile and run every ```` ```wk ```` example in `input`'s doc
+    /// comments and report each ([`doctest`]), instead of compiling the file.
+    pub doctest: bool,
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
     pub verify_each: bool,
@@ -403,6 +418,7 @@ impl Default for Options {
             emit_also: Vec::new(),
             run: false,
             repl: false,
+            doctest: false,
             opt_level: 0,
             verify_each: false,
             passes: None,
@@ -731,6 +747,14 @@ pub fn compile(opts: &Options) -> i32 {
             EmitStage::Ast,
             &wukong_ast::print::print_module(&module, &interner),
         ) {
+            return code;
+        }
+    }
+
+    // `--emit=doc` documents the ROOT file too, from its parse: a file that does not parse has no
+    // documentation, so its errors are reported as for any compile and nothing is printed.
+    if opts.emits(EmitStage::Doc) {
+        if let Some(code) = emit_doc(opts, &sm, id, &sink, &parse_lints, &module, &interner) {
             return code;
         }
     }
@@ -1255,6 +1279,65 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     exit::OK
+}
+
+/// The `doc` stage ([`EmitStage::Doc`]): the root file's Markdown documentation. Returns the exit
+/// code when the compile stops here — at the last stage, or because the parse failed, whose
+/// errors (and the parser's lints) are then rendered as `--emit=ast` renders them — and `None`
+/// to go on to a later stage.
+fn emit_doc(
+    opts: &Options,
+    sm: &SourceMap,
+    id: wukong_span::SourceId,
+    sink: &DiagnosticSink,
+    parse_lints: &[Diagnostic],
+    module: &wukong_ast::Module,
+    interner: &Interner,
+) -> Option<i32> {
+    let renderer = Renderer::new(opts.color);
+    let stop = opts.emit == EmitStage::Doc || sink.has_errors();
+    let mut denied = 0;
+    if stop {
+        let errors = emit_diags(sink.diagnostics(), opts, &renderer, sm);
+        denied = render_lints(parse_lints.to_vec(), module, interner, opts, &renderer, sm);
+        emit_summary(errors + denied, opts, &renderer);
+    }
+    if !sink.has_errors() {
+        // A file with no `module` header is titled by its name: the input's file name, or the
+        // display name of standard input or `-e`.
+        let title = match opts.input.file_name() {
+            Some(n) if opts.source.is_none() && !reads_stdin(opts) => {
+                n.to_string_lossy().into_owned()
+            }
+            _ => source_name(opts),
+        };
+        match wukong_fmt::doc::document(
+            sm.source(id),
+            id,
+            &title,
+            &wukong_fmt::FmtOptions::default(),
+        ) {
+            Ok(md) => {
+                if let Err(code) = put_artifact(opts, EmitStage::Doc, &md) {
+                    return Some(code);
+                }
+            }
+            // The compile's own lex and parse were clean, so this cannot happen; refuse loudly
+            // rather than print nothing and succeed.
+            Err(e) => {
+                emit_driver_error(opts, format!("--emit=doc: {e}"));
+                return Some(exit::COMPILE_ERROR);
+            }
+        }
+    }
+    if !stop {
+        return None;
+    }
+    Some(if sink.has_errors() || denied > 0 {
+        exit::COMPILE_ERROR
+    } else {
+        exit::OK
+    })
 }
 
 /// Can this compile reach the Cranelift backend with a source map — `--run --backend=native`, or

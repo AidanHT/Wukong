@@ -268,6 +268,17 @@ fn representative_ast_emission_is_deterministic_across_processes() {
     }
 }
 
+/// `--emit=doc` is a function of the root file: every item, field, variant and method, with its
+/// signature and docs, in source order.
+#[test]
+fn representative_doc_emission_is_deterministic_across_processes() {
+    assert_representative_text_determinism(&repo_dir("doc").join("geometry.wk"), &["--emit=doc"]);
+    assert_representative_text_determinism(
+        &repo_dir("run").join("enum_payload_struct.wk"),
+        &["--emit=doc"],
+    );
+}
+
 #[test]
 fn representative_llvm_ir_emission_is_deterministic_across_processes() {
     // O0 preserves specialized functions and aggregate accesses; O2 also covers their optimized

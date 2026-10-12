@@ -15,6 +15,7 @@ USAGE:
     wukongc [OPTIONS] -              (read the program from standard input)
     wukongc [OPTIONS] -e <source>    (the program is the <source> argument)
     wukongc --repl [OPTIONS]         (an interactive session on standard input; `:help` inside)
+    wukongc --doctest [OPTIONS] <input.wk>   (run the ```wk examples in its doc comments)
     wukongc fmt [--check] [--stdout] <path|->...   (format source files; `wukongc fmt --help`)
 
 OPTIONS:
@@ -27,10 +28,13 @@ OPTIONS:
                        read (the root and each import); its targets are the files the compile
                        writes (the -o artifact of --emit=obj/exe, each <stem>.<ext> of an
                        --emit list with -o), otherwise <f> itself (not when the last stage is
-                       tokens or ast)
+                       tokens, ast or doc)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
-                       tokens, ast, check, mir-high, mir, mir-text, grad, llvm-ir, obj, exe
+                       tokens, ast, doc, check, mir-high, mir, mir-text, grad, llvm-ir, obj, exe
                        (default: exe)
+                       (doc = the input file's documentation as Markdown: its //! docs, then
+                       every item in source order with its signature as `wukongc fmt` prints
+                       it and its /// docs; fields, variants and methods under their item)
                        (mir-text = the optimized MIR with every type, float bits and parameter
                        promise spelled out; `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
                        f.mir` reads it back, verifies, optimizes and prints it. A .mir input takes
@@ -41,13 +45,13 @@ OPTIONS:
                        Emit several artifacts from ONE compile, in pipeline order whatever the
                        written order. Text artifacts go to stdout, each under a
                        `==> <stage> <==` header line; with -o <stem> every artifact goes to
-                       <stem>.<ext> instead: .tokens, .ast, .mir-high, .mir-low (mir), .mir
-                       (mir-text), .grad, .ll (llvm-ir), .o (obj), the host's executable
-                       extension (exe). obj or exe in a list needs -o; check and grad combine
-                       only with tokens/ast; obj not with exe. The last stage decides the
-                       compile: with exe, mir/mir-text/llvm-ir show the program pruned to what
-                       main reaches; with obj and --grad-of, the gradient export (<fn>_grad
-                       included, at least -O1)
+                       <stem>.<ext> instead: .tokens, .ast, .md (doc), .mir-high, .mir-low
+                       (mir), .mir (mir-text), .grad, .ll (llvm-ir), .o (obj), the host's
+                       executable extension (exe). obj or exe in a list needs -o; check and grad
+                       combine only with tokens/ast/doc; obj not with exe. The last stage
+                       decides the compile: with exe, mir/mir-text/llvm-ir show the program
+                       pruned to what main reaches; with obj and --grad-of, the gradient export
+                       (<fn>_grad included, at least -O1)
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
                        With --emit=obj, the object also exports the gradient as <fn>_grad
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
@@ -80,6 +84,14 @@ OPTIONS:
                        Commands: :help, :quit, :reset, :items, :type <expr>. Takes --backend
                        (interp, native), -O, --fp, --target-cpu, -A/-W/-D, --color,
                        --error-format, --error-limit and --threads
+    --doctest          Compile and run every ```wk example in the input's doc comments (/// and
+                       //!) and report each (`doctest <file>:<line> ... ok`; exit 1 if any
+                       failed). An example sees the file's items (its own main aside); one with
+                       no fn main is wrapped in `fn main() -> i32 { ...; return 0; }`. It must
+                       exit 0; tagged ```wk,no_run it must only compile, ```wk,compile_fail[,E0503]
+                       it must fail to compile (with that code), ```wk,ignore it is skipped.
+                       Takes --backend (interp, native), -O, --fp, --target-cpu, --color,
+                       --error-format and --error-limit
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)
@@ -151,6 +163,8 @@ EXAMPLES:
     wukongc --run model.wk -- data/weights.bin 64
     wukongc --run -e 'fn main() -> i32 { printf(\"{}\\n\", 6 * 7); return 0; }'
     wukongc --emit=mir,llvm-ir,obj -O2 -o kernel kernel.wk
+    wukongc --emit=doc examples/fib.wk > fib.md
+    wukongc --doctest examples/fib.wk
     wukongc --repl --backend=native
 ";
 
@@ -200,6 +214,8 @@ fn run_compile(opts: Options) -> i32 {
         .spawn(move || {
             if opts.repl {
                 wukong_driver::repl::run(&opts)
+            } else if opts.doctest {
+                wukong_driver::doctest::run(&opts)
             } else {
                 compile(&opts)
             }
@@ -459,6 +475,69 @@ fn check_repl_flags(opts: &Options, has_input: bool, emit_explicit: bool) -> Res
     Ok(())
 }
 
+/// `--doctest` compiles and runs a file's doc examples. It honours the flags that shape how an
+/// example compiles and runs — `--backend=interp|native`, `-O<n>`, `--fp`, `--target-cpu`,
+/// `--color`, `--error-format`, `--error-limit` and `--threads` — and refuses every other one by
+/// name, rather than ignoring it. (Examples are not linted, so `-A/-W/-D` are refused too.)
+fn check_doctest_flags(
+    opts: &Options,
+    emit_explicit: bool,
+    lints_given: bool,
+) -> Result<(), String> {
+    let defaults = Options::default();
+    let g = &opts.grad;
+    let d = &defaults.grad;
+    let training = g.train
+        || g.of.is_some()
+        || !g.wrt.is_empty()
+        || g.train_steps != d.train_steps
+        || g.train_lr != d.train_lr
+        || g.train_weight_decay != d.train_weight_decay
+        || g.train_opt != d.train_opt
+        || g.train_seed != d.train_seed
+        || !g.train_init.is_empty()
+        || !g.train_data.is_empty()
+        || !g.train_save.is_empty()
+        || g.train_clip.is_some()
+        || g.train_warmup != d.train_warmup
+        || g.train_schedule != d.train_schedule;
+    let refused = [
+        (opts.repl, "`--repl`"),
+        (opts.run, "`--run` (every example is run already)"),
+        (emit_explicit, "`--emit`"),
+        (opts.output.is_some(), "`-o`"),
+        (!opts.program_args.is_empty(), "`--` program arguments"),
+        (
+            training,
+            "`--train`, `--grad-of`, `--grad-wrt` or the `--train-*` options",
+        ),
+        (opts.depfile.is_some(), "`--depfile`"),
+        (
+            opts.time_passes || opts.time_trace.is_some(),
+            "`--time-passes` / `--time-trace`",
+        ),
+        (
+            opts.passes.is_some() || opts.print_after.is_some(),
+            "`--passes` / `--print-after`",
+        ),
+        (opts.verify_each, "`--verify-each`"),
+        (opts.remarks_dispatch, "`--remarks`"),
+        (opts.debug_info, "`-g`"),
+        (lints_given, "`-A`/`-W`/`-D` (examples are not linted)"),
+        (
+            matches!(
+                opts.backend,
+                wukong_driver::BackendKind::Gpu | wukong_driver::BackendKind::GpuLower
+            ),
+            "a GPU `--backend` (examples run on interp or native)",
+        ),
+    ];
+    match refused.iter().find(|(given, _)| *given) {
+        Some((_, what)) => Err(format!("`--doctest` does not take {what}")),
+        None => Ok(()),
+    }
+}
+
 /// Parse CLI arguments. `Ok(None)` means a help / version / `--explain` message was already printed
 /// and we should exit successfully without compiling. The two rejected flag *combinations* are
 /// checked at the end, after the whole argv has been seen.
@@ -467,6 +546,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut input: Option<PathBuf> = None;
     let mut inline_source: Option<String> = None;
     let mut emit_explicit = false;
+    let mut lints_given = false;
     let mut color_choice = ColorChoice::Auto;
 
     let mut i = 0;
@@ -493,6 +573,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--run" => opts.run = true,
             "--repl" => opts.repl = true,
+            "--doctest" => opts.doctest = true,
             // Everything after `--` belongs to the program `--run` executes, not to the compiler.
             "--" => {
                 opts.program_args = args[i + 1..].to_vec();
@@ -713,6 +794,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 };
             }
             "-A" | "-W" | "-D" => {
+                lints_given = true;
                 i += 1;
                 let lint = args.get(i).ok_or_else(|| {
                     format!("`{arg}` requires a lint name, e.g. `{arg} warnings`")
@@ -720,6 +802,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 set_lint_level(&mut opts.lint_levels, arg, lint)?;
             }
             _ if arg.len() > 2 && ["-A", "-W", "-D"].iter().any(|f| arg.starts_with(f)) => {
+                lints_given = true;
                 set_lint_level(&mut opts.lint_levels, &arg[..2], &arg[2..])?;
             }
             _ if arg.starts_with("--error-limit=") => {
@@ -746,6 +829,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // Resolve color once the whole environment is known: `--color` (or its `auto` default) plus the
     // NO_COLOR / CLICOLOR_FORCE / TERM conventions, and VT setup on Windows.
     opts.color = resolve_color(color_choice);
+
+    // `--doctest` runs a file's doc examples: no stage, no artifact, no run of the file itself.
+    if opts.doctest {
+        check_doctest_flags(&opts, emit_explicit, lints_given)?;
+    }
 
     // `--repl` reads its program from standard input, an input at a time: no input file, no stage
     // and no artifact. What it does honour is checked in one place.
@@ -867,6 +955,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         let early = match opts.emit {
             EmitStage::Tokens => Some("tokens"),
             EmitStage::Ast => Some("ast"),
+            EmitStage::Doc => Some("doc"),
             EmitStage::Check => Some("check"),
             EmitStage::MirHigh => Some("mir-high"),
             _ => None,
@@ -915,12 +1004,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
 
-    // The dependency set is the import graph, and these two stages stop before imports are loaded:
-    // a depfile written there would silently omit every imported file.
-    if opts.depfile.is_some() && matches!(opts.emit, EmitStage::Tokens | EmitStage::Ast) {
+    // The dependency set is the import graph, and these three stages stop before imports are
+    // loaded: a depfile written there would silently omit every imported file.
+    if opts.depfile.is_some()
+        && matches!(
+            opts.emit,
+            EmitStage::Tokens | EmitStage::Ast | EmitStage::Doc
+        )
+    {
         return Err(
-            "`--depfile` needs the import graph, which `--emit=tokens` and `--emit=ast` stop \
-             before loading"
+            "`--depfile` needs the import graph, which `--emit=tokens`, `--emit=ast` and \
+             `--emit=doc` stop before loading"
                 .to_string(),
         );
     }
@@ -942,6 +1036,44 @@ mod tests {
         );
         for opt in ["--check", "--stdout", "-h, --help", "./fmt"] {
             assert!(fmt_cmd::FMT_USAGE.contains(opt), "fmt usage lacks `{opt}`");
+        }
+    }
+
+    /// `--emit=doc` is a root-file stage like `ast` (it combines with `check`, takes no depfile and
+    /// no pass list), and `--doctest` is a mode of its own that refuses what it cannot honour; both
+    /// are in USAGE.
+    #[test]
+    fn doc_stage_and_doctest_flags_parse() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--emit=doc", "in.wk"]).unwrap().unwrap();
+        assert_eq!(o.emit, EmitStage::Doc);
+        let o = parse(&["--emit=check,doc", "in.wk"]).unwrap().unwrap();
+        assert_eq!(
+            (o.emit, o.emit_also.as_slice()),
+            (EmitStage::Check, &[EmitStage::Doc][..])
+        );
+        assert!(parse(&["--emit=doc", "--depfile=d.d", "in.wk"]).is_err());
+        assert!(parse(&["--emit=doc", "--passes=dce", "in.wk"]).is_err());
+        assert!(parse(&["--emit=doc", "-o", "x.md", "in.wk"]).is_err());
+
+        let o = parse(&["--doctest", "--backend=native", "-O2", "in.wk"])
+            .unwrap()
+            .unwrap();
+        assert!(o.doctest && o.opt_level == 2 && !o.run);
+        for bad in [
+            &["--doctest", "--run", "in.wk"][..],
+            &["--doctest", "--emit=mir", "in.wk"][..],
+            &["--doctest", "-o", "x", "in.wk"][..],
+            &["--doctest", "--backend=gpu-native", "in.wk"][..],
+            &["--doctest", "-A", "dead_code", "in.wk"][..],
+            &["--doctest", "--train-steps=3", "in.wk"][..],
+            &["--doctest", "--repl"][..],
+            &["--doctest"][..],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        for text in ["tokens, ast, doc, check", "--doctest", ".md (doc)"] {
+            assert!(USAGE.contains(text), "USAGE lacks {text:?}");
         }
     }
 
