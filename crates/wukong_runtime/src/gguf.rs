@@ -14,8 +14,13 @@
 //! A string is a `u64` byte length and that many bytes (no terminator). A value is one of thirteen
 //! types — `u8 i8 u16 i16 u32 i32 f32 bool string array u64 i64 f64` (ids 0–12) — and an array is
 //! `{u32 element_type, u64 count, count values}`, arrays of arrays included. Every value is parsed
-//! (and kept, as [`MetaValue`]): the tensor table sits after the metadata, so a reader cannot reach
-//! it without walking every value, and `general.alignment` must be a `u32` power of two.
+//! and checked: the tensor table sits after the metadata, so a reader cannot reach it without
+//! walking every value, and `general.alignment` must be a `u32` power of two. What is *kept* (as
+//! [`MetaValue`], in [`Gguf::metadata`]) depends on the entry: [`gguf_parse`] — behind the
+//! `gguf_meta_*` accessors — keeps every pair, while [`gguf_parse_tensors`] — behind the tensor
+//! reads, the tensor-table queries and the mapped loads (`gguf_open(path, false)`) — steps over
+//! the values and keeps only `general.alignment`. A check that needs any other key on those paths
+//! must open with `keep_meta`.
 //!
 //! A tensor's `ne[0]` is its **innermost** (fastest-varying) dimension; Wukong, like safetensors,
 //! NumPy and PyTorch, spells a shape outermost first, so the GGUF dims `[4096, 11008]` are the
@@ -166,7 +171,8 @@ pub struct GgufTensorInfo {
 pub struct Gguf {
     /// The format version (2 or 3).
     pub version: u32,
-    /// Every metadata key/value pair, in file order.
+    /// The kept metadata key/value pairs, in file order: every pair from [`gguf_parse`], only
+    /// `general.alignment` (when present) from [`gguf_parse_tensors`].
     pub metadata: Vec<(Vec<u8>, MetaValue)>,
     /// The tensor table, in file order.
     pub tensors: Vec<GgufTensorInfo>,
