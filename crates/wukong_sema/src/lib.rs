@@ -4761,6 +4761,11 @@ impl<'a> Sema<'a> {
                     );
                     return Ty::Unknown;
                 }
+                // An integer literal beside an 8-bit float converts to it (`x * 1000`, `x < 1000`):
+                // `E0438` when the f8 cannot hold it (`f8.rs`).
+                if !matches!(op, Shl | Shr | And | Or) {
+                    self.range_check_f8_int_operands(lhs, rhs, &l, &r);
+                }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
                     // base-pointer compare — two distinct values are *always* "not equal" — a wrong
@@ -5152,7 +5157,13 @@ impl<'a> Sema<'a> {
                     // [1024]-vs-[2] lie turns a statically-valid index into a runtime OOB segfault.
                     // Unify them — the 4th shape-bearing context, the one `check_binop_shapes` missed.
                     self.check_merge_shapes(&then_ty, &else_ty, Some(else_expr), else_expr.span);
-                    join(then_ty, else_ty)
+                    let merged = join(then_ty, else_ty);
+                    // An integer-literal arm merging into an 8-bit float converts to it (`f8.rs`).
+                    if let Some(tail) = &then_branch.tail {
+                        self.range_check_f8_int_arm(tail, &merged);
+                    }
+                    self.range_check_f8_int_arm(else_expr, &merged);
+                    merged
                 } else {
                     Ty::Unit
                 }
@@ -5188,6 +5199,10 @@ impl<'a> Sema<'a> {
                     // is an E0502 — not a silently mistyped result that mis-strides or reinterprets.
                     self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
+                }
+                // An integer-literal arm merging into an 8-bit float converts to it (`f8.rs`).
+                for arm in arms {
+                    self.range_check_f8_int_arm(&arm.body, &result);
                 }
                 // The `else` of a `let … else` (which the parser made this match's `_` arm) must
                 // diverge (`patterns.rs`).

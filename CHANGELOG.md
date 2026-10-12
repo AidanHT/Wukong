@@ -43,7 +43,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   conversion builtins only.
 - **Literals, conversions, printing.** `1.5f8e4m3` / `3f8e5m2` suffixes and unsuffixed literals
   adapting to an f8 type; a literal that would saturate, overflow or round to zero is the new
-  **`E0438`**. `as` reaches every integer and float type in one rounding — an `f64` is encoded from
+  **`E0438`** — and so is an unsuffixed integer literal that converts to an f8 beside an f8 value
+  (`x * 1000`, `x < 1000`, `e += 1000`, `max(x, 1000)`, `clamp`, `fma`, an `if`/`match` arm),
+  which would otherwise silently be 448 or infinity. `as` reaches every integer and float type in one rounding — an `f64` is encoded from
   its own bits, never through `f32` (which would round twice) — and an f8 widens losslessly in mixed
   arithmetic to `f16`, `bf16`, `f32`, `f64`; `f8e4m3` with `f8e5m2`, or with an integer, is `E0440`.
   An f8 prints as the `f32` it holds, in `print`, `printf` and aggregates. `bits(x)` is the OCP code

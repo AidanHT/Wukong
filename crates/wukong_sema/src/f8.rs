@@ -14,9 +14,16 @@
 //! and an unsuffixed one at every site it adapts to an f8 annotation, parameter, field or return
 //! (`Sema::range_check_int_literal`, which every adaptation site already calls). Arithmetic that
 //! overflows at run time is the format's saturation / overflow rule, not this check's.
+//!
+//! An unsuffixed *integer* literal never adapts to an f8 annotation (`let x: f8e4m3 = 1000;` is
+//! `E0401`), but beside an f8 value it converts to that value's type, as it would to any float:
+//! `x * 1000`, `x < 1000`, `e += 1000`, `max(x, 1000)`, `clamp(x, 0, 1000)`, `fma(x, 1000, 0)` and
+//! an `if`/`match` arm merging with an f8. It is computed in its own integer type and rounded onto
+//! the f8 grid once, so one the format cannot hold is `E0438` too
+//! (`Sema::range_check_f8_int_literal`).
 
 use wukong_ast::{BinOp, Expr, ExprKind, UnOp};
-use wukong_types::Scalar;
+use wukong_types::{Scalar, Ty};
 
 use crate::Sema;
 
@@ -132,6 +139,60 @@ impl Sema<'_> {
                 self.range_check_f8_literal(rhs, sc);
             }
             _ => {}
+        }
+    }
+
+    /// `E0438` for an unsuffixed integer literal operand `e` — a lone literal, a negated one, or an
+    /// all-integer expression of them, judged by its folded value — that converts to the f8 type
+    /// `sc` because it meets an f8 value (see the module docs for the sites). The integer is
+    /// rounded onto the f8 grid once, so `x * 1000` of an `f8e4m3` would multiply by 448 exactly as
+    /// `e += 1000.0` would add 448. A float literal, or any other expression, is not this check's.
+    pub(crate) fn range_check_f8_int_literal(&mut self, e: &Expr, sc: Scalar) {
+        if !sc.is_f8() || !self.is_literal_operand(e) {
+            return;
+        }
+        // `eval_const_int` folds integer literals only (a float leaf is `None`), in `i64`; a lone
+        // literal past `i64` is read from its magnitude.
+        let shown = match crate::eval_const_int(e, self.interner) {
+            Some(v) => v.to_string(),
+            None => match crate::wide_lit_value(e, self.interner) {
+                Some((neg, mag, false)) => format!("{}{mag}", if neg { "-" } else { "" }),
+                _ => return,
+            },
+        };
+        let Ok(v) = shown.parse::<f64>() else {
+            return;
+        };
+        if let Some(why) = f8_literal_problem(v, sc) {
+            let what = if crate::wide_lit_value(e, self.interner).is_some() {
+                format!("integer literal `{shown}`")
+            } else {
+                format!("integer literal expression (value `{shown}`)")
+            };
+            let ty = sc.name();
+            self.error(
+                e.span,
+                "E0438",
+                format!("{what} converts to `{ty}` beside an `{ty}` value, and it {why}"),
+            );
+        }
+    }
+
+    /// [`Sema::range_check_f8_int_literal`] for the two operands of a binary operator or of
+    /// `min`/`max`: an integer literal beside an f8 value converts to that value's f8 type.
+    pub(crate) fn range_check_f8_int_operands(&mut self, lhs: &Expr, rhs: &Expr, l: &Ty, r: &Ty) {
+        for (lit, other) in [(lhs, r), (rhs, l)] {
+            if let Ty::Scalar(o) = other {
+                self.range_check_f8_int_literal(lit, *o);
+            }
+        }
+    }
+
+    /// [`Sema::range_check_f8_int_literal`] for an `if`/`match` arm whose value merges into the
+    /// f8 type `merged` (`if c { x } else { 1000 }`).
+    pub(crate) fn range_check_f8_int_arm(&mut self, arm: &Expr, merged: &Ty) {
+        if let Ty::Scalar(sc) = merged {
+            self.range_check_f8_int_literal(crate::merge_arm_value(arm), *sc);
         }
     }
 }

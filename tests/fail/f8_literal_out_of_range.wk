@@ -1,5 +1,5 @@
 // EXPECT-CODE: E0438
-// EXPECT-COUNT: 6
+// EXPECT-COUNT: 16
 module tests.fail.f8_literal_out_of_range
 
 // An 8-bit float literal is worth its rounding onto the format's grid, so one that rounds past the
@@ -8,6 +8,12 @@ module tests.fail.f8_literal_out_of_range
 // `0.0001f8e4m3` zero (E4M3FN's least value is 2^-9). Each is E0438 — suffixed, or unsuffixed where it
 // adapts to an f8 annotation, parameter, field or compound-assignment place. 464.0 is in range: it is
 // the midpoint of 448 and the absent 480, which ties to the even 448.
+//
+// An unsuffixed INTEGER literal beside an f8 value converts to that value's type, so the same rule
+// holds for it in every such position: an arithmetic or comparison operand, a compound-assignment
+// operand, a `min`/`max`/`clamp`/`fma` operand and an `if`/`match` arm merging with an f8 (`ints`).
+// An all-integer expression is judged by its value (`2 * 300` is 600). 464 and -448 are in range, and
+// so is 61439 for E5M2: it is below the midpoint 61440 of 57344 and infinity.
 struct S {
     w: f8e4m3,
 }
@@ -16,7 +22,31 @@ fn f(x: f8e5m2) -> f8e5m2 {
     return x;
 }
 
+fn ints(x: f8e4m3, y: f8e5m2, c: bool, n: i32) -> f8e4m3 {
+    let mut e: f8e4m3 = x;
+    e += 1000; //~ E0438
+    let mut g: f8e5m2 = y;
+    g *= 70000; //~ E0438
+    let p = x * 1000; //~ E0438
+    let q = y - 100000; //~ E0438
+    let lt = x < 500; //~ E0438
+    let eq = -1000 == x; //~ E0438
+    let m = max(x, 1000); //~ E0438
+    let k = clamp(x, 0, 2 * 300); //~ E0438
+    let v = if c { x } else { 1000 }; //~ E0438
+    let w = match n {
+        0 => x,
+        _ => 600, //~ E0438
+    };
+    let ok = x * 464 + max(x, -448) + clamp(x, -448, 448) + (y * 61439) as f8e4m3;
+    if lt || eq {
+        return p + m + k + v + w + ok + (g + q) as f8e4m3;
+    }
+    return e;
+}
+
 fn main() -> i32 {
+    let i = ints(1.0, 1.0, true, 0);
     let a = 500.0f8e4m3; //~ E0438
     let b = 70000.0f8e5m2; //~ E0438
     let c: f8e4m3 = 0.0001; //~ E0438
@@ -25,5 +55,5 @@ fn main() -> i32 {
     let s = S { w: -999.0 }; //~ E0438
     let mut e: f8e4m3 = 1.0;
     e += 1000.0; //~ E0438
-    return (a as i32) + (b as i32) + (c as i32) + (ok as i32) + (d as i32) + (s.w as i32) + (e as i32);
+    return (a as i32) + (b as i32) + (c as i32) + (ok as i32) + (d as i32) + (s.w as i32) + (e as i32) + (i as i32);
 }

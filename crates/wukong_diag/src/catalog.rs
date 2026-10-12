@@ -884,7 +884,10 @@ fn main() -> i32 {
         "8-bit float literal out of range",
         "A literal of an 8-bit float type — suffixed (`1.5f8e4m3`, `0.25f8e5m2`), or unsuffixed \
          where it takes an `f8e4m3`/`f8e5m2` type from an annotation, a parameter, a field, a \
-         return type or a compound-assignment place — is worth its rounding onto the format's grid \
+         return type or a compound-assignment place, and an unsuffixed integer literal that \
+         converts to one beside an 8-bit float value (`x * 1000`, `x < 1000`, `e += 1000`, \
+         `max(x, 1000)`, an `if` arm; an all-integer expression by its value) — is worth its \
+         rounding onto the format's grid \
          (nearest, ties to even). Two roundings would silently turn it into a different number, \
          so both are rejected: a magnitude that rounds past the largest finite value (448 for \
          `f8e4m3`, which has no infinity and saturates there; 57344 for `f8e5m2`, which would \

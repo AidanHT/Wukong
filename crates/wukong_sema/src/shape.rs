@@ -403,6 +403,16 @@ impl Sema<'_> {
                     ) {
                         return Ty::Unknown;
                     }
+                    // `min`/`max` take the operands' common type, so an integer literal beside an
+                    // 8-bit float converts to it, like `x * 1000` (`f8.rs`).
+                    if matches!(interner.resolve(name), "min" | "max") && args.len() == 2 {
+                        self.range_check_f8_int_operands(
+                            &args[0],
+                            &args[1],
+                            &arg_tys[0],
+                            &arg_tys[1],
+                        );
+                    }
                     // A math intrinsic operates on a scalar (an integer is coerced to float, like
                     // `sqrt(2)`), a SIMD vector, or a tensor — never an aggregate, pointer, reference,
                     // unit, or function value. Such an argument used to slip through (the result is

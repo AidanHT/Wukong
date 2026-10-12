@@ -596,7 +596,7 @@ impl Sema<'_> {
             .unwrap_or(Ty::Scalar(Scalar::F32));
         if let Ty::Scalar(f) = out {
             for (arg, ty) in args.iter().zip(arg_tys.iter_mut()) {
-                if matches!(ty, Ty::Scalar(s) if s.is_float()) {
+                if matches!(ty, Ty::Scalar(s) if s.is_float() || (f.is_f8() && s.is_int())) {
                     self.sb_adapt(arg, ty, f);
                 }
             }
@@ -604,8 +604,13 @@ impl Sema<'_> {
         out
     }
 
-    /// Re-stamp an unsuffixed literal operand with `ty` (and range-check it).
+    /// Re-stamp an unsuffixed literal operand with `ty` (and range-check it). An integer literal
+    /// does not adapt to a float, but converts to an 8-bit one (`clamp(x, 0, 1000)`,
+    /// `fma(x, 1000, 0)`), so it is range-checked against it (`f8.rs`).
     fn sb_adapt(&mut self, arg: &Expr, arg_ty: &mut Ty, ty: Scalar) {
+        if ty.is_f8() && matches!(arg_ty, Ty::Scalar(s) if s.is_int()) {
+            self.range_check_f8_int_literal(arg, ty);
+        }
         let t = Ty::Scalar(ty);
         if self.literal_adapts(&t, arg) {
             self.retype_adapted_literal(arg, &t);

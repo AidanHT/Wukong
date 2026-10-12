@@ -236,6 +236,9 @@ impl Sema<'_> {
             } else if ts.is_f8() && vs.is_float() {
                 // The operand is rounded onto the place's 8-bit grid before the operation.
                 self.range_check_f8_literal(value, ts);
+            } else if ts.is_f8() && vs.is_int() && !shift {
+                // So is an integer literal (`e += 1000`), converted to the place's type (`f8.rs`).
+                self.range_check_f8_int_literal(value, ts);
             }
             return;
         }

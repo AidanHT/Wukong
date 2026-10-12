@@ -577,7 +577,11 @@ slice elements, `alloc::<f8e4m3>(n)` buffers, generic instantiations, `Tensor[f8
   (`0.0001f8e4m3`) is **`E0438`** (`tests/fail/f8_literal_out_of_range.wk`); `464.0f8e4m3` is fine —
   it is the midpoint of 448 and the absent 480 and ties to the even 448. In arithmetic an unsuffixed
   float literal stays `f32`, as with `bf16`: `x * 2.0` of an `f8e4m3` is an `f32` product, and
-  `x * 2.0f8e4m3` an f8 one.
+  `x * 2.0f8e4m3` an f8 one. An unsuffixed *integer* literal beside an f8 value converts to the
+  f8 (`x * 2` is an f8 product), so the same rule holds for it as an arithmetic, comparison,
+  compound-assignment, `min`/`max`/`clamp`/`fma` operand or an `if`/`match` arm: `x * 1000`,
+  `x < 1000` and `e += 1000` of an `f8e4m3` are `E0438`, where they would silently use 448 (an
+  all-integer expression is judged by its value, `2 * 300` by 600).
 - **Mixed arithmetic** promotes losslessly: every f8 value is exactly an `f16`, a `bf16`, an `f32`
   and an `f64`, so `x_f8 + y_f32` is `f32`; `f8e4m3` with `f8e5m2` (each holds values the other
   cannot) and an f8 with any integer are `E0440` (`tests/fail/f8_format_mix.wk`).
