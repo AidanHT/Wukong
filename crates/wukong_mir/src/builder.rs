@@ -1,10 +1,10 @@
 //! A convenience builder for constructing MIR functions imperatively.
 
 use crate::{
-    AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, ParamAttrs, Terminator, ValueId,
-    VecKernel,
+    AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, ParamAttrs, SourceLocs,
+    Terminator, ValueId, VecKernel,
 };
-use wukong_span::Symbol;
+use wukong_span::{Span, Symbol};
 
 /// Builds one [`Function`]. Create it, add parameters, carve out blocks, append instructions to
 /// the "current" block, and finish.
@@ -20,6 +20,13 @@ pub struct Builder {
     /// Per-parameter source facts, index-parallel to the entry block's parameters (shorter when the
     /// trailing parameters carry none). Becomes [`Function::param_attrs`].
     param_attrs: Vec<ParamAttrs>,
+    /// The source span every new value is attributed to ([`Builder::set_loc`]). Dummy until the
+    /// lowerer names one; a value created under a dummy span has no location.
+    loc: Span,
+    /// The declaration the function is lowered from ([`Builder::set_decl`]).
+    decl: Span,
+    /// One span per value, index-parallel to `value_types`. Becomes [`SourceLocs::values`].
+    value_locs: Vec<Span>,
 }
 
 impl Builder {
@@ -33,6 +40,9 @@ impl Builder {
             current: BlockId(0),
             vec_kernels: Vec::new(),
             param_attrs: Vec::new(),
+            loc: Span::dummy(),
+            decl: Span::dummy(),
+            value_locs: Vec::new(),
         };
         let entry = b.new_block();
         b.entry = entry;
@@ -64,7 +74,39 @@ impl Builder {
     pub fn new_value(&mut self, ty: MirType) -> ValueId {
         let id = ValueId(self.value_types.len() as u32);
         self.value_types.push(ty);
+        self.value_locs.push(self.loc);
         id
+    }
+
+    /// Record the declaration this function is lowered from ([`SourceLocs::decl`]). A real span
+    /// also becomes the current location, so every value built before the first statement names
+    /// one — the parameters among them. A dummy span is stored but leaves the location alone.
+    pub fn set_decl(&mut self, s: Span) {
+        self.decl = s;
+        if !s.is_dummy() {
+            self.loc = s;
+        }
+    }
+
+    /// Attribute every value created from now on to `s`, returning the previous location for
+    /// [`Builder::restore_loc`]. A dummy `s` changes nothing, so a compiler-synthesized node
+    /// (which has no source text) inherits the location of the construct around it.
+    pub fn set_loc(&mut self, s: Span) -> Span {
+        let prev = self.loc;
+        if !s.is_dummy() {
+            self.loc = s;
+        }
+        prev
+    }
+
+    /// Return to a location [`Builder::set_loc`] or [`Builder::current_loc`] handed out.
+    pub fn restore_loc(&mut self, prev: Span) {
+        self.loc = prev;
+    }
+
+    /// The span new values are currently attributed to (dummy when none was set).
+    pub fn current_loc(&self) -> Span {
+        self.loc
     }
 
     /// The MIR type of an already-created value (mid-construction). Mirrors
@@ -264,6 +306,10 @@ impl Builder {
             entry: self.entry,
             vec_kernels: self.vec_kernels,
             param_attrs: self.param_attrs,
+            locs: SourceLocs {
+                decl: self.decl,
+                values: self.value_locs,
+            },
         }
     }
 }

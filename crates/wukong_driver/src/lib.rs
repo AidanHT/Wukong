@@ -4146,6 +4146,7 @@ mod verify_gate_tests {
             entry: BlockId(0),
             vec_kernels: Vec::new(),
             param_attrs: Vec::new(),
+            locs: Default::default(),
         };
         Program {
             funcs: vec![f],

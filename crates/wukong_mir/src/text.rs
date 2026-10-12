@@ -827,6 +827,8 @@ impl FnParser {
             entry: self.entry.unwrap_or(BlockId(0)),
             vec_kernels: Vec::new(),
             param_attrs: self.param_attrs,
+            // Textual MIR carries no source locations.
+            locs: Default::default(),
         })
     }
 }
@@ -1543,6 +1545,7 @@ mod tests {
             entry: BlockId(1),
             vec_kernels: vec![],
             param_attrs: vec![],
+            locs: Default::default(),
         });
         p
     }

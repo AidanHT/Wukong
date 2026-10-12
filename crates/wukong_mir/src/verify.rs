@@ -186,6 +186,17 @@ impl<'a> Verifier<'a> {
             }
         }
 
+        // The source-location table may be shorter than the value arena, never longer: an entry
+        // past the arena names a value that does not exist, so whatever wrote it misnumbered
+        // something (`SourceLocs`).
+        if f.locs.values.len() > f.value_types.len() {
+            self.err(format!(
+                "the source-location table has {} entries for {} values",
+                f.locs.values.len(),
+                f.value_types.len()
+            ));
+        }
+
         // Both backends bind the entry block's parameters by zipping them against `Function::params`
         // and both zips truncate silently (Cranelift then aborts on the first unbound value, the
         // interpreter reads it as 0), so the two lists must agree.
@@ -2025,5 +2036,62 @@ mod tests {
         assert_eq!(f.blocks[0].term.edge_count(), 3);
         assert_eq!(f.blocks[0].term.edge_target(2), Some(crate::BlockId(3)));
         assert_eq!(f.blocks[0].term.edge_target(3), None);
+    }
+
+    /// The builder attributes each value to the location current when it was created, `set_decl`
+    /// starts the function at its declaration, dummy spans never displace a real one, and the
+    /// verifier rejects a table that outgrew the value arena.
+    #[test]
+    fn source_locations_follow_the_builder_and_bound_the_arena() {
+        use wukong_span::{SourceId, Span};
+        let at = |lo: u32| Span::new(SourceId(0), lo, lo + 1);
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("located"), MirType::I64);
+        let p = b.add_param(MirType::I64);
+        b.set_decl(at(3));
+        let q = b.add_param(MirType::I64);
+        let outer = b.set_loc(at(10));
+        assert_eq!(outer, at(3));
+        let sum = b.build(MirType::I64, Op::Bin(BinOp::Add, p, q));
+        // A synthesized node (dummy span) inherits the construct around it.
+        let prev = b.set_loc(Span::dummy());
+        let twice = b.build(MirType::I64, Op::Bin(BinOp::Add, sum, sum));
+        b.restore_loc(prev);
+        assert_eq!(b.current_loc(), at(10));
+        b.restore_loc(outer);
+        let slot = b.alloca(MirType::I64);
+        b.ret(Some(twice));
+        let mut f = b.finish();
+        assert_eq!(f.value_loc(p), None, "created before any location was set");
+        assert_eq!(f.value_loc(q), Some(at(3)));
+        assert_eq!(f.value_loc(sum), Some(at(10)));
+        assert_eq!(f.value_loc(twice), Some(at(10)));
+        assert_eq!(f.value_loc(slot), Some(at(3)));
+        assert_eq!(f.decl_span(), Some(at(3)));
+        assert!(verify_function(&f).is_empty());
+
+        // Dropping entries is sound; copying from an unknown value changes nothing.
+        f.locs.values.truncate(2);
+        assert_eq!(f.value_loc(sum), None);
+        f.copy_value_loc(p, sum);
+        assert_eq!(f.value_loc(sum), None);
+        f.copy_value_loc(q, slot);
+        assert_eq!(f.value_loc(slot), Some(at(3)));
+        assert!(verify_function(&f).is_empty());
+
+        // An entry for a value that does not exist is an error.
+        let past = crate::ValueId(f.value_types.len() as u32);
+        f.set_value_loc(past, at(20));
+        let errs = verify_function(&f);
+        assert!(
+            errs.iter().any(|e| e.contains("source-location table")),
+            "{errs:?}"
+        );
+        let f = Function {
+            locs: crate::SourceLocs::default(),
+            ..f
+        };
+        assert_eq!(f.decl_span(), None);
+        assert!(verify_function(&f).is_empty());
     }
 }
