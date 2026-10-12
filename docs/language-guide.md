@@ -2147,7 +2147,8 @@ only once every chunk has completed; each per-core chunk is itself auto-vectoriz
 SIMD). The interpreter runs the same range sequentially, so results stay differentially equal.
 
 The whole-function vehicle fires on a narrow shape: **every** parameter must be a fixed-size array
-(`[T; N]`) — a `[]T` slice, a `Tensor[..]`, a pointer or a scalar parameter declines — the body must be
+(`[T; N]`) — a `[]T` slice, a `Tensor[..]`, a pointer or a scalar parameter declines (the region
+vehicle below then gets the loop) — the body must be
 exactly one unlabelled `for i in 0..hi { … }` over a half-open, unit-step range starting at literal `0`,
 and the body must not `return` or `break`/`continue` out of that loop (a `break`/`continue`
 inside an *inner* loop is fine; a `defer` is lowered to ordinary statements first, so a body holding
@@ -2160,23 +2161,52 @@ statement, so the outliner declines it and the ordinary lowering that follows di
 reduction kernel from inside the loop.
 
 `@parallel` has a second vehicle for functions the whole-function outliner declines. Inside a
-`@parallel` function, an inner `for hh in 0..N { … }` with a literal `0` start, a literal trip count
-`N >= 2`, and provably per-iteration-disjoint writes is outlined on its own into a region body
+`@parallel` function, an inner `for hh in 0..N { … }` with a literal `0` start and provably
+per-iteration-disjoint writes is outlined on its own into a region body
 (`wukong$par$<n>(start, end, env)`) plus one `wukong_parallel_for` call — the same runtime contract, so
-the interpreter still runs `[0, N)` sequentially. The disjointness proof requires every escaping write
-to hit a *captured fixed-size array* at an index carrying the loop variable as a mixed-radix digit
-(`hh*C + …`, or the tiled `t/C` / `t%C` pair); per-iteration scratch must be a `let` local inside the
-body. It declines — and the loop lowers serially — for a loop-carried accumulator (a write to a
-captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
-alias a capture), a call other than a pure math intrinsic, a counter-based RNG scalar (`rand_u32`,
-`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output)
-or an `atomic_add` to a captured array element that nothing else in the loop touches (above), a
-`match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
-`break`/`continue`. Two array **parameters** over the same element type may be one caller buffer
-whatever their declared lengths, so the proof covers the union of their accesses — unless a
-`@noalias` promise separates the pair, which lets a gather from one parameter into another thread.
-There is no cap on the number of regions per program (the compiler used to keep
+the interpreter still runs `[0, N)` sequentially. The trip count is a constant `N >= 2` (a literal or
+a `const`), or (✅) one known only at run time — `0..rows`, `0..s.len()`, any pure arithmetic of
+names and literals over a **signed** counter — which the call site evaluates once. The disjointness
+proof requires every escaping write to hit a *captured fixed-size array* or (✅) a *captured `[]T`
+slice of scalars* at an index carrying the loop variable as a mixed-radix digit (`hh*C + …`, or the
+tiled `t/C` / `t%C` pair), with everything else in the index bounded inside one band of the digit's
+stride: `out[hh*C + j]` and `out[(hh + 1)*C + j]` both pass, a buffer written one band up from where
+it is read (`out[hh + 1] = out[hh]`) does not. With a run-time trip count no term can vanish modulo
+`C·N`, so an index offset by a captured name (`out[b*32 + hh*8 + j]`) needs a constant `N`.
+Per-iteration scratch must be a `let` local inside the body. It declines — and the loop lowers
+serially — for a loop-carried accumulator (a write to a captured scalar), a non-affine or offset
+index, a local bound to a slice/pointer/reference (it might alias a capture), a slice passed whole to
+a user function, a call other than a pure math intrinsic, a kernel builtin (below), a counter-based
+RNG scalar (`rand_u32`, `rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane;
+`print` would reorder output) or an `atomic_add` to a captured array or slice element that nothing
+else in the loop touches (above), a `match`/`loop` expression in the body, a `return`/`defer`, and a
+labelled or loop-level `break`/`continue`. Two array **parameters** over the same element type may be
+one caller buffer whatever their declared lengths, so the proof covers the union of their accesses —
+unless a `@noalias` promise separates the pair, which lets a gather from one parameter into another
+thread. There is no cap on the number of regions per program (the compiler used to keep
 every region past the 32nd serial, silently).
+
+**Slices in a region** (✅). A `[]T` capture (parameter or local) is indexed through its fat pointer,
+which nothing in a region can re-point, but its *name* says nothing about where it points: two slices
+of one element type — or a slice and an array — may view one buffer at any offset
+(`f(x[0..64], x[8..72])`). So such a pair is settled at **run time**: the threaded call runs only when
+the two element ranges are disjoint, or start at the same address when the union of their accesses
+passes the proof (`f(x, x)`, in place); otherwise the same outlined body runs once over every chunk,
+in order, on the calling thread — the serial loop. `--emit=mir -O2` shows the test as `ptrtoint`s
+ahead of the `wukong_parallel_for`. Slices of different element types never share storage and need no
+test. Fixture: `tests/run/parallel_region_slices.wk`, whose overlapping-views call prints a wrong,
+run-to-run varying answer natively if the test is removed.
+
+**Kernel builtins in a region** (✅). `softmax`, `log_softmax`, `layernorm`, `rmsnorm`, the
+two-argument activations, `matmul`/`matmul_nt`/`matmul_tn`/`linear`, `transpose`, `sum`/`amax`/
+`amin`/`dot` and `sdpa` are admitted as exactly the reads and writes of their buffer operands — each
+kernel touches every element of each operand (the lowering's run-time extent checks pin a slice to its
+shape) and writes only its output. An operand may be a range view `s[lo..hi]` of a captured slice with
+a constant length `hi - lo` (the elements `lo..hi`), a captured buffer named whole (fine to read,
+never to write — every iteration would write all of it), or a body-local array (private). So a row
+kernel on row `r`, `softmax(x[r*C..r*C + C], out[r*C..r*C + C])`, threads the rows, while a view of
+another row, a run-time length or `out[lo..]` keeps the loop serial. Inside the region each call is
+the serial kernel; the region supplies the threading. Fixture: `tests/run/parallel_region_kernels.wk`.
 
 **How many threads, and when they are used.** The workers are one pool per process, sized to the
 CPUs the process may use (affinity mask and container quota respected) — or to `--threads=<n>` for a

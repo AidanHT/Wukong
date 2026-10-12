@@ -14,19 +14,23 @@ module examples.gpt2_forward_bench_par
 //     1 vmath_f32_parallel (GELU), 2 velem_f32_parallel (the residual adds);
 //   * the final LN and the last-position LM head live in main(), which is NOT @parallel, so they emit
 //     the serial wukong_norm_affine_f32 and wukong_sgemv;
-//   * the attention head loop does NOT outline. `for h in 0..12` is a SERIAL chain of 12 iterations,
-//     each issuing wukong_sgemm_nt_alpha_parallel (Q·Kᵀ), wukong_parallel_for (the 512×512 causal-mask
-//     write), wukong_norm_f32_parallel (row softmax) and wukong_sgemm_nt_parallel (P·V). The cores are
-//     fanned WITHIN each head, twelve times per layer — not ACROSS heads;
-//   * the single outlined region `wukong$par$0` is that causal-mask write (its body holds zero wukong_*
-//     calls and zero allocas), entered 144× per forward;
-//   * the per-head scratch is NOT private per head and does NOT live on pool-worker stacks: all five
-//     arrays are hoisted to gpt2_block's ENTRY block (alloca [32768 x f32] ×4 + alloca [262144 x f32],
-//     ~1.5 MB) and reused across head iterations on the CALLING thread's stack.
-// So this vehicle measures a serial head chain of multicore kernels — the shape the head-outlining
-// design rejects. Read its scaling number as that, not as heads-across-cores. The 1.5 MB frame is also
-// why it survives only under `wukongc --run`, which executes on the 256 MiB compile thread; an
-// --emit=exe build would run main() on the default 1 MiB Windows main-thread stack.
+//   * the attention head loop OUTLINES (N85: the region outliner admits `[]T` slice captures). `for h
+//     in 0..12` is the one region `wukong$par$0` — the heads ACROSS cores — and its body runs one head
+//     with the SERIAL kernels: wukong_sgemm_nt_alpha (Q·Kᵀ), wukong_norm_f32 (row softmax) and
+//     wukong_sgemm_nt (P·V); the 512×512 causal-mask write is a plain loop in that body (regions do
+//     not nest);
+//   * `q`/`k`/`v` (read) and `attn` (written) are slices, so the threaded call is versioned on a
+//     run-time test of their element ranges (four ranges, eight `ptrtoint`s, ahead of the
+//     `wukong_parallel_for` call); this program passes four separate buffers, so it takes the
+//     threaded arm. Overlapping buffers would take the serial arm — a direct call of the same
+//     outlined body;
+//   * the per-head scratch is private per head: the five arrays (alloca [32768 x f32] ×4 + alloca
+//     [262144 x f32], ~1.5 MB) are the outlined body's own frame, so each pool worker (16 MiB stack)
+//     holds one set, and gpt2_block's frame holds none.
+// So this vehicle measures heads-across-cores with serial per-head kernels, beside the whole-[S,D] ops
+// that fan cores inside each kernel. The serial arm would put the 1.5 MB frame on the calling thread,
+// which is safe under `wukongc --run` (it executes on the 256 MiB compile thread); an --emit=exe build
+// runs main() on the default 1 MiB Windows main-thread stack.
 //
 // Numerics are unaffected by any of this: the vehicle produces argmax 338, matching the serial vehicle.
 // Dims are literals here (the S=512 config), the simplest form the recognizers accept. Runtime OFFSETS
@@ -41,8 +45,8 @@ import gpt2_config;
 
 // One pre-LayerNorm decoder block over the real weight blob `w` at layer offset `base`. @parallel: the
 // LNs -> wukong_norm_affine_f32_parallel, the six projections -> sgemm_nt_epi_parallel, the residual
-// adds -> velem_f32_parallel; the head loop stays serial and fans cores inside each head (see the header
-// for the measured emission). Reads x, writes out (= x + block(x)).
+// adds -> velem_f32_parallel; the head loop is one region spreading the heads across cores (see the
+// header for the measured emission). Reads x, writes out (= x + block(x)).
 @parallel
 fn gpt2_block(
     w: []f32, base: i64,
@@ -81,18 +85,18 @@ fn gpt2_block(
         v[i * 768 + j] = w[base + GPT2_REL_BV + j] + s;
     } }
 
-    // ---- multi-head causal attention (H=12, hd=64). The heads ARE independent, but this loop does not
-    // outline: the region-legality scan cannot prove the column-band disjointness across the []f32 slice
-    // params, so what is emitted is a serial 12-iteration chain of multicore per-head kernels. ----
+    // ---- multi-head causal attention (H=12, hd=64). The heads are independent and the region proof
+    // sees it: every write `attn[i * 768 + h * 64 + dd]` carries `h` as the digit of stride 64 (the
+    // `i * 768` row term vanishes mod 64·12), and the reads of q/k/v sit in the same band, so the loop
+    // outlines into one region behind a run-time range test of the four slices. ----
     for h in 0..12 {
         let mut qh:     [f32; 32768]  = [0.0; 32768];   // [512, 64]
         let mut kh:     [f32; 32768]  = [0.0; 32768];   // [512, 64]
         let mut vt:     [f32; 32768]  = [0.0; 32768];   // [64, 512]  (V transposed -> NT P·V)
         let mut scores: [f32; 262144] = [0.0; 262144];  // [512, 512]
         let mut oh:     [f32; 32768]  = [0.0; 32768];   // [512, 64]
-        // separate, contiguously-written repacks: the combined/transposed form defeats the parallel-
-        // region legality scan. (Splitting them was not enough either — the loop still does not outline;
-        // the declarations stay here because the emitted allocas are hoisted to the entry block anyway.)
+        // separate, contiguously-written repacks into the head's private scratch (the outlined body's
+        // own frame, so one set per worker).
         for i in 0..512 { for p in 0..64 { qh[i * 64 + p] = q[i * 768 + h * 64 + p]; } }
         for i in 0..512 { for p in 0..64 { kh[i * 64 + p] = k[i * 768 + h * 64 + p]; } }
         for dd in 0..64 { for p in 0..512 { vt[dd * 512 + p] = v[p * 768 + h * 64 + dd]; } }
