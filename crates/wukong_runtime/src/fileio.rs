@@ -82,6 +82,10 @@ pub const IO_NAME_NOT_FOUND: i64 = -5;
 /// The container's header is malformed: bad magic, unparseable header, a payload outside the
 /// file, or a payload whose byte length disagrees with its dtype and shape.
 pub const IO_BAD_HEADER: i64 = -6;
+/// The tensor's storage type has no decoder for this read: a GGUF type id outside the ggml table
+/// (or one ggml retired), or a block-quantized type with no dequantizer (an i-quant) read into
+/// `f32` ([`crate::gguf`]).
+pub const IO_UNSUPPORTED_TYPE: i64 = -7;
 
 /// Elements per staged chunk of a widening load (128 KiB of half-precision input).
 const WIDEN_CHUNK: usize = 1 << 16;
@@ -199,15 +203,23 @@ pub fn check_dest(
     } else {
         return Err(IO_DTYPE_MISMATCH);
     };
-    let count = shape_count(&loc.shape)?;
     if loc.fortran && loc.shape.len() >= 2 {
+        shape_count(&loc.shape)?;
         return Err(IO_SHAPE_MISMATCH);
     }
+    Ok((check_shape(&loc.shape, dest_len, dims)?, widen))
+}
+
+/// The shape half of [`check_dest`], shared with the GGUF reader: a tensor-view destination's rank
+/// and every dimension must equal `shape` (outermost first), and the destination's element count
+/// must equal `shape`'s exactly. Returns that count.
+pub fn check_shape(shape: &[u64], dest_len: i64, dims: Option<&[i64]>) -> Result<usize, i64> {
+    let count = shape_count(shape)?;
     if let Some(dims) = dims {
-        let same = dims.len() == loc.shape.len()
+        let same = dims.len() == shape.len()
             && dims
                 .iter()
-                .zip(&loc.shape)
+                .zip(shape)
                 .all(|(&d, &s)| u64::try_from(d).ok() == Some(s));
         if !same {
             return Err(IO_SHAPE_MISMATCH);
@@ -216,8 +228,7 @@ pub fn check_dest(
     if u64::try_from(dest_len).ok() != Some(count) {
         return Err(IO_SHAPE_MISMATCH);
     }
-    let count = usize::try_from(count).map_err(|_| IO_SHAPE_MISMATCH)?;
-    Ok((count, widen))
+    usize::try_from(count).map_err(|_| IO_SHAPE_MISMATCH)
 }
 
 /// Which container a typed load parses, with the tensor name a safetensors file is indexed by.
