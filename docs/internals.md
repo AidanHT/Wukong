@@ -622,6 +622,53 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
 
+### Running a chosen pass list: `--passes` and `--print-after`
+
+`wukong_driver::passes` (`crates/wukong_driver/src/passes.rs`) is a replica of
+`optimize_preserving` built only from `wukong_opt`'s public API, so a pipeline can be named on the
+command line. `--passes=<list>` takes comma-separated names:
+
+- **Function passes**, by their `Pass::name()`: `sroa`, `mem2reg`, `simplify`, `jump-thread`,
+  `simplify-cfg`, `simplify-phis`, `dce`, `tre`, `cse`, `dse`, `loop-canon`, `loop-delete`, `fuse`,
+  `licm`, `bce`, `unswitch`, `promote`, `vectorize`. Consecutive ones form one group, run to a
+  per-function fixpoint exactly as `PassManager::run` runs the standard list (callees first, call
+  effects summarized per SCC, clean-tracking). A name may repeat.
+- **Program steps**, run once where named, each closing the group before it: `inline`
+  (`inline_program`), `unroll` (`unroll_program` plus `PassManager::unroll_cleanup` over the functions
+  it changed), `slp` (`slp_program` plus the same cleanup; `WUKONG_NO_SLP` still applies) and
+  `form-switches`.
+
+Each `-O` level is one such list (`passes::standard_spec`):
+
+| Level | List |
+|---|---|
+| `-O0` | (empty) |
+| `-O1` | `mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre` |
+| `-O2`, `-O3` | `inline,sroa,mem2reg,simplify,jump-thread,simplify-cfg,simplify-phis,dce,tre,cse,dse,loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,vectorize,unroll,slp,form-switches` |
+
+**The law:** `run_steps(parse_spec(standard_spec(l)))` leaves MIR byte-identical to
+`wukong_opt::optimize(p, l)` at every level, with and without `--verify-each`
+(`passes::tests::standard_spec_replica_matches_optimize_at_every_level`, over programs that reach
+inlining, the loop passes, complete unrolling, SLP, switch formation and tail calls). It makes the
+list syntax an executable specification of the standard pipeline, and it is what catches drift: a
+pass added to `PassManager::standard`, or a new stage in `optimize_preserving`, fails it until
+`standard_spec` and `passes::Step` follow. `-O` still sets the Cranelift level when `--passes` names
+the list. On this path `--time-passes` reports the optimize stage as one interval, without the
+per-pass split `optimize_timed` gives.
+
+`--print-after=<name>` runs the level's list (or the `--passes` list) through the same replica and
+writes to stderr, leaving stdout byte-identical: after each run of the named function pass on a
+function, `; *** MIR after <pass> (fn <name>) ***` and the function, or the one line
+`; *** MIR after <pass> (fn <name>): unchanged ***` when that run changed nothing; after a named
+program step, `; *** MIR after <step> ***` and the whole program. `all` matches every pass and step.
+A snapshot is written the moment its pass returns (the wrapper renders through a symbol-for-symbol
+copy of the interner), so a pass that panics leaves every earlier snapshot on stderr. The cleanup
+sweeps inside `unroll` and `slp` are part of the step and print with it. Both flags are refused
+(exit 2) with `--emit=tokens|ast|check|mir-high`, where no optimizer runs, and on a gradient compile
+(`--emit=grad`, `--train`, `--emit=obj --grad-of`): the replica has no autodiff roots
+(`inline_program_preserving` is crate-private), and autodiff differentiates the standard pipeline's
+forward without SLP.
+
 **The MIR loop vectorizer** (`src/vectorize.rs`) widens a canonical counted loop (a step of `+1`
 or `-1`; one straight-line body, one if-converted diamond, or a small nest of conditionals) into
 128-bit vectors, keeping the original loop as the scalar epilogue. Its invariant is that lane `k` of a group executes exactly what scalar

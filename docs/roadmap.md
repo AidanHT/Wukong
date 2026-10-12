@@ -905,6 +905,12 @@ another architecture or OS is not supported. A native-backend failure is a catal
   only what `main` reaches; `-O0` native code is built at Cranelift `opt_level=none`, and the JIT
   compiles functions in parallel. Not yet: several artifacts from one `--emit=a,b` invocation (each
   stage is still its own compile), per-function timing in the trace, or a parallel optimizer.
+- Optimizer debugging from the command line: `--passes=<list>` runs any list of the optimizer's
+  function passes and program steps, and `--print-after=<pass|all>` prints the MIR after each run of
+  a pass. Each `-O` level is such a list, held byte-identical to `optimize` by a driver test. Sharp
+  edges: neither works on a gradient compile (the replica has no autodiff roots), `--time-passes`
+  does not split the optimize stage per pass on that path, and the cleanup sweeps inside `unroll`
+  and `slp` print only as part of their step.
 
 ## GPU backend (NVIDIA, behind `--features gpu`) — RTX 4050 (`sm_89`) and H100 (`sm_90a`)
 

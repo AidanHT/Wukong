@@ -209,6 +209,13 @@ after every pass that ran and panics naming the culprit, so run the tests in a d
 Add a test asserting both an effect (e.g. instruction-count reduction) and that results are
 unchanged. The opt-level differential test (`crates/wukongc/tests/run.rs`) will also exercise it.
 
+Then name the pass in `crates/wukong_driver/src/passes.rs`: `FUNCTION_PASSES`, `make_pass`, and
+`standard_spec` for each level that runs it. That module is the `--passes` replica of the standard
+pipeline, and its `standard_spec_replica_matches_optimize_at_every_level` test holds it
+byte-identical to `wukong_opt::optimize`, so it fails until you do. A new whole-program stage in
+`optimize_preserving` (as `slp` was) becomes a `passes::Step` the same way, with a
+`verify_program_stage` under `--verify-each`.
+
 Two transforms deliberately sit **outside** the fixpoint, in `optimize` itself: `inline_program`
 before it (it needs whole-program information) and `unroll_program` after it (it needs the canonical
 two-block loop the fixpoint produces, and re-running it on its own output would unroll the same loop

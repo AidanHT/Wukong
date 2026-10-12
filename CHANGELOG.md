@@ -5,6 +5,23 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer pass lists (`gap5/mir-text-passes`)
+
+- **`--passes=<list>` runs a chosen optimizer pipeline (N71).** The list names function passes by
+  their `Pass::name()` (`sroa`, `mem2reg`, `simplify`, `jump-thread`, `simplify-cfg`, `simplify-phis`,
+  `dce`, `tre`, `cse`, `dse`, `loop-canon`, `loop-delete`, `fuse`, `licm`, `bce`, `unswitch`,
+  `promote`, `vectorize`), which run together to a fixpoint, and the program steps `inline`, `unroll`,
+  `slp` and `form-switches`, which run once where named. `--passes=` runs nothing; an unknown name
+  is a usage error (exit 2) that lists every name. `-O` still sets the native code generator's
+  level. Each `-O` level is such a list (`docs/internals.md`, "Running a chosen pass list"), and a
+  driver test holds the replica byte-identical to `wukong_opt::optimize` at `-O0`..`-O3`, so the list
+  is an executable specification of the standard pipeline: bisect an optimizer bug by deleting names.
+- **`--print-after=<pass|all>` shows the MIR right after a pass.** On stderr, after each run of the
+  named function pass, the function it left, or one `unchanged` line when that run did nothing; after
+  a named program step, the whole program. Stdout is byte-identical with or without it. Both flags
+  are refused with `--emit=tokens|ast|check|mir-high` and on gradient compiles (`--emit=grad`,
+  `--train`, `--emit=obj --grad-of`), whose forward is always the standard pipeline's.
+
 ### Diagnostics: multi-line spans (`gap5/diag-multiline-spans`)
 
 - **Multi-line spans are drawn whole, with rustc-style connectors (N6).** The human renderer used to

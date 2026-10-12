@@ -44,6 +44,10 @@ mod lang_bench;
 /// and splices the items into the root module under program-unique symbols.
 mod loader;
 
+/// `--passes=<list>` / `--print-after=<pass>`: a replica of the standard optimizer pipeline that
+/// runs any chosen pass list and prints the MIR after a named pass.
+pub mod passes;
+
 /// Whole-program reachability pruning ahead of optimization (`--run`, `--emit=exe`).
 mod prune;
 
@@ -125,6 +129,13 @@ pub struct Options {
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
     pub verify_each: bool,
+    /// `--passes=<list>`: run exactly this comma-separated pass list (see [`passes::parse_spec`])
+    /// instead of the `-O` level's pipeline; `opt_level` still sets the native code generator's
+    /// level. `None` runs the level's pipeline.
+    pub passes: Option<String>,
+    /// `--print-after=<pass|all>`: print the MIR to stderr after each change the named pass makes
+    /// (per function), or after the named program step (see [`passes::run_steps`]).
+    pub print_after: Option<String>,
     /// Lint levels from the command line (`-A/-W/-D <lint>`, `-D warnings`), applied on top of each
     /// lint's default; `@allow/@warn/@deny` attributes in the source refine them per item. See
     /// `wukong_sema::lints`.
@@ -255,6 +266,8 @@ impl Default for Options {
             run: false,
             opt_level: 0,
             verify_each: false,
+            passes: None,
+            print_after: None,
             lint_levels: LintLevels::default(),
             time_passes: false,
             time_trace: None,
@@ -703,7 +716,45 @@ pub fn compile(opts: &Options) -> i32 {
         (opts.opt_level, wukong_opt::OptimizeOptions::FULL)
     };
     timer.begin("optimize");
-    if opts.verify_each {
+    if opts.passes.is_some() || opts.print_after.is_some() {
+        // A chosen pass list, or the level's own list run through the same replica so a pass can
+        // be watched (`passes`). Its per-pass times are not split out under `--time-passes`.
+        if feeds_autodiff {
+            emit_driver_error(
+                opts,
+                "`--passes` and `--print-after` cannot be used on a gradient compile \
+                 (`--emit=grad`, `--train`, `--emit=obj --grad-of`), which always runs the \
+                 standard pipeline",
+            );
+            return exit::UNIMPLEMENTED;
+        }
+        let spec = opts
+            .passes
+            .as_deref()
+            .unwrap_or_else(|| passes::standard_spec(opt_level));
+        let steps = match passes::parse_spec(spec) {
+            Ok(steps) => steps,
+            Err(e) => {
+                emit_driver_error(opts, format!("--passes: {e}"));
+                return exit::UNIMPLEMENTED;
+            }
+        };
+        if let Err(failure) = passes::run_steps(
+            &mut program,
+            &steps,
+            opts.verify_each,
+            opts.print_after.as_deref(),
+            &interner,
+        ) {
+            emit_diag(
+                &optimization_failure_diag(&failure, &interner),
+                opts.error_format,
+                &renderer,
+                &SourceMap::new(),
+            );
+            return exit::COMPILE_ERROR;
+        }
+    } else if opts.verify_each {
         if let Err(failure) = wukong_opt::optimize_verified_preserving_with(
             &mut program,
             opt_level,

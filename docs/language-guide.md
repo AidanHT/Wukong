@@ -2377,6 +2377,18 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 --train-warmup=<n>    ramp the learning rate linearly over the first n updates   (default: 0)
 --train-schedule=<s>  constant | cosine: the learning rate after the warmup (default: constant)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
+--passes=<list>       run exactly this comma-separated optimizer pass list instead of the -O
+                      level's (-O still sets the native code generator's level); `--passes=`
+                      runs none. Function passes (run together to a fixpoint): sroa, mem2reg,
+                      simplify, jump-thread, simplify-cfg, simplify-phis, dce, tre, cse, dse,
+                      loop-canon, loop-delete, fuse, licm, bce, unswitch, promote, vectorize;
+                      program steps (run once where named): inline, unroll, slp, form-switches.
+                      An unknown name is a usage error (exit 2) that lists them all
+--print-after=<p>     print the MIR to stderr after each run of pass <p> on a function (a run
+                      that changed nothing is one `unchanged` line), or after program step <p>;
+                      `all` matches every one. Stdout is unchanged. Both flags are rejected with
+                      --emit=tokens/ast/check/mir-high and on --emit=grad, --train and
+                      --emit=obj --grad-of
 --fp=<mode>           fast | strict   (default: fast). strict = @strict_fp on every function: no
                       FMA contraction, source-order float reductions, no kernel recognizers (see
                       "Floating-point semantics"). Rejected with --emit=grad and --train (exit 1).
