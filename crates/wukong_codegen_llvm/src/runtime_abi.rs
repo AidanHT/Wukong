@@ -9,6 +9,8 @@ pub(crate) const RUNTIME_ABI: &[(&str, &str, &[&str])] = &[
     ("wukong_argreduce_f32_parallel", "i64", &["ptr", "i64", "i64"]),
     ("wukong_argsort_f32", "i64", &["ptr", "i64", "ptr", "i64", "i64"]),
     ("wukong_attention_f32", "void", &["ptr", "ptr", "ptr", "ptr", "i64", "i64", "float", "i64"]),
+    ("wukong_attention_kv_batch_f32", "i64", &["ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "float", "i64"]),
+    ("wukong_attention_kv_batch_f32_parallel", "i64", &["ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "float", "i64"]),
     ("wukong_attention_kv_f32", "i64", &["ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "float", "i64"]),
     ("wukong_attention_kv_f32_parallel", "i64", &["ptr", "i64", "ptr", "i64", "ptr", "i64", "ptr", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "i64", "float", "i64"]),
     ("wukong_avgpool2d_f32", "void", &["ptr", "ptr", "i64", "i64", "i64", "i64", "i64", "i64", "i64"]),

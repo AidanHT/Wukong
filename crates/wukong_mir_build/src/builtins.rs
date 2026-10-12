@@ -244,6 +244,11 @@ impl FnLowerer<'_> {
         if call.kind == KernelBuiltin::Sdpa {
             return Some(self.lower_sdpa_builtin(e, args));
         }
+        // The batched decode attention is a decode builtin (`decode_builtins.rs`): one checked
+        // runtime call whose entry validates every extent itself.
+        if call.kind == KernelBuiltin::SdpaKvBatch {
+            return Some(self.lower_sdpa_kv_batch(e, args, &call));
+        }
         let operand_dims = builtin_operand_dims(call.kind);
         if operand_dims.len() != args.len() {
             return None;
@@ -826,7 +831,7 @@ impl FnLowerer<'_> {
                 );
                 return Some(v);
             }
-            Sdpa => return None,
+            Sdpa | SdpaKvBatch => return None,
         };
         self.builder.build_void(Op::Call { func, args });
         Some(self.const_zero(MirType::I32))

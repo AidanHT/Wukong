@@ -264,6 +264,8 @@ intrinsic_table! {
     // Decode builtins: KV-cache attention, half and quantized GEMV (`decode.rs`).
     AttentionKvF32 = "wukong_attention_kv_f32",
     AttentionKvF32Parallel = "wukong_attention_kv_f32_parallel",
+    AttentionKvBatchF32 = "wukong_attention_kv_batch_f32",
+    AttentionKvBatchF32Parallel = "wukong_attention_kv_batch_f32_parallel",
     KvAppendF32 = "wukong_kv_append_f32",
     SgemvBf16 = "wukong_sgemv_bf16",
     SgemvBf16Parallel = "wukong_sgemv_bf16_parallel",

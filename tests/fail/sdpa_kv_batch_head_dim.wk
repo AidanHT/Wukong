@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
+module tests.fail.sdpa_kv_batch_head_dim
+
+// `sdpa_kv_batch` is shape-checked over `<B, SQ, SKV, H, HKV, D>`: the queries and the output are
+// [B, SQ, H, D] and the key and value caches [B, SKV, HKV, D], so all four share the head
+// dimension `D`. The keys here are 4 wide while the queries are 8 - a mismatch the types catch
+// before anything runs, not a kernel reading half a head.
+fn decode_one(
+    q: Tensor[f32, 2, 1, 4, 8],
+    k: Tensor[f32, 2, 16, 2, 4],
+    v: Tensor[f32, 2, 16, 2, 8],
+    mut o: Tensor[f32, 2, 1, 4, 8],
+    lens: [i32; 2],
+    pos: [i32; 2],
+) {
+    sdpa_kv_batch(q, k, v, o, lens, pos, 0.35, true); //~ E0502
+}
+
+fn main() -> i32 {
+    return 0;
+}

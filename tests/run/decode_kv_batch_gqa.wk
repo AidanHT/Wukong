@@ -1,0 +1,254 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 105
+// EXPECT-OUT: 106
+// EXPECT-OUT: 107
+// EXPECT-OUT: 108
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1120
+// EXPECT-OUT: 1121
+// EXPECT-OUT: 1122
+// EXPECT-OUT: 1123
+// EXPECT-OUT: 1110
+// EXPECT-OUT: 1111
+// EXPECT-OUT: 1112
+// EXPECT-OUT: 1113
+// EXPECT-OUT: 1100
+// EXPECT-OUT: 1101
+// EXPECT-OUT: 1102
+// EXPECT-OUT: 1103
+// EXPECT-OUT: 1120
+// EXPECT-OUT: 1121
+// EXPECT-OUT: 1122
+// EXPECT-OUT: 1123
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 105
+// EXPECT-OUT: 106
+// EXPECT-OUT: 107
+// EXPECT-OUT: 108
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1120
+// EXPECT-OUT: 1121
+// EXPECT-OUT: 1122
+// EXPECT-OUT: 1123
+// EXPECT-OUT: 1110
+// EXPECT-OUT: 1111
+// EXPECT-OUT: 1112
+// EXPECT-OUT: 1113
+// EXPECT-OUT: 1100
+// EXPECT-OUT: 1101
+// EXPECT-OUT: 1102
+// EXPECT-OUT: 1103
+// EXPECT-OUT: 1120
+// EXPECT-OUT: 1121
+// EXPECT-OUT: 1122
+// EXPECT-OUT: 1123
+module tests.run.decode_kv_batch_gqa
+
+// A batched decode step under GQA-4 (`sdpa_kv_batch`), every output lane printed twice: once
+// through a shape-generic function whose dimensions come from its `Tensor` parameter types (called
+// with RUNTIME batch and cache sizes, threaded through the hidden dimension parameters), once
+// through the `@parallel` twin (`wukong_attention_kv_batch_f32_parallel`, bit-identical to the
+// serial kernel). Shape `<B, SQ, SKV, H, HKV, D> = <2, 1, 3, 8, 2, 4>`: one new query per
+// sequence, eight query heads over two KV heads - heads 0-3 read KV head 0 and heads 4-7 KV head
+// 1, the group the kernel processes together, loading each cached row once for all four. Scale 1,
+// causal, kv_lens = [2, 3], q_pos = [1, 2] (each query is its sequence's newest token).
+//
+// Valid key j of sequence b is one-hot (e_j) on both KV heads, its values V[b][j][g][c] =
+// 1000b + 100g + 10j + c; sequence 0's padded cache row 2 is NaN. A query of 200 along lane t
+// scores 200 on key t and 0 elsewhere; exp(-200) and exp(-100) flush to exactly 0, so the winner's
+// value row comes out exactly; equal scores average exactly (two keys). With t = h mod 4 and
+// g = h / 4, the queries and the outputs, derived by hand:
+//   sequence 0 (keys 0, 1):
+//     t = 0: 200 on lane 0 -> key 0 -> 100g + c;
+//     t = 1: 200 on lane 1 -> key 1 -> 100g + 10 + c;
+//     t = 2: 200 on lane 2, i.e. at the PADDED key 2: both visible keys score 0, so the mean
+//            (0 + 10)/2 -> 100g + 5 + c (a leaked NaN key would print NaN);
+//     t = 3: 200 on lane 1 and 100 on lane 0 -> key 1 -> 100g + 10 + c.
+//   sequence 1 (keys 0, 1, 2):
+//     t = 0: 200 on lane 2 -> key 2 -> 1000 + 100g + 20 + c;
+//     t = 1: 200 on lane 1 -> key 1 -> 1000 + 100g + 10 + c;
+//     t = 2: 200 on lane 0 -> key 0 -> 1000 + 100g + c;
+//     t = 3: 200 on lane 3 (no key has it) and 100 on lane 2 -> key 2 -> 1000 + 100g + 20 + c.
+// A wrong head-to-KV-head mapping (the group of four), a slipped batch stride or a mask off by one
+// changes a lane. The census pins the dispatch: one `wukong_attention_kv_batch_f32` site (in
+// `decode_step`) and one `wukong_attention_kv_batch_f32_parallel` (in `decode_step_par`).
+
+fn decode_step<B, S>(
+    q: Tensor[f32, B, 1, 8, 4],
+    k: Tensor[f32, B, S, 2, 4],
+    v: Tensor[f32, B, S, 2, 4],
+    mut o: Tensor[f32, B, 1, 8, 4],
+    lens: Tensor[i32, B],
+    pos: Tensor[i32, B],
+) {
+    // Every dimension is inferred from the parameter types.
+    sdpa_kv_batch(q, k, v, o, lens, pos, 1.0, true);
+}
+
+@parallel
+fn decode_step_par(
+    q: [f32; 64],
+    k: [f32; 48],
+    v: [f32; 48],
+    mut o: [f32; 64],
+    lens: [i32; 2],
+    pos: [i32; 2],
+) {
+    sdpa_kv_batch::<2, 1, 3, 8, 2, 4>(q, k, v, o, lens, pos, 1.0, true);
+}
+
+fn main() -> i32 {
+    let nan: f32 = f32_from_bits(0x7fc00000);
+    let lens: [i32; 2] = [2, 3];
+    let pos: [i32; 2] = [1, 2];
+    let mut k: [f32; 48] = [0.0; 48];
+    let mut v: [f32; 48] = [0.0; 48];
+    for b in 0..2 {
+        for j in 0..3 {
+            for g in 0..2 {
+                for c in 0..4 {
+                    let at = ((b * 3 + j) * 2 + g) * 4 + c;
+                    if j < (lens[b] as i64) {
+                        k[at] = if c == j { 1.0 } else { 0.0 };
+                        v[at] = (1000 * b + 100 * g + 10 * j + c) as f32;
+                    } else {
+                        k[at] = nan;
+                        v[at] = nan;
+                    }
+                }
+            }
+        }
+    }
+    let mut q: [f32; 64] = [0.0; 64];
+    for h in 0..8 {
+        let t = h % 4;
+        let s0 = h * 4;
+        let s1 = 32 + h * 4;
+        if t == 0 {
+            q[s0] = 200.0;
+            q[s1 + 2] = 200.0;
+        }
+        if t == 1 {
+            q[s0 + 1] = 200.0;
+            q[s1 + 1] = 200.0;
+        }
+        if t == 2 {
+            q[s0 + 2] = 200.0;
+            q[s1] = 200.0;
+        }
+        if t == 3 {
+            q[s0 + 1] = 200.0;
+            q[s0] = 100.0;
+            q[s1 + 3] = 200.0;
+            q[s1 + 2] = 100.0;
+        }
+    }
+
+    // Runtime batch and cache sizes (a loop, so nothing folds them to constants).
+    let mut nb: i64 = 0;
+    while nb < 2 {
+        nb = nb + 1;
+    }
+    let mut ns: i64 = 0;
+    while ns < 3 {
+        ns = ns + 1;
+    }
+    let mut o: [f32; 64] = [-1.0; 64];
+    decode_step::<nb, ns>(q, k, v, o, lens, pos);
+    for e in 0..64 {
+        print(o[e]);
+    }
+
+    let mut o2: [f32; 64] = [-1.0; 64];
+    decode_step_par(q, k, v, o2, lens, pos);
+    for e in 0..64 {
+        print(o2[e]);
+    }
+    return 0;
+}

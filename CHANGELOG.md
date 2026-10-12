@@ -5,6 +5,38 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Batched decode attention and GQA-group blocking (`gap6/decode-attention-2`, N81)
+
+- **Added: `sdpa_kv_batch`, batched and padded KV-cache attention.** `sdpa_kv_batch(q, k, v, out,
+  kv_lens, q_pos, scale, causal)` attends `B` sequences in one call over packed tensors: `q`/`out`
+  `[B, SQ, H, D]`, caches `k`/`v` `[B, SKV, HKV, D]` padded to one capacity `SKV`, and two `i32`
+  vectors of `B` entries — `kv_lens[b]` real cached keys (`0..=SKV`, checked at run time) and
+  `q_pos[b]` the position of the sequence's first query row (decode: `kv_lens[b] - 1`;
+  FlashAttention's bottom-right mask: `kv_lens[b] - SQ`; a right-padded prompt: `0`; negative
+  allowed). Row `i` sees keys `j < kv_lens[b]` and, causally, `j <= q_pos[b] + i`. Masked keys are
+  never read, so they contribute exactly zero probability whatever the padding holds (NaN included)
+  and every row is bit-for-bit the single-sequence `sdpa_kv` row; a fully masked row (an empty
+  sequence, a causal row before position 0) is defined as exactly `0` in every lane
+  (`tests/run/decode_kv_batch.wk`).
+- **Shape-checked like a kernel builtin.** Its dimensions `<B, SQ, SKV, H, HKV, D>` come from a
+  turbofish (literals, `const`s, generic dimensions, integer variables), the shapes of `Tensor`
+  operands and the lengths of fixed arrays; disagreeing operands are `E0502`, a wrong rank or an
+  array that does not hold its shape `E0501`, head counts that do not group `E0502`, an unfixed
+  dimension `E0409` — no new codes. A shape-generic `fn f<B, S>(q: Tensor[f32, B, 1, 8, 4], ..)`
+  calls it with runtime sizes, and a `@parallel` function calls the multicore twin
+  (`tests/run/decode_kv_batch_gqa.wk`, `tests/fail/sdpa_kv_batch_head_dim.wk`). The resolution is
+  recorded in `builtin_calls` (`KernelBuiltin::SdpaKvBatch`), so deferred and copied calls keep it.
+- **GQA-group blocking in both attention kernels.** The AVX2 path processes up to eight query heads
+  sharing a KV head together: each key row is loaded once and dotted into a register tile of
+  `keys x heads` accumulators, each value row loaded once and accumulated for every head, so a GQA
+  step reads its cache up to 8x less often. Every (row, head) keeps the exact per-head operation
+  order, so the grouped pass equals the per-head scalar twin bit for bit (pinned over GQA ratios
+  1, 2, 3, 4, 5, 7, 8, 12 and 16, every `d % 8` tail and both sides of the 64-key block). Not yet
+  measured: no throughput claim is made.
+- **Runtime** `wukong_attention_kv_batch_f32[_parallel]` with `kv_batch_plan` /
+  `kv_batch_check_lens` (shared by the interpreter twin), Cranelift and textual-LLVM ABI rows, and
+  autodiff refusing it like `sdpa_kv`.
+
 ### Stack-slot coloring (`gap6/stack-coloring`)
 
 - **Allocas with disjoint lifetimes share one native frame slot (N86).** The Cranelift backend

@@ -268,7 +268,15 @@ body. The **decode builtins** (`sdpa_kv`,
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so
 the entry validates them against the operand lengths and returns a status the lowering asserts is
-zero; the interpreter runs the same validation and calls the same serial entry.
+zero; the interpreter runs the same validation and calls the same serial entry. The batched
+`sdpa_kv_batch` is the exception that has a shape signature: sema resolves its `<B, SQ, SKV, H, HKV,
+D>` like a kernel builtin's and records it in `builtin_calls` as `KernelBuiltin::SdpaKvBatch` (so a
+deferred or copied call keeps it), `mir_build::builtins` hands the record to `decode_builtins`, and the
+call passes the six dimensions after its six `(buffer, length)` pairs; the runtime still checks the
+lengths and every `kv_lens[b]`. Both attention entries share one driver whose unit of work is
+(sequence, query row, KV head, block of up to 8 of its query heads): the AVX2 pass loads each key and
+value row once per block (register tiles of at most eight accumulators), and every (row, head) keeps
+the exact per-head operation order, so it is bit-identical to the portable per-head twin.
 
 **Match lowering and the exhaustiveness verdict.** `lower_match` lowers a `match` to an if-else chain
 of arm tests (`pattern_cond`); an arm's guard is lowered in a block only the pattern's success edge

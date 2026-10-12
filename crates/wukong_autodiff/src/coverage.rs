@@ -41,9 +41,9 @@ const TEXT_OUTPUT: &str = "formatted text output (`printf`, `sprintf`, a structu
                            writes text, not a differentiated buffer; it carries no gradient";
 const PROCESS_INPUT: &str = "the program's arguments, environment and standard input come from \
                              outside the program; they carry no gradient";
-const DECODE_ATTENTION: &str = "KV-cache decode attention (`sdpa_kv`) has no backward kernel: it \
-                                is an inference kernel; spell training attention as matmul + \
-                                softmax + matmul (each differentiable)";
+const DECODE_ATTENTION: &str = "KV-cache decode attention (`sdpa_kv`, `sdpa_kv_batch`) has no \
+                                backward kernel: it is an inference kernel; spell training \
+                                attention as matmul + softmax + matmul (each differentiable)";
 
 /// Every non-differentiable symbol `wukong_mir_build` can emit, with the reason a decline reports.
 pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
@@ -235,6 +235,8 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     // The decode builtins (`wukong_mir_build`'s `decode_builtins.rs`): inference kernels.
     ("wukong_attention_kv_f32", DECODE_ATTENTION),
     ("wukong_attention_kv_f32_parallel", DECODE_ATTENTION),
+    ("wukong_attention_kv_batch_f32", DECODE_ATTENTION),
+    ("wukong_attention_kv_batch_f32_parallel", DECODE_ATTENTION),
     (
         "wukong_kv_append_f32",
         "a KV-cache append is a decode-time row copy with no VJP rule; write the copy as a loop \

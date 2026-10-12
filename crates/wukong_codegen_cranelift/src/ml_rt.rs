@@ -53,7 +53,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 22] {
+pub(crate) fn entries() -> [Entry; 24] {
     use Abi::{Ptr, F32, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -135,6 +135,20 @@ pub(crate) fn entries() -> [Entry; 22] {
             params: ATTENTION_KV,
             ret: Some(I64),
             addr: wukong_runtime::wukong_attention_kv_f32_parallel as *const u8,
+        },
+        // (q, nq, k, nk, v, nv, o, no, kv_lens, nl, q_pos, np, batch, sq, skv, n_heads,
+        // n_kv_heads, d, scale, causal) -> i64: `sdpa_kv_batch`.
+        Entry {
+            name: "wukong_attention_kv_batch_f32",
+            params: ATTENTION_KV_BATCH,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_attention_kv_batch_f32 as *const u8,
+        },
+        Entry {
+            name: "wukong_attention_kv_batch_f32_parallel",
+            params: ATTENTION_KV_BATCH,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_attention_kv_batch_f32_parallel as *const u8,
         },
         // (cache, ncache, row, nrow, pos, stride) -> i64: `kv_append`.
         Entry {
@@ -234,6 +248,30 @@ const ATTENTION_KV: &[Abi] = &[
 
 /// The checked GEMV ABI: weight, activation and output, each with its length.
 const GEMV: &[Abi] = &[Abi::Ptr, Abi::I64, Abi::Ptr, Abi::I64, Abi::Ptr, Abi::I64];
+
+/// Six `(buffer, length)` pairs, six dimensions, the scale and the causal flag.
+const ATTENTION_KV_BATCH: &[Abi] = &[
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::F32,
+    Abi::I64,
+];
 
 /// Declare every table entry as an import and record it in `rt_ids` — the module-wide symbol set
 /// that both resolves a runtime call and arms `lower_call`'s arity guard.
