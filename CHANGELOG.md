@@ -86,6 +86,43 @@ All notable changes to Wukong are documented here. The format is loosely based o
   dimension named only by the function parameter is passed to the instance as a hidden dimension
   argument (`tests/run/closure_infer.wk`).
 
+### Autodiff through `@parallel` regions (`gap6/autodiff-parallel`, N87)
+
+- **Added: a loss that runs a `@parallel` loop region differentiates, and its backward is a
+  region too.** `wukong_autodiff::grad_program` (now behind `--emit=grad`, `--train` and
+  `--emit=obj --grad-of`) takes the outlined body apart, recomputes and differentiates one iteration
+  per index (`{loss}_grad$par<i>$it`) and runs those iterations through `wukong_parallel_for` again
+  (`{loss}_grad$par<i>`). This covers a loop of a `@parallel` loss and a whole-function `@parallel`
+  helper the loss calls. A loss with a region used to be refused with "no VJP rule for
+  buffer-writing call `wukong_parallel_for`".
+- **Deterministic shared adjoints.** A buffer the region writes has its adjoint in the iteration's
+  own slice. A buffer several iterations read, such as a broadcast weight or a scalar computed before
+  the loop, is accumulated in at most 16 private zeroed copies, one per virtual chunk, and added back
+  in chunk order. Reads that an affine index proof places in the iteration's own band skip that step.
+  The chunks depend on the trip count alone and no float adjoint is accumulated atomically, so the
+  gradient has the same bits on the interpreter, on the native pool at every `--threads` count, and
+  at every `-O` level.
+- **The driver keeps outlined bodies at `-O1` for a gradient compile.** `-O2` unrolls the counted
+  loop the rule takes apart. The forward then runs the `-O1` form of each region body, which computes
+  the same bits. `--emit=grad` now also prints the region backward functions and the outlined bodies,
+  and `--train` and `--emit=obj --grad-of` carry them.
+- **Refused by name:**
+  - an iteration with control flow: an inner loop no recognizer takes, a slice index's bounds check
+    or an overlap guard, so slice-based regions do not differentiate yet;
+  - a region that reads a buffer it also writes;
+  - a buffer the region reads, or a kernel in it writes, that the loss writes again after the loop;
+  - a shared buffer of no fixed extent;
+  - second order.
+- `tests/run/autodiff_train_parallel_region.wk` trains through a region whose shared adjoint arrives
+  in four chunk pieces. Its trajectory was derived independently in Python with f32 rounding.
+  `wukong_driver`'s `region_grad_tests` cover elementwise and shared-weight regions, a kernel call in
+  a region, a captured scalar, a spliced helper, 37 rows over 16 chunks and an `f64` region, each
+  against closed forms and finite differences at `-O0`..`-O3` with and without the implicit grain.
+  They also cover byte-identical interpreter and native training, and the declines.
+  `wukong_autodiff`'s `tests/regions.rs` gates hand-built MIR in `f64`, and `autodiff_cli.rs` trains
+  through a 40-row region on both backends at four thread counts with byte-identical saved weights.
+- Not measured: the backward's speed.
+
 ### `@parallel` regions over slices, run-time trip counts and kernel builtins (`gap6/outliner-slices-kernels`)
 
 - **A `@parallel` loop region may capture `[]T` slices (N85).** The mid-function region outliner used

@@ -1357,8 +1357,31 @@ Float precision casts propagate adjoints, and integer-to-float casts terminate i
 float-to-integer-to-float paths decline. **User-function calls differentiate at every `-O` level**:
 straight-line helpers are spliced into the loss before the reverse pass
 (`wukong_autodiff::inline_calls`); a multi-block or recursive helper on the gradient path refuses,
-naming the callee. Mid-function parallel regions and synthesized `VecKernelCall` recipes remain
-unsupported, and every unsupported differentiable operation reports a diagnostic. **Second order**
+naming the callee. Synthesized `VecKernelCall` recipes remain unsupported, and every unsupported
+differentiable operation reports a diagnostic.
+
+**`@parallel` loop regions differentiate (N87).** A loss that runs an outlined region — a loop of a
+`@parallel` function, or a whole-function `@parallel` helper spliced into the loss — gets a parallel
+backward from `wukong_autodiff::grad_program` (`region.rs`): each iteration of the outlined body is
+recomputed from the buffers the forward left behind and differentiated by the straight-line rules
+(`{loss}_grad$par<i>$it`), and the loss's backward runs those iterations through
+`wukong_parallel_for` again (`{loss}_grad$par<i>`). A buffer the region writes has its adjoint in the
+iteration's own slice (the outliner's proof); a buffer several iterations read — a broadcast weight,
+a captured scalar — is accumulated in private zeroed copies, one per virtual chunk (at most 16), and
+added back in chunk order. The chunks depend on the trip count alone and no float adjoint is ever
+accumulated atomically, so the gradient has the same bits on the interpreter, on the native pool at
+every `--threads` count, and at every `-O` level (a gradient compile re-optimizes outlined bodies at
+`-O1`, the canonical counted loop the rule takes apart). Gated against closed forms and finite
+differences (f32 and f64) in `wukong_driver`'s `region_grad_tests` and `wukong_autodiff`'s
+`tests/regions.rs`; `crates/wukongc/tests/autodiff_cli.rs` trains through a 40-row region on both
+backends at four thread counts and requires byte-identical weights;
+`tests/run/autodiff_train_parallel_region.wk` is a hand-derived trajectory. **Sharp edges**, each
+refused by name: an iteration with control flow (an inner loop the recognizers did not take, a slice
+index's run-time bounds check, a kernel builtin's overlap guard — so slice-based regions do not
+differentiate yet), a region that reads a buffer it also writes (in place), a buffer the region
+reads (or a kernel in it writes) that the loss writes again after it, a shared buffer of no fixed
+extent, and second order. An `f64` region's buffers must be parameters (the tape keeps local
+gradient buffers in `f32`). The backward's speed is not measured. **Second order**
 is supported for scalar-path losses: `wukong_autodiff::grad_dot` emits the single-block directional
 derivative `<v, ∇L>` and `hvp` its gradient, the Hessian-vector product; second order through
 recognized tensor kernels, and differentiating the emitted void `*_grad` itself, decline by name.
