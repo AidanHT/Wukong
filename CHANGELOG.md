@@ -33,7 +33,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   AVX2+FMA (`wukong_mir::host_supports_f16c_kernels`); an f16 invariant that may lie off the f16
   grid (a parameter: an integer converted to f16 is not rounded until it is stored) keeps the
   128-bit loop. The interpreter marshals f16 streams like any other, its evaluator rounding where
-  the instructions do; the LLVM emitter lowers the three ops through `half`.
+  the instructions do; the LLVM emitter lowers the three ops through `half`. The evaluator's
+  rounding is the `half` crate's software routine transcribed in `wukong_mir::f16_bits`, tested bit
+  for bit against `half` (a dev-dependency), so `wukong_mir` still depends on `wukong_span` and
+  `wukong_types` only, which a test now pins.
   `tests/run/vec256_f16_lanes.wk` runs five f16 kernels over 2048 lanes each and prints every
   lane's bits (hand-derived). Census: `vec256_f16_lanes`, `vec_f16_lanes` (a runtime trip) and
   `cov4_par_lowp_dot` gain kernels; nothing is lost.

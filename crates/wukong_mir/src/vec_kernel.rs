@@ -192,9 +192,9 @@ impl VecValue for f32 {
         f32::NAN
     }
     fn round_f16(self) -> Self {
-        // The `half` crate, exactly as the runtime's scalar shims convert: F16C on a host that has
-        // it, an integer routine that agrees with it on every input on one that does not.
-        half::f16::from_f32(self).to_f32()
+        // Exactly as the runtime's scalar shims (the `half` crate) convert: its integer routine,
+        // which agrees with F16C on every input (see `f16_bits`).
+        crate::f16_bits::round_f16(self)
     }
 }
 

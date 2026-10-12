@@ -1150,7 +1150,10 @@ halves widened exactly), `StoreF16` (`vcvtps2ph` with imm8 0, round to nearest e
 stream is f16 or `f32` throughout (`validate`), its group 16 bytes or 32 wide. F16C is used because
 it is the scalar path: the runtime shims are the `half` crate, which is `vcvtps2ph`/`vcvtph2ps` on
 an F16C host and an integer routine that agrees with them on every input elsewhere. The reference
-evaluator rounds through the same crate (`VecValue::round_f16`): a `LoadF16` rounds whatever the
+evaluator rounds through that integer routine (`VecValue::round_f16`), transcribed in
+`wukong_mir::f16_bits` so the IR crate keeps its two workspace dependencies, and tested there bit for
+bit against `half`'s host and software paths (all 65536 f16 encodings; every sign, exponent and
+value of the eleven mantissa bits a result keeps or rounds on): a `LoadF16` rounds whatever the
 slot or a forwarded store holds (the interpreter stores a scalar f16 as is and rounds on load), and
 a `StoreF16` writes and forwards the rounded lane. The kernel needs F16C as well as AVX2+FMA
 (`host_supports_f16c_kernels`, asked by the optimizer and refused by the assembler without it;

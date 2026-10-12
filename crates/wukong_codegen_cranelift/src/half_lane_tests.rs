@@ -4,10 +4,11 @@
 //! The scalar path is the runtime shims (`wukong_f32_to_f16_bits` / `wukong_f16_bits_to_f32`), the
 //! `half` crate — F16C's `vcvtps2ph`/`vcvtph2ps` on this host when it has F16C, and the crate's
 //! integer software routine on one that does not. So every result is checked against **both**: the
-//! shim as it runs here, and [`soft_f32_to_f16`] / [`soft_f16_to_f32`], a transcription of the
+//! shim as it runs here, and [`soft_f32_to_f16`] / [`soft_f16_to_f32`], the transcription of the
 //! `half` crate's software fallback (`binary16/arch.rs`, `f32_to_f16_fallback` and
-//! `f16_to_f32_fallback`, half 2.7.1). A conversion that matched only the instruction, or only the
-//! fallback, would let native code differ between two hosts.
+//! `f16_to_f32_fallback`, half 2.7.1) in `wukong_mir::f16_bits`, which the recipe evaluator rounds
+//! with. A conversion that matched only the instruction, or only the fallback, would let native code
+//! differ between two hosts.
 //!
 //! f16 to f32 is checked exhaustively (all 65536 encodings). f32 to f16 is checked densely: every
 //! sign and exponent against a set of mantissas that put a one, a run of ones or a tie at every
@@ -25,70 +26,11 @@ use wukong_mir::MirType;
 use crate::half_lanes;
 use crate::target::TargetCpu;
 
-/// `half`'s `f32_to_f16_fallback`, transcribed.
-pub(crate) fn soft_f32_to_f16(value: f32) -> u16 {
-    let x = value.to_bits();
-    let sign = x & 0x8000_0000;
-    let exp = x & 0x7f80_0000;
-    let man = x & 0x007f_ffff;
-    if exp == 0x7f80_0000 {
-        let nan_bit = if man == 0 { 0 } else { 0x0200 };
-        return ((sign >> 16) | 0x7c00 | nan_bit | (man >> 13)) as u16;
-    }
-    let half_sign = sign >> 16;
-    let unbiased_exp = ((exp >> 23) as i32) - 127;
-    let half_exp = unbiased_exp + 15;
-    if half_exp >= 0x1f {
-        return (half_sign | 0x7c00) as u16;
-    }
-    if half_exp <= 0 {
-        if 14 - half_exp > 24 {
-            return half_sign as u16;
-        }
-        let man = man | 0x0080_0000;
-        let mut half_man = man >> (14 - half_exp);
-        let round_bit = 1 << (13 - half_exp);
-        if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
-            half_man += 1;
-        }
-        return (half_sign | half_man) as u16;
-    }
-    let half_exp = (half_exp as u32) << 10;
-    let half_man = man >> 13;
-    let round_bit = 0x0000_1000;
-    if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
-        ((half_sign | half_exp | half_man) + 1) as u16
-    } else {
-        (half_sign | half_exp | half_man) as u16
-    }
-}
-
-/// `half`'s `f16_to_f32_fallback`, transcribed.
-pub(crate) fn soft_f16_to_f32(i: u16) -> f32 {
-    if i & 0x7fff == 0 {
-        return f32::from_bits((i as u32) << 16);
-    }
-    let half_sign = (i & 0x8000) as u32;
-    let half_exp = (i & 0x7c00) as u32;
-    let half_man = (i & 0x03ff) as u32;
-    if half_exp == 0x7c00 {
-        if half_man == 0 {
-            return f32::from_bits((half_sign << 16) | 0x7f80_0000);
-        }
-        return f32::from_bits((half_sign << 16) | 0x7fc0_0000 | (half_man << 13));
-    }
-    let sign = half_sign << 16;
-    let unbiased_exp = ((half_exp as i32) >> 10) - 15;
-    if half_exp == 0 {
-        let e = (half_man as u16).leading_zeros() - 6;
-        let exp = (127 - 15 - e) << 23;
-        let man = (half_man << (14 + e)) & 0x7f_ffff;
-        return f32::from_bits(sign | exp | man);
-    }
-    let exp = ((unbiased_exp + 127) as u32) << 23;
-    let man = (half_man & 0x03ff) << 13;
-    f32::from_bits(sign | exp | man)
-}
+// `half`'s software routine, transcribed once in `wukong_mir::f16_bits` (the recipe evaluator's
+// rounding) and checked there against `half` itself, its host path and its software one.
+pub(crate) use wukong_mir::f16_bits::{
+    f16_bits_to_f32 as soft_f16_to_f32, f32_to_f16_bits as soft_f32_to_f16,
+};
 
 /// Which conversion a JIT-compiled probe performs on four lanes, `fn(src, dst)`.
 #[derive(Clone, Copy)]

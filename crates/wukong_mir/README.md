@@ -8,7 +8,9 @@ A `Function` is a `Vec<BasicBlock>`; every block ends in exactly one `Terminator
 **typed block parameters + branch arguments** (Cranelift/MLIR style), never phi nodes. Data types +
 imperative `Builder` + deterministic printer + verifier — no passes, no lowering.
 
-Dependencies: `wukong_span`, `wukong_types::Scalar` only.
+Dependencies: `wukong_span`, `wukong_types::Scalar` only (pinned by
+`f16_bits::tests::the_crate_depends_on_wukong_span_and_wukong_types_only`). `half` is a
+dev-dependency: the test oracle for `src/f16_bits.rs`, which reaches no consumer.
 
 ## Pipeline fit
 
@@ -32,6 +34,7 @@ wukong_mir_build → wukong_opt → wukong_interp | wukong_codegen_cranelift | w
 | `src/text.rs` | `print_program_typed` / `parse_program` — typed textual MIR that reads back (`--emit=mir-text`, `.mir` input); laws: `typed(parse(typed(p))) == typed(p)`, `print_program(parse(typed(p))) == print_program(p)` |
 | `src/verify.rs` | `verify_function`, `verify_program` — well-formedness gate |
 | `src/vec_kernel.rs` | `VecKernel` — backend-agnostic 256-bit AVX2 loop recipe |
+| `src/f16_bits.rs` | `f32_to_f16_bits` / `f16_bits_to_f32` / `round_f16` — the `half` crate's software f16 routine, transcribed (the recipe evaluator's `LoadF16`/`StoreF16`/`RoundF16` rounding) and tested bit for bit against `half` |
 
 | region | file:line | what |
 |---|---|---|

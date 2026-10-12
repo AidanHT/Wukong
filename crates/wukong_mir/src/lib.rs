@@ -8,6 +8,7 @@
 //! type's note before building on the two-level design).
 
 mod builder;
+pub mod f16_bits;
 mod inst;
 #[cfg(test)]
 mod lane_op_tests;
