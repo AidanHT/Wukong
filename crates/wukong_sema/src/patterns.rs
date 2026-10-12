@@ -7,12 +7,15 @@
 //!   field binds through its sub-pattern at the field's declared type, and an unlisted field is
 //!   unconstrained.
 //! * An array pattern matches a fixed-size array `[T; N]`: without `..` it lists all `N` elements,
-//!   with one at most `N`. A `[]T` slice's length is known only at run time, so it is rejected
-//!   with a pointer to `s.len()`.
+//!   with one at most `N`. On a `[]T` slice it is a run-time length test instead, which a `let` or
+//!   a `for` head may not make (`E0442`). `rest @ ..` binds the elements the `..` stands for: the
+//!   sub-array `[T; N - listed]` of an array, a `[]T` sub-slice of a slice.
 //! * The `else` of a `let … else` must diverge — `return`, `break`, `continue`, or a `loop` with no
 //!   way out — since the names the pattern binds do not exist on that path.
 //! * A plain `let` pattern must be irrefutable (`E0442`, Rust's E0005): `let Shape::Circle { r } =
-//!   s;` would leave `r` unbound for every other shape. The witness names a value it misses.
+//!   s;` would leave `r` unbound for every other shape. The witness names a value it misses. A
+//!   pattern the analysis cannot place (inside an array of more than 32 elements, say) is checked
+//!   by form instead, as a `for` head is ([`Sema::check_let_pattern`]).
 //! * A destructuring `for` head (`for (i, x) in pairs`, `for Point { x, y } in pts`) binds each
 //!   element as `let <pat> = a[i];` would, over an array or slice only (`E0401` for a range or any
 //!   other iterand), and is never tested, so it must be irrefutable by its form (`E0442`).
@@ -22,7 +25,7 @@ use wukong_ast::{
     StmtKind, VariantPat,
 };
 use wukong_diag::Diagnostic;
-use wukong_span::Span;
+use wukong_span::{Span, Symbol};
 use wukong_types::Ty;
 
 use crate::{
@@ -93,17 +96,22 @@ impl Sema<'_> {
         }
     }
 
-    /// Type-check and bind an array pattern `[prefix.., (..), suffix..]` against `ty`.
+    /// Type-check and bind an array pattern `[prefix.., (rest @ ..), suffix..]` against `ty`, a
+    /// fixed-size array `[T; N]` or a `[]T` slice. On an array the element count is checked here;
+    /// on a slice it is a run-time length test (`len == listed` without `..`, `len >= listed` with
+    /// one). `rest @ ..` binds the elements the `..` stands for: a `[T; N - listed]` sub-array of
+    /// an array, a `[]T` sub-slice of a slice — in place, never a copy of the elements.
     pub(crate) fn check_slice_pattern(
         &mut self,
         prefix: &[Pattern],
         rest: bool,
+        rest_binding: Option<&Pattern>,
         suffix: &[Pattern],
         ty: &Ty,
         span: Span,
     ) {
         let listed = (prefix.len() + suffix.len()) as u64;
-        let elem = match ty {
+        let (elem, rest_ty) = match ty {
             Ty::Array { elem, len, .. } => {
                 if (!rest && listed != *len) || (rest && listed > *len) {
                     let what = if rest { "at least " } else { "" };
@@ -116,19 +124,15 @@ impl Sema<'_> {
                         ),
                     );
                 }
-                (**elem).clone()
+                let rest_ty = Ty::Array {
+                    elem: elem.clone(),
+                    len: len.saturating_sub(listed),
+                    shared: false,
+                };
+                ((**elem).clone(), rest_ty)
             }
-            Ty::Unknown | Ty::Error => Ty::Unknown,
-            Ty::Slice(_) => {
-                self.error(
-                    span,
-                    "E0401",
-                    "an array pattern matches a fixed-size array `[T; N]`; a `[]T` slice's length \
-                     is known only at run time — test `s.len()` and index it instead"
-                        .to_string(),
-                );
-                Ty::Unknown
-            }
+            Ty::Slice(elem) => ((**elem).clone(), ty.clone()),
+            Ty::Unknown | Ty::Error => (Ty::Unknown, Ty::Unknown),
             other => {
                 self.error(
                     span,
@@ -138,11 +142,120 @@ impl Sema<'_> {
                         other.display(self.interner)
                     ),
                 );
-                Ty::Unknown
+                (Ty::Unknown, Ty::Unknown)
             }
         };
-        for p in prefix.iter().chain(suffix) {
+        for p in prefix {
             self.bind_pattern(p, &elem);
+        }
+        if let Some(b) = rest_binding {
+            self.bind_pattern(b, &rest_ty);
+        }
+        for p in suffix {
+            self.bind_pattern(p, &elem);
+        }
+    }
+
+    /// Type-check and bind an or-pattern `A | B | ..` against `ty`. Each alternative is bound in a
+    /// scope of its own, and every alternative must bind the same names (`E0423`) with the same
+    /// types (`E0424`): whichever alternative matches, the arm body reads one binding of each
+    /// name. The names are then bound once, at the first alternative's types.
+    pub(crate) fn check_or_pattern(&mut self, alts: &[Pattern], ty: &Ty) {
+        let mut bound: Vec<Vec<(Symbol, Span, Ty)>> = Vec::with_capacity(alts.len());
+        for a in alts {
+            self.push_scope();
+            self.bind_pattern(a, ty);
+            let mut names = Vec::new();
+            binding_names(a, &mut names);
+            let scope = self.scopes.last();
+            let typed = names
+                .into_iter()
+                .map(|(n, sp)| {
+                    let t = scope
+                        .and_then(|s| s.get(&n))
+                        .cloned()
+                        .unwrap_or(Ty::Unknown);
+                    (n, sp, t)
+                })
+                .collect();
+            self.pop_scope();
+            bound.push(typed);
+        }
+        // Report each name once, against the first alternative that binds it. A name bound at two
+        // types is then bound as `Error`, so its uses do not cascade into mismatches of their own.
+        let mut reported: Vec<Symbol> = Vec::new();
+        let mut clashed: Vec<Symbol> = Vec::new();
+        for (i, names) in bound.iter().enumerate() {
+            for (n, sp, t) in names {
+                if reported.contains(n) {
+                    continue;
+                }
+                let nm = self.sym_str(*n).to_string();
+                if let Some(j) = bound.iter().position(|o| !o.iter().any(|(m, ..)| m == n)) {
+                    reported.push(*n);
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "variable `{nm}` is not bound in all alternatives of this or-pattern"
+                        ))
+                        .with_code("E0423")
+                        .primary(
+                            alts[j].span,
+                            format!("this alternative does not bind `{nm}`"),
+                        )
+                        .secondary(*sp, format!("`{nm}` is bound here"))
+                        .help(format!(
+                            "whichever alternative matches, the arm reads one `{nm}`, so every \
+                             alternative must bind it; bind it in each, or match the \
+                             alternatives in separate arms"
+                        )),
+                    );
+                    continue;
+                }
+                let clash = bound[i + 1..].iter().find_map(|o| {
+                    o.iter().find(|(m, _, u)| {
+                        m == n && !t.is_unknown() && !u.is_unknown() && !same_ty(t, u)
+                    })
+                });
+                if let Some((_, osp, ot)) = clash {
+                    reported.push(*n);
+                    clashed.push(*n);
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "variable `{nm}` has type `{}` in one alternative of this or-pattern \
+                             and `{}` in another",
+                            t.display(self.interner),
+                            ot.display(self.interner)
+                        ))
+                        .with_code("E0424")
+                        .primary(
+                            *osp,
+                            format!("`{nm}` is `{}` here", ot.display(self.interner)),
+                        )
+                        .secondary(
+                            *sp,
+                            format!("`{nm}` is `{}` here", t.display(self.interner)),
+                        )
+                        .help(
+                            "the arm reads one binding of each name, so every alternative must \
+                             bind it at the same type; match the alternatives in separate arms",
+                        ),
+                    );
+                }
+            }
+        }
+        let mut done: Vec<Symbol> = Vec::new();
+        for names in &bound {
+            for (n, _, t) in names {
+                if !done.contains(n) {
+                    done.push(*n);
+                    let t = if clashed.contains(n) {
+                        Ty::Error
+                    } else {
+                        t.clone()
+                    };
+                    self.bind(*n, t);
+                }
+            }
         }
     }
 
@@ -186,6 +299,48 @@ impl Sema<'_> {
             .help(site.help()),
         );
         true
+    }
+
+    /// `E0442` when the pattern of a plain `let` does not match every value of `ty`.
+    ///
+    /// The usefulness analysis decides that for every pattern it can place, and is silent on one
+    /// it cannot: a non-wildcard sub-pattern on a type it has no constructors for, such as an
+    /// array of more than 32 elements or a struct of more than 32 fields. Silence was taken as
+    /// "irrefutable", but a `let` tests nothing — it binds each name at its place — so
+    /// `let [[a, ..]] = rows;` over a `[][f32; 64]` compiled, and bound `a` through the data
+    /// pointer of an empty slice (null) or out of a slice of three rows that `[x]` does not
+    /// match. A pattern the analysis cannot place is therefore checked by FORM, like a `for` head:
+    /// an array pattern listing an element of a `[]T` tests its length, and a literal, range,
+    /// path, or-pattern or variant of a multi-variant enum tests the value. (Such a pattern that
+    /// happens to cover every value, `true | false` on a `bool` field of a 33-field struct, is
+    /// rejected too: the rule leaves nothing for lowering to test.) `pattern_typed` is whether
+    /// binding the pattern reported no error: a pattern of the wrong type is unplaceable too, and
+    /// its own error is the one to read.
+    pub(crate) fn check_let_pattern(&mut self, pat: &Pattern, ty: &Ty, pattern_typed: bool) {
+        if self.check_irrefutable(pat, ty, PatSite::Let)
+            || !pattern_typed
+            || matches!(ty, Ty::Unknown | Ty::Error)
+            || usefulness::placeable(&self.defs, self.interner, ty, pat)
+        {
+            return;
+        }
+        let found = match self.slice_length_test(pat, ty) {
+            Some(r) => Some((r, "an array pattern on a `[]T` tests its length")),
+            None => refutable_form(pat, &self.defs).map(|r| {
+                (
+                    r,
+                    "a literal, range, path, or-pattern or enum variant tests the value",
+                )
+            }),
+        };
+        if let Some((r, what)) = found {
+            self.diags.push(
+                Diagnostic::error("refutable pattern in `let`: this pattern tests the value")
+                    .with_code("E0442")
+                    .primary(r.span, what)
+                    .help(PatSite::Let.help()),
+            );
+        }
     }
 
     /// The destructuring pattern of `for <pat> in <iter>` (anything but a name or `_`), whose
@@ -243,8 +398,17 @@ impl Sema<'_> {
         if !self.check_pattern_shape(pat, elem) {
             return;
         }
-        let Some(r) = refutable_form(pat, &self.defs) else {
-            return;
+        // A form that tests the element, or an array pattern that lists an element of a `[]T`
+        // (it tests the slice's run-time length).
+        let (r, what) = match refutable_form(pat, &self.defs) {
+            Some(r) => (
+                r,
+                "a literal, range, path, or-pattern or enum variant tests the element",
+            ),
+            None => match self.slice_length_test(pat, elem) {
+                Some(r) => (r, "an array pattern on a `[]T` tests its length"),
+                None => return,
+            },
         };
         if !self.check_irrefutable(pat, elem, PatSite::ForHead) {
             self.diags.push(
@@ -252,12 +416,57 @@ impl Sema<'_> {
                     "refutable pattern in `for` head: this pattern tests each element",
                 )
                 .with_code("E0442")
-                .primary(
-                    r.span,
-                    "a literal, range, path, or-pattern or enum variant tests the element",
-                )
+                .primary(r.span, what)
                 .help(PatSite::ForHead.help()),
             );
+        }
+    }
+
+    /// The first array pattern inside `pat` (matched against `ty`) that lists an element of a
+    /// `[]T` slice, and so tests the slice's length at run time; `[..]` and `[rest @ ..]` match
+    /// every slice. Struct, variant, tuple and array sub-patterns reach their field types.
+    fn slice_length_test<'p>(&self, pat: &'p Pattern, ty: &Ty) -> Option<&'p Pattern> {
+        match (&pat.kind, ty) {
+            (PatKind::Slice { prefix, suffix, .. }, Ty::Slice(_))
+                if !prefix.is_empty() || !suffix.is_empty() =>
+            {
+                Some(pat)
+            }
+            (PatKind::Slice { prefix, suffix, .. }, Ty::Array { elem, .. }) => prefix
+                .iter()
+                .chain(suffix)
+                .find_map(|p| self.slice_length_test(p, elem)),
+            (PatKind::Tuple(subs), Ty::Tuple(tys)) => subs
+                .iter()
+                .zip(tys)
+                .find_map(|(p, t)| self.slice_length_test(p, t)),
+            (PatKind::Binding { sub, .. }, _) => self.slice_length_test(sub, ty),
+            (PatKind::Struct { fields, .. }, Ty::Named(n)) => {
+                let Some(DefKind::Struct(decl)) = self.defs.lookup(*n).map(|d| &d.kind) else {
+                    return None;
+                };
+                fields.iter().find_map(|fp| {
+                    let (_, t) = decl.iter().find(|(f, _)| *f == fp.name)?;
+                    self.slice_length_test(&fp.pat, t)
+                })
+            }
+            (PatKind::Variant { path, fields }, _) => {
+                let payload = variant_payload(path, &self.defs)?;
+                match (fields, payload) {
+                    (VariantPat::Tuple(subs), VariantPayload::Tuple(tys)) => subs
+                        .iter()
+                        .zip(&tys)
+                        .find_map(|(p, t)| self.slice_length_test(p, t)),
+                    (VariantPat::Struct(fps), VariantPayload::Struct(named)) => {
+                        fps.iter().find_map(|fp| {
+                            let (_, t) = named.iter().find(|(n, _)| *n == fp.name)?;
+                            self.slice_length_test(&fp.pat, t)
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -294,7 +503,7 @@ impl Sema<'_> {
             },
             PatKind::Binding { sub, .. } => self.check_pattern_shape(sub, ty),
             PatKind::Slice { prefix, suffix, .. } => {
-                let Ty::Array { elem, .. } = ty else {
+                let (Ty::Array { elem, .. } | Ty::Slice(elem)) = ty else {
                     return true;
                 };
                 let elem = (**elem).clone();
@@ -375,6 +584,58 @@ impl PatSite {
             }
         }
     }
+}
+
+/// The names `p` binds, each once, in source order, with the span of the binding (an or-pattern
+/// nested inside contributes its first alternative's, which [`Sema::check_or_pattern`] checks
+/// against the others).
+fn binding_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
+    fn push(n: Symbol, sp: Span, out: &mut Vec<(Symbol, Span)>) {
+        if !out.iter().any(|(m, _)| *m == n) {
+            out.push((n, sp));
+        }
+    }
+    match &p.kind {
+        PatKind::Ident(n) => push(*n, p.span, out),
+        PatKind::Binding { name, sub } => {
+            push(*name, p.span, out);
+            binding_names(sub, out);
+        }
+        PatKind::Tuple(subs) => subs.iter().for_each(|s| binding_names(s, out)),
+        PatKind::Or(alts) => {
+            if let Some(a) = alts.first() {
+                binding_names(a, out);
+            }
+        }
+        PatKind::Variant { fields, .. } => match fields {
+            VariantPat::Tuple(subs) => subs.iter().for_each(|s| binding_names(s, out)),
+            VariantPat::Struct(fps) => fps.iter().for_each(|fp| binding_names(&fp.pat, out)),
+        },
+        PatKind::Struct { fields, .. } => fields.iter().for_each(|fp| binding_names(&fp.pat, out)),
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
+            .iter()
+            .chain(rest_binding.as_deref())
+            .chain(suffix)
+            .for_each(|s| binding_names(s, out)),
+        PatKind::Wildcard
+        | PatKind::Unit
+        | PatKind::Int { .. }
+        | PatKind::Char(_)
+        | PatKind::Bool(_)
+        | PatKind::Path(_)
+        | PatKind::Range { .. } => {}
+    }
+}
+
+/// Whether two alternatives' bindings have one type. A literal-typed binding (`Unknown` until
+/// inference) never clashes; nor does anything sema reported already (`Error`).
+fn same_ty(a: &Ty, b: &Ty) -> bool {
+    a == b || matches!(a, Ty::Error) || matches!(b, Ty::Error)
 }
 
 /// The payload of the variant `Enum::Variant` names, when it resolves.
@@ -537,7 +798,7 @@ mod tests {
             "fn f(a: [i32; 4]) -> i32 { return match a { [0, .., 0] => 0, [h, .., t] => h + t }; }",
         );
         assert_clean("fn f(a: [i32; 3]) -> i32 { let [p, q, r] = a; return p + q + r; }");
-        // The element count must fit the array; a slice's length is not static.
+        // The element count must fit the array.
         assert_code(
             "fn f(a: [i32; 3]) -> i32 { let [p, q] = a; return p + q; }",
             "E0401",
@@ -546,8 +807,13 @@ mod tests {
             "fn f(a: [i32; 2]) -> i32 { return match a { [p, q, r, ..] => p, _ => 0 }; }",
             "E0401",
         );
+        // Neither a `str` nor a scalar is an array.
         assert_code(
-            "fn f(s: []i32) -> i32 { return match s { [p, ..] => p, _ => 0 }; }",
+            "fn f(s: str) -> i32 { return match s { [b, ..] => b as i32, _ => 0 }; }",
+            "E0401",
+        );
+        assert_code(
+            "fn f(x: i32) -> i32 { return match x { [b, ..] => b, _ => 0 }; }",
             "E0401",
         );
         let d = check(
@@ -558,6 +824,77 @@ mod tests {
                 .any(|d| d.code == Some("E0405") && d.message.contains("[false, true]")),
             "{d:?}"
         );
+    }
+
+    /// An array pattern on a `[]T` tests its length at run time; `rest @ ..` binds the elements
+    /// the `..` stands for: a sub-slice of a slice, a `[T; N - listed]` sub-array of an array.
+    #[test]
+    fn slice_patterns_and_rest_bindings() {
+        assert_clean(
+            "fn f(s: []i32) -> i32 { return match s { [] => 0, [x] => x, [a, .., z] => a + z }; }",
+        );
+        assert_clean(
+            "fn sum(s: []i32) -> i32 { return match s { [] => 0, [h, t @ ..] => h + sum(t) }; }",
+        );
+        assert_clean(
+            "struct P { x: i32 } fn f(s: []P) -> i32 { return match s { [P { x: 0 }, ..] => 1,              [p, .., q] => p.x + q.x, _ => 2 }; }",
+        );
+        // A sub-array has the remaining length, `[i32; 2]` out of a `[i32; 4]`, checked like any
+        // other array length (a shape error, `E0501`).
+        assert_clean(
+            "fn g(m: [i32; 2]) -> i32 { return m[0] + m[1]; }              fn f(a: [i32; 4]) -> i32 { let [x, mid @ .., y] = a; return x + g(mid) + y; }",
+        );
+        assert_code(
+            "fn g(m: [i32; 3]) -> i32 { return m[0]; }              fn f(a: [i32; 4]) -> i32 { let [x, mid @ .., y] = a; return x + g(mid) + y; }",
+            "E0501",
+        );
+        // A sub-slice is a `[]T`.
+        assert_code(
+            "fn f(s: []i32) -> i32 { return match s { [_, t @ ..] => t, _ => 0 }; }",
+            "E0401",
+        );
+        // A refutable slice pattern in `let` or a `for` head names the slice it misses.
+        let d = check("fn f(s: []i32) -> i32 { let [a, r @ ..] = s; return a + r[0]; }");
+        assert!(
+            d.iter()
+                .any(|d| d.code == Some("E0442") && d.message.contains("`[]` not covered")),
+            "{d:?}"
+        );
+        assert_code(
+            "fn f(ss: [[]i32; 2]) -> i32 { let mut t = 0; for [a, ..] in ss { t = t + a; }              return t; }",
+            "E0442",
+        );
+        // `[..]` and `[all @ ..]` match every slice.
+        assert_clean(
+            "fn f(ss: [[]i32; 2]) -> i64 { let mut t: i64 = 0; for [all @ ..] in ss {              t = t + all.len(); } return t; }",
+        );
+        assert_clean("fn f(s: []i32) -> i64 { let [..] = s; let [r @ ..] = s; return r.len(); }");
+    }
+
+    /// Every alternative of an or-pattern binds the same names (E0423) at the same types (E0424).
+    #[test]
+    fn or_pattern_bindings() {
+        assert_clean(&format!(
+            "{SHAPE}fn f(s: Shape) -> i32 {{ return match s {{ Shape::Circle(r) |              Shape::Square(r) => r }}; }}"
+        ));
+        assert_clean(
+            "fn f(t: (i32, i32)) -> i32 { return match t { (0, v) | (v, 0) => v, (a, b) => a + b              }; }",
+        );
+        assert_clean("fn f(s: []i32) -> i32 { return match s { [x] | [x, _] => x, _ => 0 }; }");
+        let d = check(
+            "enum E { A(i32), B } fn f(e: E) -> i32 { return match e { E::A(x) | E::B => x }; }",
+        );
+        assert!(
+            d.iter()
+                .any(|d| d.code == Some("E0423") && d.message.contains("`x` is not bound")),
+            "{d:?}"
+        );
+        // A name bound at two types is reported once, and its use does not cascade.
+        let d = check(
+            "enum N { I(i32), R(f32) } fn f(n: N) -> f32 { return match n { N::I(v) | N::R(v) =>              v }; }",
+        );
+        let codes: Vec<_> = d.iter().filter_map(|d| d.code).collect();
+        assert_eq!(codes, ["E0424"], "{d:?}");
     }
 
     #[test]
@@ -572,6 +909,48 @@ mod tests {
         );
         // A one-variant enum's variant is irrefutable.
         assert_clean("enum W { Only(i32) } fn f(w: W) -> i32 { let W::Only(v) = w; return v; }");
+    }
+
+    /// A `let` pattern the analysis cannot place — a non-wildcard sub-pattern on an array of more
+    /// than 32 elements or a struct of more than 32 fields — is checked by form, as a `for` head
+    /// is. The analysis used to be silent on it, which passed for "irrefutable", and a `let` binds
+    /// without testing: `let [[a, ..]] = rows` read `a` through an empty slice's null data pointer.
+    #[test]
+    fn an_unplaceable_let_pattern_is_checked_by_form() {
+        let fields: String = (0..33).map(|i| format!("x{i}: i32, ")).collect();
+        let big = format!("{SHAPE}struct Big {{ {fields}s: Shape }} ");
+        let refutable = |src: &str| {
+            let d = check(src);
+            assert!(
+                d.iter()
+                    .any(|d| d.code == Some("E0442")
+                        && d.message.contains("refutable pattern in `let`")),
+                "{src}: {d:?}"
+            );
+        };
+        // A length test on a `[]T` whose element the analysis cannot split.
+        refutable("fn f(rows: [][f32; 64]) -> f32 { let [[a, ..]] = rows; return a; }");
+        refutable(&format!(
+            "{big}fn f(bs: []Big) -> i32 {{ let [Big {{ x0, .. }}] = bs; return x0; }}"
+        ));
+        // A literal, and a variant of a multi-variant enum, inside the 33-field struct.
+        refutable(&format!(
+            "{big}fn f(b: Big) -> i32 {{ let Big {{ x0: 0, x1, .. }} = b; return x1; }}"
+        ));
+        refutable(&format!(
+            "{big}fn f(b: Big) -> i32 {{ let Big {{ s: Shape::Circle(r), .. }} = b; return r; }}"
+        ));
+        // Names, `_` and `..` stay irrefutable however wide the type.
+        assert_clean("fn f(a: [f32; 64]) -> f32 { let [x, .., y] = a; return x + y; }");
+        assert_clean(&format!(
+            "{big}fn f(b: Big) -> i32 {{ let Big {{ x0, x31: z, .. }} = b; return x0 + z; }}"
+        ));
+        // A pattern of the wrong type reports that, and nothing more.
+        let d = check(&format!(
+            "{SHAPE}{POINT}fn f(p: Point) -> i32 {{ let Shape::Circle(r) = p; return r; }}"
+        ));
+        let codes: Vec<_> = d.iter().filter_map(|d| d.code).collect();
+        assert_eq!(codes, ["E0401"], "{d:?}");
     }
 
     #[test]
@@ -601,6 +980,36 @@ mod tests {
             &format!(
                 "{SHAPE}fn f(s: Shape) -> i32 {{ let Shape::Circle(r) = s else {{ print(0); }}; \
                  return r; }}"
+            ),
+            "E0401",
+        );
+    }
+
+    /// A later `let` of an `if let` / `while let` chain binds for the operands after it and the
+    /// block, and nowhere else.
+    #[test]
+    fn let_chains_with_several_lets() {
+        assert_clean(&format!(
+            "{SHAPE}fn f(a: Shape, b: Shape) -> i32 {{ if let Shape::Circle(r) = a && r > 1 && \
+             let Shape::Square(w) = b && w > r {{ return r * 10 + w; }} return 0; }}"
+        ));
+        assert_clean(
+            "fn f(s: []i32, t: (i32, i32)) -> i32 { let mut k = 0; while let [h, ..] = s && \
+             let (0, v) = t && k < h { k = k + v; } return k; }",
+        );
+        // The second `let`'s names do not reach the `else`.
+        assert_code(
+            &format!(
+                "{SHAPE}fn f(a: Shape, b: Shape) -> i32 {{ if let Shape::Circle(r) = a && \
+                 let Shape::Square(w) = b {{ return r + w; }} else {{ return w; }} }}"
+            ),
+            "E0301",
+        );
+        // A later `let`'s pattern is checked against its own scrutinee.
+        assert_code(
+            &format!(
+                "{SHAPE}{POINT}fn f(a: Shape, p: Point) -> i32 {{ if let Shape::Circle(r) = a && \
+                 let Shape::Square(w) = p {{ return r + w; }} return 0; }}"
             ),
             "E0401",
         );

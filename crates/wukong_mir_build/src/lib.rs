@@ -42,15 +42,21 @@ mod externs;
 #[cfg(test)]
 mod fp_contract_tests;
 mod kernel_guard;
+// The `let` operands of an `if let` / `while let` chain's guard (see the module docs).
+mod let_chain;
 #[cfg(test)]
 mod match_tests;
 mod methods;
 mod minmax;
 mod noalias;
+// Names bound inside an or-pattern (see the module docs).
+mod or_pat;
 mod par_grain;
 #[cfg(test)]
 mod repr_tests;
 mod shape_ops;
+// Array patterns over a `[]T` slice (a run-time length test) and `rest @ ..` (see the module docs).
+mod slice_pat;
 mod softmax_oop;
 #[cfg(test)]
 mod srcloc_tests;
@@ -658,6 +664,7 @@ impl MonoCollector<'_> {
                 }
             }
             ExprKind::Loop { body, .. } => self.walk_block(body, subst),
+            ExprKind::Let { scrutinee, .. } => self.walk_expr(scrutinee, subst),
         }
     }
 }
@@ -913,6 +920,7 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
             }
         }
         ExprKind::Loop { body, .. } => collect_str_block(body, out),
+        ExprKind::Let { scrutinee, .. } => collect_str_expr(scrutinee, out),
     }
 }
 
@@ -1080,6 +1088,7 @@ fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
             }
         }
         ExprKind::Loop { body, .. } => collect_field_bases_block(body, out),
+        ExprKind::Let { scrutinee, .. } => collect_field_bases_expr(scrutinee, out),
     }
 }
 
@@ -2716,6 +2725,7 @@ fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
                 })
         }
         ExprKind::Loop { body, .. } => escapes_parallel_chunk_block(body, depth + 1),
+        ExprKind::Let { scrutinee, .. } => escapes_parallel_chunk_expr(scrutinee, depth),
     }
 }
 
@@ -10484,6 +10494,7 @@ impl FnLowerer<'_> {
                     ast::PatKind::Struct { .. }
                     | ast::PatKind::Binding { .. }
                     | ast::PatKind::Slice { .. }
+                    | ast::PatKind::Or(_)
                     | ast::PatKind::Variant { .. }
                         if match &pat.kind {
                             ast::PatKind::Variant { path, .. } => self
@@ -21995,6 +22006,12 @@ impl FnLowerer<'_> {
         } else {
             None
         };
+        // A guard is tried with each alternative of a binding or-pattern, as Rust does — but the
+        // "guard" of an `if let` / `while let` (whose fall-through arm says so) is its chain's
+        // `&&` operands, which see only the first alternative that matched (`or_pat.rs`).
+        let guard_per_alternative = !arms
+            .iter()
+            .any(|a| a.origin == ast::ArmOrigin::LetFallthrough);
         for (i, arm) in arms.iter().enumerate() {
             let unconditional = (matches!(
                 &arm.pat.kind,
@@ -22015,20 +22032,17 @@ impl FnLowerer<'_> {
 
             let body_bb = self.builder.new_block();
             let next_bb = self.builder.new_block();
-            // Bind first so an `Ident` pattern's guard can reference the binding; the binding is
-            // scoped to this arm (popped after the body).
+            // The test binds the pattern's names once it passed, so the guard and the body can
+            // read them; they are scoped to this arm (popped after the body).
             self.push_scope();
-            self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
             self.emit_match_arm_test(
                 &arm.pat,
                 (scrut, &scrut_mir, &scrut_ty),
-                arm.guard.as_ref(),
+                arm.guard.as_ref().map(|g| (g, guard_per_alternative)),
                 body_bb,
                 next_bb,
             );
-
-            self.builder.switch_to(body_bb);
-            self.terminated = false;
+            // The test left the builder where the body starts: `body_bb`, after any bindings.
             merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
             self.pop_scope();
 
@@ -22092,15 +22106,10 @@ impl FnLowerer<'_> {
         scrut_ty: &Ty,
     ) {
         match &pat.kind {
-            // A name bound inside an or-pattern would need one binding fed by whichever
-            // alternative matched; nothing lowers that yet. Refuse it at the pattern, and bind one
-            // alternative's names so the arm body does not cascade into a second error at each
-            // use (the program is rejected either way).
+            // A name bound inside an or-pattern: one binding, fed by whichever alternative
+            // matched (`or_pat.rs`).
             ast::PatKind::Or(alts) if alts.iter().any(pattern_has_binding) => {
-                self.unsupported(pat.span, "a binding inside an or-pattern");
-                if let Some(alt) = alts.iter().find(|a| pattern_has_binding(a)) {
-                    self.bind_match_ident(alt, scrut, scrut_mir, scrut_ty);
-                }
+                self.bind_or_pattern(alts, (scrut, scrut_mir, scrut_ty), pat.span);
             }
             ast::PatKind::Ident(name) => {
                 let is_slice = matches!(scrut_ty, Ty::Slice(_));
@@ -22142,11 +22151,30 @@ impl FnLowerer<'_> {
                     self.bind_field_pattern(sub, fptr, &fty);
                 }
             }
-            ast::PatKind::Slice { prefix, suffix, .. } => {
+            // On a `[]T` the elements sit behind the fat pointer at `scrut` (`slice_pat.rs`).
+            ast::PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                if let Ty::Slice(elem) = scrut_ty {
+                    self.bind_slice_view_pattern(
+                        prefix,
+                        rest_binding.as_deref(),
+                        suffix,
+                        scrut,
+                        elem,
+                    );
+                    return;
+                }
                 for (index, ety, sub) in Self::slice_pattern_elems(scrut_ty, prefix, suffix) {
                     let emir = self.mir_ty_of(&ety);
                     let eptr = self.gep_elem(scrut, &emir, index);
                     self.bind_field_pattern(sub, eptr, &ety);
+                }
+                if let Some(b) = rest_binding {
+                    self.bind_array_rest(b, scrut, scrut_ty, prefix.len(), suffix.len());
                 }
             }
             _ => {}
@@ -22267,21 +22295,42 @@ impl FnLowerer<'_> {
 
     /// End the current (test) block in the branch a match arm takes: to `body_bb` when `pat`
     /// matches the scrutinee `(value, MIR type, sema type)` and its guard, if any, holds; to
-    /// `next_bb` otherwise. The bindings were made before this, so the guard may read them.
+    /// `next_bb` otherwise. The pattern's names are bound in the scope the caller pushed, on the
+    /// success edge of the test, so the guard and the body may read them. The builder is left
+    /// where the body starts — without a guard that is after the bindings, which may have
+    /// branched (an or-pattern's, `or_pat.rs`), so the body must not re-enter `body_bb` itself.
+    ///
+    /// Binding only after the test is what makes an array pattern over a `[]T` safe: `[a, b]`
+    /// against a one-element slice must not load `data[1]`, and `[x, ..]` against an empty one
+    /// must not load through its (possibly null) data pointer. (Bindings used to be made before
+    /// the test, harmlessly while every pattern's places were in bounds whether it matched or
+    /// not.)
     ///
     /// The guard is lowered in a block of its own that only the pattern's success reaches, so it
     /// runs only after the pattern matched — Rust's order, and the one `if let P = e && c` promises.
     /// It used to be lowered in the test block and ANDed with the pattern test, so it ran for every
     /// value that reached the arm: `match x { E::A(v) if noisy(v) => .., _ => .. }` called
     /// `noisy` on an `E::B`, with `v` read out of the wrong variant's payload.
+    ///
+    /// `guard` carries whether it is a `match` guard proper, which Rust tries with each
+    /// alternative of a binding or-pattern in turn (`or_pat::emit_guarded_or_arm`:
+    /// `(v, _) | (_, v) if v > 4` takes `v = 5` from `(2, 5)`), rather than an `if let` chain's
+    /// `&&` operands, which see the first alternative that matched.
     fn emit_match_arm_test(
         &mut self,
         pat: &Pattern,
         (scrut, scrut_mir, scrut_ty): (ValueId, &MirType, &Ty),
-        guard: Option<&Expr>,
+        guard: Option<(&Expr, bool)>,
         body_bb: wukong_mir::BlockId,
         next_bb: wukong_mir::BlockId,
     ) {
+        if let Some((g, true)) = guard {
+            if or_pat::has_binding_or(pat) {
+                self.emit_guarded_or_arm(pat, (scrut, scrut_mir, scrut_ty), g, body_bb, next_bb);
+                return;
+            }
+        }
+        let guard = guard.map(|(g, _)| g);
         let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
         let Some(g) = guard else {
             let c = pat_cond.unwrap_or_else(|| {
@@ -22289,6 +22338,9 @@ impl FnLowerer<'_> {
                     .build(MirType::I1, Op::ConstInt(1, MirType::I1))
             });
             self.builder.cond_br(c, body_bb, vec![], next_bb, vec![]);
+            self.builder.switch_to(body_bb);
+            self.terminated = false;
+            self.bind_match_ident(pat, scrut, scrut_mir, scrut_ty);
             return;
         };
         if let Some(pc) = pat_cond {
@@ -22297,12 +22349,15 @@ impl FnLowerer<'_> {
             self.builder.switch_to(guard_bb);
             self.terminated = false;
         }
+        self.bind_match_ident(pat, scrut, scrut_mir, scrut_ty);
         // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
         // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
         // `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix covered
-        // if/while/short-circuit/assert but not the match-guard path).
-        let gv = self.lower_bool_cond(g);
-        self.builder.cond_br(gv, body_bb, vec![], next_bb, vec![]);
+        // if/while/short-circuit/assert but not the match-guard path). An `if let` chain's later
+        // `let`s are lowered operand by operand instead (`let_chain.rs`).
+        self.emit_guard(g, body_bb, next_bb);
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
     }
 
     /// The i1 condition under which `pat` matches the scrutinee. For a scalar pattern `scrut` is the
@@ -22384,7 +22439,18 @@ impl FnLowerer<'_> {
                 Some(self.enum_disc_eq(scrut, scrut_mir, disc))
             }
             // `Enum::Variant(a, b)` / `Enum::Variant { f }` — a data-carrying variant pattern: the
-            // discriminant test AND each payload sub-pattern's test (GEPed off the buffer base).
+            // discriminant test, then each payload sub-pattern's test (GEPed off the buffer base)
+            // in a block only a matching discriminant reaches.
+            //
+            // The payload's fields exist only for its own variant: for any other, those bytes are
+            // that variant's fields. ANDing the payload tests into the discriminant test ran them
+            // regardless, which was harmless while every such test only loaded and compared a
+            // scalar inside the buffer, and not once a `[]T` array pattern could sit in the payload:
+            // `V::L([7, ..])` against `V::P(4096, 3)` read P's two `i64`s as L's fat pointer,
+            // passed the length test (`3 >= 1`) and loaded an `i32` from address 4096 — an access
+            // violation natively, a trap on the interpreter. A nested variant, an or-pattern's
+            // alternative, an or-binding's re-test and an `if let` chain's `let` all test through
+            // here, so they are guarded too.
             ast::PatKind::Variant { path, fields } => {
                 let Some(disc) = self.enum_path_value(path) else {
                     self.unsupported(span, "enum-variant pattern");
@@ -22393,15 +22459,36 @@ impl FnLowerer<'_> {
                             .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
                     );
                 };
-                let mut cond = self.enum_disc_eq(scrut, scrut_mir, disc);
+                let disc_ok = self.enum_disc_eq(scrut, scrut_mir, disc);
+                let subs: Vec<&Pattern> = match fields {
+                    VariantPat::Tuple(subs) => subs.iter().collect(),
+                    VariantPat::Struct(fps) => fps.iter().map(|fp| &fp.pat).collect(),
+                };
+                if !subs.into_iter().any(slice_pat::pattern_tests) {
+                    return Some(disc_ok);
+                }
                 let enum_sym = path.segments[0].sym;
                 let vname = path.segments.last().unwrap().sym;
-                if let Some(fc) = self.variant_pattern_cond(scrut, enum_sym, vname, fields, span) {
-                    cond = self
-                        .builder
-                        .build(MirType::I1, Op::Bin(BinOp::And, cond, fc));
-                }
-                Some(cond)
+                let payload_bb = self.builder.new_block();
+                let join = self.builder.new_block();
+                let result = self.builder.block_param(join, MirType::I1);
+                let no = self
+                    .builder
+                    .build(MirType::I1, Op::ConstInt(0, MirType::I1));
+                self.builder
+                    .cond_br(disc_ok, payload_bb, vec![], join, vec![no]);
+                self.builder.switch_to(payload_bb);
+                self.terminated = false;
+                let fc = self
+                    .variant_pattern_cond(scrut, enum_sym, vname, fields, span)
+                    .unwrap_or_else(|| {
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(1, MirType::I1))
+                    });
+                self.builder.br(join, vec![fc]);
+                self.builder.switch_to(join);
+                self.terminated = false;
+                Some(result)
             }
             // A range pattern `lo..hi` / `lo..=hi`: `lo <= scrut` AND `scrut < hi` (or `<= hi`),
             // with the comparison signedness taken from the scrutinee's type.
@@ -22476,7 +22563,16 @@ impl FnLowerer<'_> {
                 }
                 acc
             }
-            ast::PatKind::Slice { prefix, suffix, .. } => {
+            ast::PatKind::Slice {
+                prefix,
+                rest,
+                suffix,
+                ..
+            } => {
+                // A `[]T` slice: a run-time length test, then the elements (`slice_pat.rs`).
+                if let Ty::Slice(elem) = scrut_ty {
+                    return Some(self.slice_view_pattern_cond(prefix, *rest, suffix, scrut, elem));
+                }
                 let mut acc: Option<ValueId> = None;
                 for (index, ety, sub) in Self::slice_pattern_elems(scrut_ty, prefix, suffix) {
                     let emir = self.mir_ty_of(&ety);
@@ -26498,9 +26594,16 @@ fn pattern_has_binding(p: &ast::Pattern) -> bool {
             VariantPat::Struct(fps) => fps.iter().any(|fp| pattern_has_binding(&fp.pat)),
         },
         ast::PatKind::Struct { fields, .. } => fields.iter().any(|fp| pattern_has_binding(&fp.pat)),
-        ast::PatKind::Slice { prefix, suffix, .. } => {
-            prefix.iter().chain(suffix).any(pattern_has_binding)
-        }
+        ast::PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
+            .iter()
+            .chain(rest_binding.as_deref())
+            .chain(suffix)
+            .any(pattern_has_binding),
         ast::PatKind::Wildcard
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
@@ -28169,6 +28272,7 @@ impl GemmBiasAlias<'_> {
                         arm.guard.as_ref().is_some_and(|e| self.expr(e)) || self.expr(&arm.body)
                     })
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
         }
     }
 }
@@ -37623,6 +37727,101 @@ fn main() -> i32 {
             "binding a SCALAR enum payload must cost no kernel, got {:?}",
             kernel_calls(&prog, &interner)
         );
+    }
+
+    /// A pattern that binds a part of an OWNED array by pointer — `rest @ ..`, here — gives the
+    /// scrutinee's storage a second name at an offset, whatever the scrutinee's type borrows.
+    /// Each spelling below was RUN before the rule: the scan reading `a[i]` and writing `mid[i]`
+    /// dispatched `wukong_cumsum_f32` with the two names as disjoint buffers (a shifted overlap),
+    /// which only the debug-build runtime contract check caught. The controls bind only a scalar,
+    /// or one name into a fresh copy, and keep their kernel unguarded.
+    #[test]
+    fn alias_analysis_sees_a_pattern_binding_into_an_owned_array() {
+        const SCAN: &str =
+            "let mut acc: f32 = 0.0; for i in 0..8 { acc = acc + a[i]; mid[i] = acc; }";
+        let local = |bind: &str| {
+            format!(
+                "module m
+fn main() -> i32 {{
+    let mut a: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let z: i32 = 0;
+    {bind}
+    print(a[8] as i32);
+    return 0;
+}}
+"
+            )
+        };
+        let fresh = |bind: &str| {
+            format!(
+                "module m
+fn make() -> [f32; 9] {{ return [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]; }}
+fn pair() -> ([f32; 9], i32) {{ return (make(), 3); }}
+fn main() -> i32 {{
+    let mut c: [f32; 8] = [0.0; 8];
+    {bind}
+    print(c[7] as i32);
+    return 0;
+}}
+"
+            )
+        };
+        let tainted = [
+            local(&format!("match a {{ [_, mid @ ..] => {{ {SCAN} }} }}")),
+            local(&format!(
+                "if let 0 = z && let [_, mid @ ..] = a {{ {SCAN} }}"
+            )),
+            fresh(&format!("let mut a @ [_, mid @ ..] = make(); {SCAN}")),
+            fresh(&format!(
+                "let (a @ [_, mid @ ..], k) = pair(); {SCAN} c[0] = k as f32;"
+            )),
+        ];
+        for src in &tainted {
+            assert!(!alias_free_of(src, "main"), "{src}");
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls_unguarded(&prog, &interner, "wukong_cumsum_f32"),
+                "a scan over two names for one array must not dispatch unguarded: {src}"
+            );
+        }
+        let controls = [
+            local(
+                "let mut c: [f32; 8] = [0.0; 8]; match a { [h, ..] => { let mut acc: f32 = 0.0; \
+                 for i in 0..8 { acc = acc + a[i]; c[i] = acc; } a[0] = c[7] + h; } }",
+            ),
+            // `mid` is recorded as a view of `a`, not as a taint: a function whose operands are
+            // `mid` and another array, and never `a` itself, names each buffer once.
+            "module m
+fn main() -> i32 {
+    let a: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let mut c: [f32; 8] = [0.0; 8];
+    match a {
+        [_, mid @ ..] => {
+            let mut acc: f32 = 0.0;
+            for i in 0..8 { acc = acc + mid[i]; c[i] = acc; }
+        }
+    }
+    print(c[7] as i32);
+    return 0;
+}
+"
+            .to_string(),
+            fresh(
+                "let [_, mid @ ..] = make(); let mut acc: f32 = 0.0; \
+                 for i in 0..8 { acc = acc + mid[i]; c[i] = acc; }",
+            ),
+        ];
+        for src in &controls {
+            assert!(alias_free_of(src, "main"), "{src}");
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls_unguarded(&prog, &interner, "wukong_cumsum_f32"),
+                "the control must keep its kernel, got {:?}: {src}",
+                kernel_calls(&prog, &interner)
+            );
+        }
     }
 
     /// **Two more republishing spellings, each executed as a live wrong answer on the binary before

@@ -585,6 +585,11 @@ impl Desugar<'_> {
                     self.expr(&mut arm.body);
                 }
             }
+            // An `if let` chain's `let` binds names like an arm's pattern does.
+            ExprKind::Let { pat, scrutinee } => {
+                self.expr(scrutinee);
+                self.check_rebind(pat);
+            }
             ExprKind::Loop { label, body } => {
                 self.frames.push(Frame::Loop(label.map(|l| l.sym)));
                 self.block(body);
@@ -712,6 +717,10 @@ impl Desugar<'_> {
                 }
             }
             ExprKind::Loop { body, .. } => self.refresh_block(body),
+            ExprKind::Let { pat, scrutinee } => {
+                self.refresh_expr(scrutinee);
+                self.refresh_pattern(pat);
+            }
             ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => self.refresh_ty(t),
             // Lifted away before this pass runs (`closures.rs`).
             ExprKind::Closure { .. } => {}
@@ -808,8 +817,17 @@ impl Desugar<'_> {
                 }
             }
             PatKind::Binding { sub, .. } => self.refresh_pattern(sub),
-            PatKind::Slice { prefix, suffix, .. } => {
-                for sub in prefix.iter_mut().chain(suffix.iter_mut()) {
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                for sub in prefix
+                    .iter_mut()
+                    .chain(rest_binding.as_deref_mut())
+                    .chain(suffix.iter_mut())
+                {
                     self.refresh_pattern(sub);
                 }
             }
@@ -918,8 +936,13 @@ fn pattern_bindings(p: &Pattern, out: &mut Vec<Symbol>) {
             out.push(*name);
             pattern_bindings(sub, out);
         }
-        PatKind::Slice { prefix, suffix, .. } => {
-            for sub in prefix.iter().chain(suffix) {
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            for sub in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                 pattern_bindings(sub, out);
             }
         }
@@ -1007,6 +1030,7 @@ fn mentions_expr(e: &Expr, out: &mut Vec<Symbol>) {
                 mentions_expr(&arm.body, out);
             }
         }
+        ExprKind::Let { scrutinee, .. } => mentions_expr(scrutinee, out),
     }
 }
 
@@ -1119,6 +1143,7 @@ fn expr_has_defer(e: &Expr) -> bool {
         }
         ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => xs.iter().any(expr_has_defer),
         ExprKind::ArrayRepeat { value, count } => expr_has_defer(value) || expr_has_defer(count),
+        ExprKind::Let { scrutinee, .. } => expr_has_defer(scrutinee),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)

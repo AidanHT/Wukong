@@ -1,0 +1,126 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 64
+// EXPECT-OUT: 128
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 64
+// EXPECT-OUT: 128
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 64
+// EXPECT-OUT: 128
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 64
+// EXPECT-OUT: 128
+// EXPECT-OUT: 3
+module tests.run.alias_pattern_rest_binding
+
+// `rest @ ..` binds the elements the `..` stands for IN PLACE. In a `match`, and in an `if let`
+// chain's `let`, `mid` below is a second name for the scrutinee `a`, one element along; in a `let`,
+// `a @ [_, mid @ ..]` names the `let`'s own copy twice the same way. Each loop reads `a[i]` and
+// writes `mid[i]`, which IS `a[i + 1]` — the row scan's shape — so every iteration reads the
+// element the one before it wrote:
+//
+//   i = 0: acc = 0 + a[0] = 1,  a[1] = 1
+//   i = 1: acc = 1 + a[1] = 2,  a[2] = 2
+//   i = 2: acc = 2 + a[2] = 4,  a[3] = 4      ... and a[i + 1] = 2^i up to a[8] = 128.
+//
+// The cumsum kernel handed `mid` and `a` as two disjoint buffers computes the prefix sums of the
+// ORIGINAL array instead (1 1 3 6 10 15 21 28 36): the alias analysis did not count a pattern
+// binding into an owned array as a second name, so it dispatched with no overlap test. Every lane
+// is printed, per the corpus rule for a recognized kernel.
+
+fn make() -> [f32; 9] {
+    return [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+}
+
+fn pair() -> ([f32; 9], i32) {
+    return (make(), 3);
+}
+
+fn via_match() {
+    let mut a: [f32; 9] = make();
+    match a {
+        [_, mid @ ..] => {
+            let mut acc: f32 = 0.0;
+            for i in 0..8 {
+                acc = acc + a[i];
+                mid[i] = acc;
+            }
+        }
+    }
+    for i in 0..9 {
+        println(a[i] as i32);
+    }
+}
+
+fn via_chain_let(z: i32) {
+    let mut a: [f32; 9] = make();
+    if let 0 = z && let [_, mid @ ..] = a {
+        let mut acc: f32 = 0.0;
+        for i in 0..8 {
+            acc = acc + a[i];
+            mid[i] = acc;
+        }
+    }
+    for i in 0..9 {
+        println(a[i] as i32);
+    }
+}
+
+fn via_let_at() {
+    let mut a @ [_, mid @ ..] = make();
+    let mut acc: f32 = 0.0;
+    for i in 0..8 {
+        acc = acc + a[i];
+        mid[i] = acc;
+    }
+    for i in 0..9 {
+        println(a[i] as i32);
+    }
+}
+
+fn via_tuple_let_at() {
+    let (a @ [_, mid @ ..], k) = pair();
+    let mut acc: f32 = 0.0;
+    for i in 0..8 {
+        acc = acc + a[i];
+        mid[i] = acc;
+    }
+    for i in 0..9 {
+        println(a[i] as i32);
+    }
+    println(k);
+}
+
+fn main() -> i32 {
+    via_match();
+    via_chain_let(0);
+    via_let_at();
+    via_tuple_let_at();
+    return 0;
+}

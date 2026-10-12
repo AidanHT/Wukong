@@ -238,6 +238,82 @@ All notable changes to Wukong are documented here. The format is loosely based o
   stderr, which the interpreter now writes through the runtime's `write_stream` like the JIT and an
   executable do; `wukong_runtime::process::detach_stdin` gives every later program an empty
   standard input.
+### Slice patterns, `rest @ ..`, or-pattern bindings and let chains (`gap6/patterns-slices`)
+
+- **Array patterns on `[]T` slices (N26).** `match s { [] => …, [x] => …, [first, .., last] => … }`
+  now compiles; it was `E0401` ("test `s.len()` and index it instead"). On a slice an array pattern
+  is a run-time length test — `len == listed` without `..`, `len >= listed` with one — and only then
+  its elements' own tests, the suffix counted from the end. Exhaustiveness splits a slice column by
+  length as rustc does: `[] | [_, ..]` is exhaustive, `[] | [x]` is `E0405` with the witness
+  `[_, _, ..]`, and `W0020` sees an arm a `[..]` before it covers. A `let` or a `for` head whose
+  slice pattern tests a length is `E0442` (`[]` not covered); `[..]` and `[all @ ..]` match every
+  slice. Slice patterns work in `match`, `if let` / `while let` (with `&&` chains) and `let … else`
+  (`tests/run/slice_patterns.wk`, `tests/fail/slice_match_nonexhaustive.wk`,
+  `tests/fail/slice_let_refutable.wk`).
+- **`rest @ ..` binds the elements the `..` stands for, in place.** On a slice it is the sub-slice
+  `{ data + prefix, len - listed }` over the same storage, so `[head, rest @ ..] => head + sum(rest)`
+  recurses without copying; on an array `[T; N]` it is the sub-array `[T; N - listed]` at its
+  place, its length part of its type (passing it where another length is expected is `E0501`). In a
+  `match` that place is the scrutinee's, as for every aggregate a pattern binds; a `let` copies its
+  initializer into its own slot first, so `let [_, tail @ ..] = v;` does not see a later `v[1] = …`.
+- **Bindings inside or-patterns (N26).** `Shape::Circle(r) | Shape::Square(r) => r`,
+  `(0, v) | (v, 0) => v` and `[x] | [x, _] => x` now compile; a binding inside an or-pattern was
+  `C0001` at the pattern. Every alternative must bind the same names (`E0423`) at the same types
+  (`E0424`); the arm reads each name from the first alternative that matches, left to right, as in
+  Rust. A `match` guard is tried with each alternative that matches in turn, also as in Rust:
+  `(v, _) | (_, v) if v > 4` takes `v = 5` from `(2, 5)` rather than leaving the arm after
+  `v = 2` fails the guard, and nested binding or-patterns are tried leftmost first; an or-pattern
+  that binds nothing is tested whole, so a guard with side effects can run fewer times than in
+  Rust. The `&&` of an `if let` chain is not a guard and, as in Rust, sees only the first
+  alternative. The lowering re-tests the alternatives in order after the arm's test passed and joins
+  each name through a block parameter, and lowers a guarded arm once per expansion of its binding
+  or-patterns (at most 64; past that the arm is `C0001`) (`tests/run/or_pattern_bindings.wk`,
+  `tests/fail/or_pattern_unbound.wk`, `tests/fail/or_pattern_type_mismatch.wk`). Or-patterns also
+  bind in `if let`, `while let` and an irrefutable `let`.
+- **`if let` / `while let` chains with more than one `let` (N26).**
+  `if let Shape::Circle(r) = a && r > 1 && let Shape::Square(w) = b && w > r { … }` and
+  `while let [h, t @ ..] = s && let 1..=9 = h { … }` now compile; a second `let` in a chain was
+  `E0200`. A later `let` is a new `ExprKind::Let` operand of the guard the parser makes of the
+  chain: it runs only when the operands before it held, tests its scrutinee against its pattern and
+  binds the pattern's names for the operands after it and the block (shadowing an earlier name);
+  when any operand fails the `else` runs, where none of them exist. The lowering branches operand
+  by operand (`mir_build::let_chain`); a guard with no `let` lowers as before
+  (`tests/run/let_chains.wk`). A chain must still open with its `let` (`if c && let P = e` is
+  not supported).
+- **A match binds an arm's names only after the arm's test passed.** The names used to be bound
+  before the test, harmlessly while every place a pattern names was in bounds whatever the value; on
+  a slice, `[a, b]` against a one-element slice would load past its end and `[x, ..]` against an
+  empty one through a null data pointer. Bindings now sit on the test's success edge, before the
+  guard. The recognizer census is unchanged.
+- **A variant pattern tests its payload only once its discriminant matched.** The payload tests
+  were ANDed into the discriminant test, so they ran for every variant; once a `[]T` array pattern
+  could sit in a payload, `V::L([7, ..])` against `V::P(4096, 3)` read P's two `i64`s as L's fat
+  pointer, passed the length test and loaded from address 4096 (a native access violation, an
+  interpreter trap). They now run in a block only a matching discriminant reaches, which also
+  guards an or-pattern's alternatives, an or-binding's re-tests and an `if let` chain's `let`s
+  (`tests/run/variant_payload_slice_pattern.wk`).
+- **A `let` pattern the exhaustiveness analysis cannot place is checked by form.** The analysis is
+  silent on a non-wildcard sub-pattern over a type it has no constructors for (an array of more
+  than 32 elements, a struct of more than 32 fields), and that silence passed for "irrefutable"; a
+  `let` binds without testing, so `let [[a, ..]] = rows;` over a `[][f32; 64]` compiled and read
+  `a` through an empty slice's null data pointer, or out of a slice of three rows. Such a pattern is
+  now checked as a `for` head is: a slice length test, literal, range, path, or-pattern or
+  multi-variant enum variant anywhere inside is `E0442` (`tests/fail/slice_let_wide_element.wk`).
+- **A pattern binding into an owned array is a second name for the kernel alias analysis.**
+  `rest @ ..` binds the sub-array IN PLACE, so after `match a { [_, mid @ ..] => … }` the names
+  `mid` and `a` are one buffer one element apart; `alias.rs` tainted a `match` only when its
+  scrutinee type could hold a borrowing leaf, so a scan reading `a[i]` and writing `mid[i]`
+  dispatched `wukong_cumsum_f32` over a shifted overlap with no overlap test (the debug-build
+  runtime contract check stopped it; a release build would have printed the prefix sums of the
+  original array). A `match` arm or `if let` chain `let` that binds a part of an owned aggregate by
+  pointer now records it as a view of its place in the scrutinee, so such a kernel is versioned
+  behind the run-time overlap test, and a destructuring `let` whose `name @ sub` names its own copy
+  twice taints the function (`tests/run/alias_pattern_rest_binding.wk`). The recognizer census is
+  unchanged apart from the new fixture.
+- **A block arm body ends its arm.** `X => { … }` followed by an arm that opens with `[`, `(` or `-`
+  parsed as an index into, a call of or a subtraction from the block, so the two arms needed a comma
+  between them (which the formatter always prints); it is now two arms, as in Rust. No `.wk` file in
+  the repository relied on the old reading.
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 

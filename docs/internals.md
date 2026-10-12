@@ -271,8 +271,34 @@ the entry validates them against the operand lengths and returns a status the lo
 zero; the interpreter runs the same validation and calls the same serial entry.
 
 **Match lowering and the exhaustiveness verdict.** `lower_match` lowers a `match` to an if-else chain
-of arm tests (`pattern_cond`); an arm's guard is lowered in a block only the pattern's success edge
-reaches, so it runs only after the pattern matched. Sema's pattern-usefulness analysis
+of arm tests (`pattern_cond`); an arm's names are bound, and its guard is lowered, in a block only
+the pattern's success edge reaches (`emit_match_arm_test`), so the guard runs only after the pattern
+matched and a binding never reads a place the test has not proven exists. An array pattern on a
+`[]T` (`mir_build::slice_pat`) is a length test (`len == listed`, or `>=` with `..`) followed — in a
+block only a passing length test reaches, joined by an `i1` block parameter — by the elements'
+tests at `data[i]` and `data[len - suffix + j]`; `rest @ ..` binds a fresh fat pointer
+`{ data + prefix, len - listed }` on a slice and the address of element `prefix`, typed
+`[T; N - listed]`, on an array. A data-carrying variant pattern tests its payload the same way, in
+a block only a matching discriminant reaches: another variant's payload bytes are that variant's
+fields, and `V::L([7, ..])` against `V::P(4096, 3)` would read them as a fat pointer and load
+through it. The usefulness analysis gives a slice column one constructor per
+length below `L` and one variable-length constructor for every length `>= L` (rustc's split, `L`
+past every length a row pins down). A name bound inside an or-pattern (`mir_build::or_pat`) is bound
+after the arm's test like any other, so some alternative is known to match: the alternatives before
+the last are re-tested in order (a test only loads and compares), each binds its names in a scope of
+its own and branches to a join block with each name's value — a scalar's value, an aggregate's
+address — as block parameters, and the join binds each name once. A `match` arm with a guard
+instead expands its binding or-patterns (`or_pat::expand_binding_ors`, leftmost slowest, at most 64
+combinations) and tries each expansion's test, bindings and guard in turn, joining at the body
+block, as Rust tries a guard once per matching alternative; an `if let` / `while let` match (it has
+a `LetFallthrough` arm) keeps the first rule, since a let chain's `&&` is no guard. A guard whose
+`&&` fold holds an
+`ExprKind::Let` — the later `let`s of an `if let` / `while let` chain — is lowered operand by
+operand (`mir_build::let_chain`): a condition branches to the next operand or the arm's failure
+block, a `let` evaluates its scrutinee, tests it with `pattern_cond` and binds on success into the
+arm's scope. `ExprKind::Let` exists only there, so every scope-aware walker (sema's typing, the
+lints, `@noalias`, the loader's `resolve`, `canon`'s region scan, `defer`) binds its pattern into
+the enclosing arm's scope. Sema's pattern-usefulness analysis
 (`wukong_sema::usefulness`) decides E0405 and W0020, and it also publishes a positive verdict,
 `SemaResult::exhaustive_matches`: the `Match` ids it proved exhaustive over a concrete scrutinee type
 whose all-zero value it models (`zero_value_modeled` — mir_build zero-fills `let e: E;`, so an enum
@@ -2596,7 +2622,7 @@ surface form again:
 | `impl [Trait for] T { fn m … }` | an `ItemKind::Impl` marker, then one top-level `Fn` per method named `T.m` | the `Impl` item's `ImplMethod.fn_name`s, consumed in order |
 | `self` / `mut self` / `&self` / `&mut self` | a parameter `self: T` whose type span is the name's | `ty.span == name.span`; the tokens in the parameter span |
 | `Self` inside an `impl` | the type's own symbol | the identifier's source text is `Self` |
-| `if let P = e [&& g] { A } [else …]` | `match e { P [if g] => …, _ => … }`, second arm `ArmOrigin::LetFallthrough` | the arm origin; no `else` when both arm bodies share a span |
+| `if let P = e [&& g] { A } [else …]` | `match e { P [if g] => …, _ => … }`, second arm `ArmOrigin::LetFallthrough`; a later `let Q = f` in `g` is an `ExprKind::Let` operand | the arm origin; no `else` when both arm bodies share a span |
 | `[l:] while let P = e [&& g] { A }` | `[l:] loop { match e { P => { A }, _ => { break; } } }` | a `Loop` whose first token is `while` |
 | `let [mut] P = e else { B };` | `let names = match e { P => names, _ => { B } }` (or the bare `match` when `P` binds nothing) | the second arm's `ArmOrigin::LetElse` |
 | `const X: T = v;` in a block | an immutable `let` | the token before the pattern is `const` |
@@ -2610,7 +2636,8 @@ surface form again:
 attributes stay inline. Structs and enums put one field or variant per line with a trailing comma.
 Blocks are always multi-line except an empty, comment-free `{}`. `} else if c {` / `} else {`. A
 match arm is `pat[ if g] => body,`; a block-bodied arm drops the comma unless the next arm's pattern
-starts with `(`, `[` or `-` (which would continue the block as a call, an index or a subtraction).
+starts with `(`, `[` or `-`. (The parser ends a block arm body at its `}`, so that comma is not
+needed to parse; it keeps the text from reading as a call, an index or a subtraction.)
 A statement ends in `;` unless it is a block-like expression (`{…}`, `if`, `match`, `loop`), `while`,
 `for` or `while let`; a block-like expression statement still gets one when it is the block's last
 statement with no tail (else it would re-parse as the tail) or when the next statement starts with a

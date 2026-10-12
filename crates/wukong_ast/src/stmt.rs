@@ -95,8 +95,9 @@ pub enum PatKind {
     Char(Symbol),
     /// A boolean literal pattern (`true` / `false`).
     Bool(bool),
-    /// An or-pattern `A | B | C` — matches if any alternative matches. Alternatives are typically
-    /// literals / enum variants (binding-free); a binding inside one is not recommended.
+    /// An or-pattern `A | B | C` — matches if any alternative matches. Every alternative binds the
+    /// same names at the same types (sema's `E0423` / `E0424`); the names take their values from
+    /// the first alternative that matches.
     Or(Vec<Pattern>),
     /// A path pattern — an enum variant such as `Color::Red`, matched by its integer discriminant.
     Path(Path),
@@ -131,12 +132,18 @@ pub enum PatKind {
         name: Symbol,
         sub: Box<Pattern>,
     },
-    /// An array pattern `[a, b, .., z]` on a fixed-size array: `prefix` matches the first
-    /// elements and `suffix` the last ones. Without a `..` (`rest: false`, `suffix` empty) the
-    /// pattern lists every element; with one, the elements between are unconstrained.
+    /// An array pattern `[a, b, .., z]` on a fixed-size array `[T; N]` or a `[]T` slice: `prefix`
+    /// matches the first elements and `suffix` the last ones. Without a `..` (`rest: false`,
+    /// `suffix` empty) the pattern lists every element (on a slice: the length must equal the
+    /// count); with one, the elements between are unconstrained (on a slice: the length must be at
+    /// least the count).
     Slice {
         prefix: Vec<Pattern>,
         rest: bool,
+        /// `name @ ..`: binds the elements the `..` stands for — a `[T; N - listed]` sub-array of
+        /// an array, a `[]T` sub-slice of a slice — as a [`PatKind::Ident`] pattern spanning
+        /// `name`. Only ever present with `rest`.
+        rest_binding: Option<Box<Pattern>>,
         suffix: Vec<Pattern>,
     },
 }

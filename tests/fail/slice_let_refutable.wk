@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0442
+// EXPECT-COUNT: 1
+module tests.fail.slice_let_refutable
+
+// A plain `let` binds without testing, so its pattern must match every value. On a `[]T` the
+// array pattern `[head, rest @ ..]` needs at least one element and misses the empty slice `[]`.
+// Use `let [head, rest @ ..] = s else { … };` or a `match`.
+fn head_plus_len(s: []i32) -> i32 {
+    let [head, rest @ ..] = s; //~ E0442
+    return head + rest.len() as i32;
+}
+
+fn main() -> i32 {
+    let a: [i32; 3] = [4, 5, 6];
+    print(head_plus_len(a));
+    return 0;
+}

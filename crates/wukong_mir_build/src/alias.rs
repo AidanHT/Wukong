@@ -298,6 +298,18 @@
 //!   constructor's type is the enum, which does not borrow), so there is no chain back to what the
 //!   payload was built from and no precise answer to give. Gated on the declared type, so every
 //!   `match` over a scalar or a C-style enum — which is every `match` in the corpus — costs nothing.
+//!   An arm (or an `if let` chain's `let`) over a scrutinee with NO borrowing leaf still names
+//!   storage when it binds a part of an owned aggregate by pointer: `rest @ ..` on an array (the
+//!   sub-array at element `prefix`), an aggregate element, field or payload, or the whole
+//!   scrutinee. Over a PLACE that is recorded precisely, as a view one projection step into it
+//!   (`note_pattern_views`); over a fresh value only `name @ sub` taints, and over an
+//!   unclassifiable one any such binding does. So does a destructuring `let` whose `name @ sub`
+//!   names its own fresh copy twice (`let w @ [_, r @ ..] = make();`). All four spellings were RUN
+//!   before these rules existed: a scan reading `a[i]` and writing `mid[i]` after
+//!   `match a { [_, mid @ ..] => … }` (and the chain-`let`, `let w @ …` and tuple-`let` spellings of
+//!   it) dispatched `wukong_cumsum_f32` with the two names as disjoint buffers, a shifted overlap
+//!   its `ExactInPlace` contract forbids, and only the debug-build runtime contract check stopped
+//!   it (`tests/run/alias_pattern_rest_binding.wk`).
 //! * CONSERVATIVE. Two *different constant* indices into one array (`f(m[0], m[1])`) are treated as
 //!   may-alias, because this pass does not evaluate index expressions.
 //! * CONSERVATIVE. A `let` whose pattern this pass cannot attribute field-by-field taints when its
@@ -376,7 +388,7 @@
 //!   rather than taken.
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Module, Stmt, StmtKind};
-use wukong_sema::{DefKind, SemaResult};
+use wukong_sema::{DefKind, SemaResult, VariantPayload};
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Symbol};
 use wukong_types::Ty;
 
@@ -1130,18 +1142,26 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                     }
                     // Binds nothing, so there is nothing to republish.
                     ast::PatKind::Wildcard | ast::PatKind::Unit => return,
-                    // The remaining arms are `Int`, `Char`, `Bool`, `Path`, `Range`, `Or` and
-                    // `Variant`. All seven are REFUTABLE, so a `let` should not be spelled with
-                    // one -- but two of them (`Or`, `Variant`) do bind names where they are legal,
-                    // `wukong_sema::bind_pattern` binds them, and a future binding pattern (struct
-                    // destructuring, say) would land here too. This pass must never answer "its own
+                    // The remaining arms are the struct, array and `name @ sub` destructurings, an
+                    // or-pattern, the variant of a one-variant enum, and the refutable literal
+                    // forms a `let` is never spelled with. This pass must never answer "its own
                     // storage" for a name it has not seen bound, so the arm taints whenever the
                     // initializer is a buffer-shaped place rather than falling through silently the
                     // way the `let else` this replaced did.
+                    //
+                    // A FRESH initializer is copied into the `let`'s own slot, so one by-pointer
+                    // binding names nothing else -- but `name @ sub` names that slot twice when
+                    // `sub` binds a part of it by pointer: `let w @ [_, r @ ..] = make();` makes
+                    // `w` and `r` one buffer at an offset.
                     _ => {
+                        let ty = sema.types.get(&e.id);
                         out.opaque_republish |=
-                            !matches!(republish_of(e, sema), Republish::Nothing)
-                                && sema.types.get(&e.id).is_some_and(ty_is_buffer_param);
+                            (!matches!(republish_of(e, sema), Republish::Nothing)
+                                && ty.is_some_and(ty_is_buffer_param))
+                                || (pattern_has_at(pat)
+                                    && ty.is_some_and(|t| {
+                                        pattern_binds_by_pointer(pat, t, sema, 0)
+                                    }));
                         return;
                     }
                 };
@@ -1352,16 +1372,18 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
             // Gated on the scrutinee's DECLARED type so the ordinary `match` over a scalar or a
             // C-style enum -- every `match` in the corpus -- costs nothing: only a type that can
             // carry a `[]T`/`*T`/`&T` leaf, destructured by a pattern that actually binds, taints.
+            //
+            // A scrutinee with no borrowing leaf is not a free pass, though: an arm that binds a
+            // part of an OWNED aggregate binds it BY POINTER, a second name for storage the
+            // scrutinee already names. See [`note_arm_pattern`], which records each such name as a
+            // view of its place, precisely, like a for-each binding.
             ExprKind::Match { scrutinee, arms } => {
-                if arms.iter().any(|a| pattern_binds(&a.pat))
-                    && sema
-                        .types
-                        .get(&scrutinee.id)
-                        .is_some_and(|t| ty_contains_borrowing(t, sema, 0))
-                {
-                    out.opaque_republish = true;
+                for a in arms {
+                    note_arm_pattern(&mut out, &a.pat, scrutinee, sema);
                 }
             }
+            // A `let P = e` of an `if let` chain binds into `e` exactly as a `match` arm does.
+            ExprKind::Let { pat, scrutinee } => note_arm_pattern(&mut out, pat, scrutinee, sema),
             ExprKind::Call { callee, args, .. } => {
                 let ExprKind::Path(p) = &callee.kind else {
                     return;
@@ -1396,9 +1418,16 @@ fn pattern_binds(p: &ast::Pattern) -> bool {
         ast::PatKind::Range { lo, hi, .. } => pattern_binds(lo) || pattern_binds(hi),
         ast::PatKind::Struct { fields, .. } => fields.iter().any(|f| pattern_binds(&f.pat)),
         ast::PatKind::Binding { .. } => true,
-        ast::PatKind::Slice { prefix, suffix, .. } => {
-            prefix.iter().chain(suffix).any(pattern_binds)
-        }
+        ast::PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
+            .iter()
+            .chain(rest_binding.as_deref())
+            .chain(suffix)
+            .any(pattern_binds),
         ast::PatKind::Wildcard
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
@@ -1441,6 +1470,305 @@ fn ty_contains_borrowing(t: &Ty, sema: &SemaResult, depth: u32) -> bool {
     }
 }
 
+/// Record what the `match` arm (or `if let` chain `let`) pattern `p` names inside `scrut`.
+///
+/// * A scrutinee whose type can carry a borrowing leaf taints on any binding (see the `match`
+///   arm of [`scan_body`]): the binding may copy that leaf out, and nothing chains it back.
+/// * Otherwise only a name bound BY POINTER ([`pattern_binds_by_pointer`]) names anything: an
+///   owned aggregate part of the scrutinee, at its address. When the scrutinee is a PLACE, each
+///   such name is recorded as a view of its place within it ([`note_pattern_views`]), so a kernel
+///   over that name and the scrutinee resolves to one root and `body_names_one_buffer_twice`
+///   separates the two only when their projections do. Measured before this existed:
+///   `match a { [_, mid @ ..] => { <scan reading a[i], writing mid[i]> } }` over
+///   `let mut a: [f32; 9]` dispatched `wukong_cumsum_f32` with `mid` and `a` as two buffers (a
+///   SHIFTED overlap, which `PairContract::ExactInPlace` exists to refuse), and the debug-build
+///   runtime contract check was all that caught it.
+/// * A FRESH scrutinee (a call's or a literal's own storage) has no other name, so only
+///   `name @ sub` — which names one of its places twice — taints; an unclassifiable one taints.
+fn note_arm_pattern(out: &mut BodyScan, p: &ast::Pattern, scrut: &Expr, sema: &SemaResult) {
+    let Some(ty) = sema.types.get(&scrut.id) else {
+        out.opaque_republish |= pattern_binds(p);
+        return;
+    };
+    if pattern_binds(p) && ty_contains_borrowing(ty, sema, 0) {
+        out.opaque_republish = true;
+        return;
+    }
+    if !pattern_binds_by_pointer(p, ty, sema, 0) {
+        return;
+    }
+    match republish_of(scrut, sema) {
+        Republish::At(place) => note_pattern_views(out, p, ty, &place, false, sema, 0),
+        Republish::Nothing => out.opaque_republish |= pattern_has_at(p),
+        Republish::Taint => out.opaque_republish = true,
+    }
+}
+
+/// Record each name `p` binds BY POINTER, matched against the value of type `ty` at place `at`, as
+/// a view of its own place: a tuple element one `Proj::Tuple` step further, a struct field one
+/// `Proj::Field` step, an array element or `rest @ ..` one (index-blind) `Proj::Index` step. Under
+/// `flat` no step is added, so every name views `at` itself — the honest answer for an enum payload
+/// (another variant's fields share its bytes, which no projection here can say) and for an
+/// or-pattern (a name may come from any alternative; the first alternative names them all, E0423,
+/// and recording each once keeps it from reading as a rebinding). A name that already had a view
+/// meaning taints, as every rebinding does ([`republish::ViewMaps::note_view`]).
+fn note_pattern_views(
+    out: &mut BodyScan,
+    p: &ast::Pattern,
+    ty: &Ty,
+    at: &Place,
+    flat: bool,
+    sema: &SemaResult,
+    depth: u32,
+) {
+    if depth > 16 {
+        out.opaque_republish |= pattern_binds(p);
+        return;
+    }
+    let d = depth + 1;
+    let step = |pr: Proj| {
+        let mut q = at.clone();
+        if !flat {
+            q.proj.push(pr);
+        }
+        q
+    };
+    match &p.kind {
+        ast::PatKind::Ident(n) => {
+            if binds_by_pointer(ty, sema) {
+                out.opaque_republish |= out.republished.note_view(*n, at.clone());
+            }
+        }
+        ast::PatKind::Binding { name, sub } => {
+            if binds_by_pointer(ty, sema) {
+                out.opaque_republish |= out.republished.note_view(*name, at.clone());
+            }
+            note_pattern_views(out, sub, ty, at, flat, sema, d);
+        }
+        ast::PatKind::Or(alts) => {
+            if let Some(first) = alts.first() {
+                note_pattern_views(out, first, ty, at, true, sema, d);
+            }
+        }
+        ast::PatKind::Tuple(subs) => match ty {
+            Ty::Tuple(tys) if tys.len() == subs.len() => {
+                for (i, (s, t)) in subs.iter().zip(tys).enumerate() {
+                    note_pattern_views(out, s, t, &step(Proj::Tuple(i as u32)), flat, sema, d);
+                }
+            }
+            _ => out.opaque_republish |= pattern_binds(p),
+        },
+        ast::PatKind::Struct { fields, .. } => {
+            let decl = match ty {
+                Ty::Named(n) => struct_fields(*n, sema),
+                _ => &[],
+            };
+            for f in fields {
+                match decl.iter().find(|(n, _)| *n == f.name) {
+                    Some((_, t)) => note_pattern_views(
+                        out,
+                        &f.pat,
+                        t,
+                        &step(Proj::Field(f.name)),
+                        flat,
+                        sema,
+                        d,
+                    ),
+                    None => out.opaque_republish |= pattern_binds(&f.pat),
+                }
+            }
+        }
+        ast::PatKind::Variant { path, fields } => {
+            let payload = path.segments.first().and_then(|e| {
+                let vname = path.segments.last()?.sym;
+                match sema.defs.lookup(e.sym).map(|d| &d.kind) {
+                    Some(DefKind::Enum(vs)) => vs
+                        .iter()
+                        .find(|v| v.name == vname)
+                        .map(|v| v.payload.clone()),
+                    _ => None,
+                }
+            });
+            match (fields, payload) {
+                (ast::VariantPat::Tuple(subs), Some(VariantPayload::Tuple(tys))) => {
+                    for (s, t) in subs.iter().zip(&tys) {
+                        note_pattern_views(out, s, t, at, true, sema, d);
+                    }
+                }
+                (ast::VariantPat::Struct(fps), Some(VariantPayload::Struct(named))) => {
+                    for fp in fps {
+                        match named.iter().find(|(n, _)| *n == fp.name) {
+                            Some((_, t)) => note_pattern_views(out, &fp.pat, t, at, true, sema, d),
+                            None => out.opaque_republish |= pattern_binds(&fp.pat),
+                        }
+                    }
+                }
+                _ => out.opaque_republish |= pattern_binds(p),
+            }
+        }
+        ast::PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            let Ty::Array { elem, .. } = ty else {
+                // A `[]T` scrutinee borrows and was answered above; anything else is a pattern
+                // sema rejected.
+                out.opaque_republish |= pattern_binds(p);
+                return;
+            };
+            let place = step(Proj::Index);
+            for s in prefix.iter().chain(suffix) {
+                note_pattern_views(out, s, elem, &place, flat, sema, d);
+            }
+            if let Some(b) = rest_binding {
+                // The sub-array is always an aggregate, so the rest name always binds by pointer.
+                match &b.kind {
+                    ast::PatKind::Ident(n) => {
+                        out.opaque_republish |= out.republished.note_view(*n, place);
+                    }
+                    _ => out.opaque_republish |= pattern_binds(b),
+                }
+            }
+        }
+        ast::PatKind::Range { .. }
+        | ast::PatKind::Wildcard
+        | ast::PatKind::Unit
+        | ast::PatKind::Int { .. }
+        | ast::PatKind::Char(_)
+        | ast::PatKind::Bool(_)
+        | ast::PatKind::Path(_) => {}
+    }
+}
+
+/// Does `p`, matched against a value of type `ty`, bind a name to a place INSIDE that value rather
+/// than to a copy of it? The lowering binds every aggregate part of a pattern at its address
+/// (`bind_match_ident`'s by-pointer convention) and copies only a scalar out, so this is "some
+/// name lands on an aggregate place": the whole value (`b` or `b @ …`), an aggregate element,
+/// field or payload, or `rest @ ..`, which is always a sub-array or sub-slice view. A pointer is
+/// counted too, since copying it names its pointee. A C-style enum is a scalar.
+///
+/// Where the pattern and the type disagree (sema reported that) or the depth cap is reached, any
+/// binding answers "yes", which only ever costs a dispatch. Wildcard-free over `PatKind`, so a new
+/// pattern form is a compile error here rather than a silent "binds nothing".
+fn pattern_binds_by_pointer(p: &ast::Pattern, ty: &Ty, sema: &SemaResult, depth: u32) -> bool {
+    if depth > 16 {
+        return pattern_binds(p);
+    }
+    let rec = |q: &ast::Pattern, t: &Ty| pattern_binds_by_pointer(q, t, sema, depth + 1);
+    match &p.kind {
+        ast::PatKind::Ident(_) => binds_by_pointer(ty, sema),
+        ast::PatKind::Binding { sub, .. } => binds_by_pointer(ty, sema) || rec(sub, ty),
+        ast::PatKind::Or(alts) => alts.iter().any(|a| rec(a, ty)),
+        ast::PatKind::Tuple(subs) => match ty {
+            Ty::Tuple(tys) if tys.len() == subs.len() => {
+                subs.iter().zip(tys).any(|(s, t)| rec(s, t))
+            }
+            _ => pattern_binds(p),
+        },
+        ast::PatKind::Struct { fields, .. } => {
+            let decl = match ty {
+                Ty::Named(n) => struct_fields(*n, sema),
+                _ => &[],
+            };
+            fields
+                .iter()
+                .any(|f| match decl.iter().find(|(n, _)| *n == f.name) {
+                    Some((_, t)) => rec(&f.pat, t),
+                    None => pattern_binds(&f.pat),
+                })
+        }
+        ast::PatKind::Variant { path, fields } => {
+            let payload = path.segments.first().and_then(|e| {
+                let vname = path.segments.last()?.sym;
+                match sema.defs.lookup(e.sym).map(|d| &d.kind) {
+                    Some(DefKind::Enum(vs)) => vs
+                        .iter()
+                        .find(|v| v.name == vname)
+                        .map(|v| v.payload.clone()),
+                    _ => None,
+                }
+            });
+            match (fields, payload) {
+                (ast::VariantPat::Tuple(subs), Some(VariantPayload::Tuple(tys))) => {
+                    subs.iter().zip(&tys).any(|(s, t)| rec(s, t))
+                }
+                (ast::VariantPat::Struct(fps), Some(VariantPayload::Struct(named))) => fps
+                    .iter()
+                    .any(|fp| match named.iter().find(|(n, _)| *n == fp.name) {
+                        Some((_, t)) => rec(&fp.pat, t),
+                        None => pattern_binds(&fp.pat),
+                    }),
+                _ => pattern_binds(p),
+            }
+        }
+        ast::PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            let (Ty::Array { elem, .. } | Ty::Slice(elem)) = ty else {
+                return pattern_binds(p);
+            };
+            rest_binding.is_some() || prefix.iter().chain(suffix).any(|s| rec(s, elem))
+        }
+        ast::PatKind::Range { lo, hi, .. } => pattern_binds(lo) || pattern_binds(hi),
+        ast::PatKind::Wildcard
+        | ast::PatKind::Unit
+        | ast::PatKind::Int { .. }
+        | ast::PatKind::Char(_)
+        | ast::PatKind::Bool(_)
+        | ast::PatKind::Path(_) => false,
+    }
+}
+
+/// Does `p` contain a `name @ sub` anywhere -- the one pattern form that names one place twice?
+/// Wildcard-free over `PatKind`, like [`pattern_binds`].
+fn pattern_has_at(p: &ast::Pattern) -> bool {
+    match &p.kind {
+        ast::PatKind::Binding { .. } => true,
+        ast::PatKind::Tuple(subs) | ast::PatKind::Or(subs) => subs.iter().any(pattern_has_at),
+        ast::PatKind::Variant { fields, .. } => match fields {
+            ast::VariantPat::Tuple(subs) => subs.iter().any(pattern_has_at),
+            ast::VariantPat::Struct(fs) => fs.iter().any(|f| pattern_has_at(&f.pat)),
+        },
+        ast::PatKind::Struct { fields, .. } => fields.iter().any(|f| pattern_has_at(&f.pat)),
+        ast::PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
+            .iter()
+            .chain(rest_binding.as_deref())
+            .chain(suffix)
+            .any(pattern_has_at),
+        ast::PatKind::Ident(_)
+        | ast::PatKind::Range { .. }
+        | ast::PatKind::Wildcard
+        | ast::PatKind::Unit
+        | ast::PatKind::Int { .. }
+        | ast::PatKind::Char(_)
+        | ast::PatKind::Bool(_)
+        | ast::PatKind::Path(_) => false,
+    }
+}
+
+/// Is a name bound to a value of type `ty` bound by pointer (see [`pattern_binds_by_pointer`])?
+/// Everything [`ty_is_buffer_param`] calls a buffer, except a C-style enum, which is its `i32`
+/// discriminant and binds by copy.
+fn binds_by_pointer(ty: &Ty, sema: &SemaResult) -> bool {
+    match ty {
+        Ty::Named(n) => match sema.defs.lookup(*n).map(|d| &d.kind) {
+            Some(DefKind::Enum(vs)) => vs.iter().any(|v| !v.payload.is_unit()),
+            _ => true,
+        },
+        other => ty_is_buffer_param(other),
+    }
+}
+
 /// The declared fields of a named STRUCT, in declaration order. Empty for an enum, for a name
 /// with no resolved definition, and for anything else — all three mean "publishes no field this
 /// pass can attribute", which is what the caller does with an empty list.
@@ -1467,8 +1795,17 @@ fn note_tuple_pattern(out: &mut BodyScan, pats: &[ast::Pattern], init: &Expr, se
         Republish::At(p) => p,
         // A tuple LITERAL is `Fresh` and is tainted by the expression arm if it carries a
         // republishing element; a call returning a tuple is `Fresh` too and is a stated hole.
-        // Neither is a place, so neither has a field to name.
-        Republish::Nothing => return,
+        // Neither is a place, so neither has a field to name -- but a `name @ sub` element names
+        // its part of the `let`'s own copy twice (see the `_` arm of `scan_body`'s `let`).
+        Republish::Nothing => {
+            if let Some(Ty::Tuple(elems)) = sema.types.get(&init.id) {
+                out.opaque_republish |= pats
+                    .iter()
+                    .zip(elems)
+                    .any(|(p, t)| pattern_has_at(p) && pattern_binds_by_pointer(p, t, sema, 0));
+            }
+            return;
+        }
         // `let (p, q) = if flag { t } else { t };` -- destructuring something this pass cannot
         // classify. Gated on the type actually being able to carry a borrowing leaf, so a
         // `(i32, i32)` destructured out of an `if` still costs nothing. Measured before this arm
@@ -1815,6 +2152,7 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(Node<'_>)) {
                 walk_expr(&a.body, f);
             }
         }
+        ExprKind::Let { scrutinee, .. } => walk_expr(scrutinee, f),
         // Leaves. Spelled out rather than `_` so a new `ExprKind` is a compile error here.
         ExprKind::Int(_)
         | ExprKind::Float(_)

@@ -20,6 +20,7 @@ alias_for_each_element.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*4 wukong_
 alias_gemv_inplace.wk: wukong_sgemv
 alias_hoisted_coefficient.wk:
 alias_matmul_inplace.wk: wukong_sgemm
+alias_pattern_rest_binding.wk: wukong_cumsum_f32 wukong_cumsum_f32*4
 alias_range_views.wk: wukong_sgemm
 alias_slice_params.wk: wukong_rt_alloc wukong_rt_free
 alias_struct_field_arg.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*3 wukong_sgemm wukong_sgemm*2
@@ -270,6 +271,7 @@ layernorm.wk: wukong_norm_f32
 layernorm_bwd.wk: wukong_layernorm_bwd_f32
 layernorm_bwd_blocked_every_lane.wk: wukong_layernorm_bwd_f32 wukong_layernorm_bwd_f32*2
 leaky_relu.wk: wukong_vmath_f32
+let_chains.wk:
 let_destructure.wk:
 libc_name_collision.wk:
 linear_bf16.wk: wukong_sgemm_bf16_nt
@@ -366,6 +368,7 @@ opt4_promote_slice.wk:
 opt4_tile_edge_guard.wk: veckernel*3
 opt5_fuse_multiblock.wk: veckernel*6
 opt5_unswitch_guarded_call.wk: wukong_rt_alloc wukong_rt_alloc*4 wukong_rt_free wukong_rt_free*4
+or_pattern_bindings.wk:
 parallel_absmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_abssum.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_argmax.wk: wukong_argreduce_f32_parallel wukong_argreduce_f32_parallel*2
@@ -455,6 +458,7 @@ slice_bounds_oob.wk:
 slice_destination_spellings.wk:
 slice_len_loop.wk: veckernel*2
 slice_param_kernel_base.wk: veckernel*1 wukong_sgemm_nt
+slice_patterns.wk:
 slice_range_index.wk:
 softmax.wk: wukong_norm_f32
 softmax_bwd.wk: wukong_softmax_bwd_f32
@@ -526,6 +530,7 @@ uninit_zero.wk:
 unroll_jam_nests.wk:
 unsigned.wk:
 unsigned_print.wk:
+variant_payload_slice_pattern.wk:
 vec256_general.wk: veckernel*1 wukong_velem_f32 wukong_velem_f32*2
 vec256_lane_types.wk: veckernel*2
 vec256_runtime_streams.wk: veckernel*3 wukong_rt_alloc wukong_rt_alloc*6 wukong_rt_free wukong_rt_free*6

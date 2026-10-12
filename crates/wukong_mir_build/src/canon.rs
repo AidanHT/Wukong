@@ -372,6 +372,7 @@ fn expr_admits_any(e: &Expr, sema: &SemaResult) -> bool {
         ExprKind::ArrayRepeat { value, count } => {
             expr_admits_any(value, sema) || expr_admits_any(count, sema)
         }
+        ExprKind::Let { scrutinee, .. } => expr_admits_any(scrutinee, sema),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -624,6 +625,7 @@ fn canon_expr(e: &mut Expr, sema: &SemaResult) -> bool {
             c
         }
         ExprKind::ArrayRepeat { value, count } => canon_expr(value, sema) | canon_expr(count, sema),
+        ExprKind::Let { scrutinee, .. } => canon_expr(scrutinee, sema),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -912,6 +914,7 @@ impl UseScan<'_> {
                     self.expr(&a.body, in_index);
                 }
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee, in_index),
         }
     }
 }
@@ -1044,6 +1047,7 @@ fn subst_expr(e: &mut Expr, x: Symbol, init: &Expr) {
                 subst_expr(&mut a.body, x, init);
             }
         }
+        ExprKind::Let { scrutinee, .. } => subst_expr(scrutinee, x, init),
     }
 }
 
@@ -1102,8 +1106,13 @@ fn scan_pattern(p: &Pattern, f: &mut RegionFacts) {
             f.declared.insert(*name);
             scan_pattern(sub, f);
         }
-        PatKind::Slice { prefix, suffix, .. } => {
-            for s in prefix.iter().chain(suffix) {
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            for s in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                 scan_pattern(s, f);
             }
         }
@@ -1255,6 +1264,11 @@ fn scan_expr(e: &Expr, f: &mut RegionFacts) {
                 }
                 scan_expr(&a.body, f);
             }
+        }
+        // An `if let` chain's `let` declares its pattern's names, like an arm's pattern.
+        ExprKind::Let { pat, scrutinee } => {
+            scan_expr(scrutinee, f);
+            scan_pattern(pat, f);
         }
     }
 }

@@ -526,6 +526,7 @@ impl Lifter<'_> {
                 self.expr(body);
                 self.lift(e);
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
         }
     }
 

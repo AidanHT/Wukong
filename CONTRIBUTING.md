@@ -341,8 +341,22 @@ takes that arm. Change one and you must change the other. `wukong_opt`'s
 `exhaustive_int_match_agrees_with_rust_on_every_value` runs every `u8`/`i8` value through both and
 against Rust's own `match`; the two `char`-literal decoders (`usefulness::char_value` and
 `decode_char_literal`) are **not** pinned by any test, so an escape-syntax change must touch both. A
-new way to forge a value the analysis does not model (the one today is the zero fill of
-`let e: E;`, handled by `zero_value_modeled`) needs the same treatment.
+slice pattern's length rule is the third half-pair: `usefulness::slice_covers` and
+`mir_build::slice_pat::slice_view_pattern_cond` must agree that `[a, b]` means `len == 2` and
+`[a, .., z]` means `len >= 2`. A new way to forge a value the analysis does not model (the one
+today is the zero fill of `let e: E;`, handled by `zero_value_modeled`) needs the same treatment.
+
+LANDMINE: **a `match` arm binds its names only after its test passed.** `bind_match_ident` loads
+every place its pattern names — `data[1]` for `[a, b]` on a slice, through the data pointer of an
+empty one for `[x, ..]` — so calling it before the arm's test (as `lower_match` did until slice
+patterns existed, harmlessly while every place was in bounds whatever the value) reads past a
+slice's end on the interpreter and faults natively. `emit_match_arm_test` binds on the test's
+success edge and leaves the builder where the body starts, which binding itself may have moved (an
+or-pattern's alternatives branch); a pattern test that needs a place to exist (a slice's elements)
+must likewise test in a block only the guarding test reaches, not AND an eager load into it. A
+variant pattern's payload is such a place: `pattern_cond` tests it only once the discriminant
+matched, because for any other variant those bytes are that variant's fields (`V::L([7, ..])`
+against `V::P(4096, 3)` read `4096` as L's data pointer and loaded through it).
 
 **A new `ExprKind` variant is a sweep the compiler drives.** Every expression walker of the front
 end is an exhaustive `match` (28 of them when closures landed, across `wukong_ast`, the driver's
@@ -351,7 +365,10 @@ arm instead of copying a leaf: a closure body is walked by name resolution, alia
 attribute check and the lints' use tracking, but never by a divergence analysis
 (`block_diverges`, `expr_contains_break`, the lints' `stmt_diverges`), where its `return` would end
 the enclosing function. `wukong_mir_build`'s walkers can treat it as a leaf only because
-`closures::lift_module` rewrites every closure away before any of them runs.
+`closures::lift_module` rewrites every closure away before any of them runs. `ExprKind::Let` (a later
+`let` of an `if let` chain, only ever an operand of a `match` guard's `&&` fold) is the one
+expression that binds names: a walker that tracks scopes must bind its pattern into the enclosing
+arm's scope, as the arm's own pattern is, or a shadowing goes unseen.
 
 ## Adding a MIR `Op`
 

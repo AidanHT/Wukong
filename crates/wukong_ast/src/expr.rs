@@ -99,6 +99,15 @@ pub enum ExprKind {
         ret: Option<Box<TypeExpr>>,
         body: Box<Expr>,
     },
+    /// `let P = e` as a later operand of an `if let` / `while let` condition chain:
+    /// `if let A(x) = s && x > 0 && let B(y) = t { .. }`. The parser builds it only there, inside
+    /// the `&&` fold it makes the first arm's guard (`ArmOrigin::LetFallthrough`): its value is
+    /// whether `e` matches `P`, and when it does, `P`'s names are bound for the operands after it
+    /// and for the arm's body. Evaluation is left to right with short-circuit, as for any `&&`.
+    Let {
+        pat: Box<Pattern>,
+        scrutinee: Box<Expr>,
+    },
 }
 
 /// One parameter of a closure literal: a name with an optional type annotation. A parameter

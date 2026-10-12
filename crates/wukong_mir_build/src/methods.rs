@@ -309,6 +309,7 @@ impl Desugar<'_> {
                     self.expr(&mut a.body);
                 }
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
         }
 
         // Children first (a receiver may itself be a method call); then this call.
@@ -581,6 +582,7 @@ impl CallScan<'_> {
                     self.expr(&a.body);
                 }
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
         }
     }
 }

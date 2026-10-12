@@ -729,6 +729,26 @@ fn main() -> i32 {
          to a closure-bound `f` are rejected. Bind each closure to a name of its own.",
         bad: "module ex.e0422\nfn main() -> i32 {\n    let mut f = |x: i32| x + 1;\n    return f(1);\n}\n",
         good: "module ex.e0422\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return f(1);\n}\n"
+        "E0423",
+        "or-pattern alternatives bind different names",
+        "An or-pattern `A | B` matches when any alternative does, and its arm then reads the names \
+         the pattern binds from whichever alternative matched. So every alternative must bind \
+         exactly the same names: `Shape::Circle(r) | Shape::Square(r)` is fine, but \
+         `Shape::Circle(r) | Shape::Empty` leaves `r` unbound when the value is `Shape::Empty`. \
+         Bind the name in every alternative, or split the alternatives into arms of their own.",
+        bad: "module ex.e0423\nenum Shape { Circle(i32), Square(i32), Empty }\nfn size(s: Shape) -> i32 {\n    return match s {\n        Shape::Circle(r) | Shape::Empty => r,\n        Shape::Square(w) => w,\n    };\n}\nfn main() -> i32 {\n    return size(Shape::Square(3));\n}\n",
+        good: "module ex.e0423\nenum Shape { Circle(i32), Square(i32), Empty }\nfn size(s: Shape) -> i32 {\n    return match s {\n        Shape::Circle(r) | Shape::Square(r) => r,\n        Shape::Empty => 0,\n    };\n}\nfn main() -> i32 {\n    return size(Shape::Square(3));\n}\n"
+    ),
+    entry!(
+        "E0424",
+        "or-pattern binds a name at different types",
+        "Every alternative of an or-pattern binds the same names, and each name must have one \
+         type across them: the arm reads a single binding, whichever alternative matched. \
+         `Num::Int(v) | Num::Real(v)` with `Int(i32)` and `Real(f32)` binds `v` as an `i32` in \
+         one alternative and an `f32` in the other. Match the alternatives in separate arms and \
+         convert there (`Num::Int(v) => v as f32`).",
+        bad: "module ex.e0424\nenum Num { Int(i32), Real(f32) }\nfn val(n: Num) -> f32 {\n    return match n {\n        Num::Int(v) | Num::Real(v) => v,\n    };\n}\nfn main() -> i32 {\n    return val(Num::Int(2)) as i32;\n}\n",
+        good: "module ex.e0424\nenum Num { Int(i32), Real(f32) }\nfn val(n: Num) -> f32 {\n    return match n {\n        Num::Int(v) => v as f32,\n        Num::Real(v) => v,\n    };\n}\nfn main() -> i32 {\n    return val(Num::Int(2)) as i32;\n}\n"
     ),
     entry!(
         "E0430",
@@ -875,7 +895,11 @@ fn main() -> i32 {
         "The pattern of a plain `let` must match every value of its type, because the names it binds \
          have to exist afterwards. `let Shape::Circle { r } = s;` leaves `r` unbound when `s` is \
          any other shape, and `let (0, x) = t;` when `t.0` is not 0, so both are rejected; the \
-         diagnostic names a value the pattern misses, found by the same analysis as E0405. Use \
+         diagnostic names a value the pattern misses, found by the same analysis as E0405. Where \
+         that analysis cannot see inside the type (an array of more than 32 elements, a struct of \
+         more than 32 fields), the pattern is checked by form instead, as a `for` head is (below): \
+         `let [[a, ..]] = rows;` over a `[][f32; 64]` is rejected because `[x]` on a slice tests \
+         its length. Use \
          `let … else` to leave the enclosing function or loop when the value does not match — \
          `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
          that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
@@ -884,7 +908,8 @@ fn main() -> i32 {
          (`for (i, x) in pairs`), which binds every element of an array or slice without testing \
          it: there it is checked by form, so a literal, range, path, or-pattern or variant of a \
          multi-variant enum anywhere inside (`for (0, x) in pairs`) is rejected even when it \
-         happens to cover every value. Match inside the loop body instead.",
+         happens to cover every value, and so is an array pattern that lists an element of a \
+         `[]T` (a run-time length test). Match inside the loop body instead.",
         bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
         good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
     ),

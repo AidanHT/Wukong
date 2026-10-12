@@ -703,7 +703,9 @@ does not lower — it reports `C0001` at the pattern; inline the literal), **enu
 `Color::Red` (matched by discriminant), **tuple** patterns
 `(0, _) => …` (each field tested and bound, nesting allowed — and these compose, e.g. `(0 | 1, y)`),
 an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. Any arm may carry an
-optional `if` guard, and `match` works in both value and statement position. See
+optional `if` guard, and `match` works in both value and statement position. An arm binds its
+names only once its pattern matched, and a `{ … }` arm body ends the arm at its `}`, so the comma
+after it is optional even before an arm that opens with `[`, `(` or `-`. See
 `tests/run/{match_expr,match_patterns,match_tuple}.wk`.
 
 ```wukong
@@ -729,12 +731,47 @@ fn describe(p: Point, n: i32, a: [i32; 4]) -> i32 {
 Three more pattern forms (✅): a **struct** pattern `Point { x: 0, y, .. }` on a value of that
 struct (an unlisted field is unconstrained), a **binding** `name @ sub` that binds the whole value
 `sub` matches (also nested: `(a @ 1..=5, b)`), and an **array** pattern `[a, b, .., z]` on a
-fixed-size array — without `..` it lists every element. All three also destructure in a `let`
-(`let Point { x, y } = p;`, `let [first, .., last] = a;`). An array pattern on a `[]T` slice is
-`E0401`: its length is a run-time value, so test `s.len()` and index instead. A struct pattern names
+fixed-size array `[T; N]` or a `[]T` slice — without `..` it lists every element. All three also
+destructure in a `let` (`let Point { x, y } = p;`, `let [first, .., last] = a;`).
+
+```wukong
+fn sum(s: []i32) -> i32 {
+    return match s {
+        [] => 0,
+        [head, rest @ ..] => head + sum(rest),   // `rest` views the tail; nothing is copied
+    };
+}
+```
+
+On a **slice** (✅) an array pattern is a run-time **length test** — `[a, b]` matches exactly two
+elements, `[a, .., z]` at least two — and only then its elements' own tests, the suffix counted
+from the end; an element is never read from a slice too short to have it. A slice match is
+exhaustive only when every length is covered: `[] | [_, ..]` is, `[] | [x]` is `E0405` with the
+witness `[_, _, ..]` (`tests/fail/slice_match_nonexhaustive.wk`). A `let` or a `for` head over
+slices must not test a length, so only `[..]` and `[all @ ..]` fit there (`E0442`,
+`tests/fail/slice_let_refutable.wk`); use `let … else` or a `match`. **`rest @ ..`** (✅) binds the
+elements the `..` stands for, in place: a sub-slice view of a slice, and the sub-array
+`[T; N - listed]` of an array, whose length is part of its type. In a `match` that place is the
+scrutinee's, as for every aggregate a pattern binds (a write to the scrutinee shows through it); a
+`let` first copies its initializer into its own slot, so `let [_, tail @ ..] = v;` keeps `v`'s
+elements as they were (`tests/run/slice_patterns.wk`). A struct pattern names
 its struct and a data-carrying variant pattern (`Shape::Circle(r)`) its enum, and the value matched
 must be of that type — `E0401` otherwise, in a `match`, a `let` and a `for` head alike
 (`tests/fail/for_head_variant_mismatch.wk`).
+
+An **or-pattern may bind names** (✅) when every alternative binds the same ones at the same types:
+`Shape::Circle(r) | Shape::Square(r) => r * 10`, `(0, v) | (v, 0) => v`, `[x] | [x, _] => x`. The arm
+reads each name from the **first** alternative that matches, left to right (`(v, 1) | (_, v)`
+against `(5, 1)` binds `v = 5`), and an aggregate name binds in place like any other. Under a
+`match` **guard**, as in Rust, the guard is tried with each alternative that matches in turn and the
+arm takes the first that passes: `(v, _) | (_, v) if v > 4 => v` against `(2, 5)` is `5`. Nested
+binding or-patterns are tried leftmost first; an or-pattern that binds nothing is tested whole, so a
+guard with side effects may run fewer times than Rust would run it. The `&&` of an `if let` chain is
+not a guard: `if let (v, _) | (_, v) = (2, 5) && v > 4` binds `v = 2` and fails, as in Rust. A name one
+alternative leaves out is `E0423`, and a name bound at two types (`Num::Int(v) | Num::Real(v)` over
+`i32` and `f32` payloads) is `E0424`; split such alternatives into arms of their own
+(`tests/run/or_pattern_bindings.wk`, `tests/fail/or_pattern_unbound.wk`,
+`tests/fail/or_pattern_type_mismatch.wk`).
 
 **`if let`, `while let` and `let … else`** (✅) are what they are in Rust, and the parser rewrites
 each into a `match`:
@@ -745,25 +782,32 @@ while let 1..=100 = k { k = k - 7; }                         // loop { match k {
 let Shape::Circle(r) = s else { return 0; };                 // `r` is bound after this line
 if let Shape::Circle(r) = s && r > 2 && r < 9 { use(r); }    // match s { P if r > 2 && r < 9 => …, _ => … }
 while let 1..=9 = k && k != 5 { k = k + 1; }                 // the guard joins the loop's arm
+if let Shape::Circle(r) = s && let Shape::Square(w) = t && w > r { use(r, w); }   // a second `let`
 ```
 
 An **`&&` chain** after an `if let` / `while let` scrutinee (✅) becomes the guard of the pattern's
 arm: the conditions run only after the pattern matched, left to right with short-circuit, and see
-its bindings — Rust's let chains with one `let`. The scrutinee therefore stops before a top-level
-`&&` (`if let true = a == b && c` tests `a == b`, then `c`); a second `let` in the chain, or a `||`
-after the condition, is `E0200` (group it: `&& (a || b)`; `tests/run/if_let_chain.wk`,
-`tests/fail/if_let_chain_or.wk`). To match a whole `&&` or `||` expression, parenthesize it:
-`if let false = (a && b)` tests `a && b`, while `if let false = a && b` tests `a` and then
-requires `b` — the same result only for a `true` pattern.
+its bindings — Rust's let chains. A **later `let P = e`** in the chain (✅) tests `e` against `P`
+when the operands before it held, and binds `P`'s names for the operands after it and for the
+block (a name it rebinds shadows the earlier one); if any operand fails, the `else` runs, and none
+of the chain's names exist there (`tests/run/let_chains.wk`). Each scrutinee stops before a
+top-level `&&` (`if let true = a == b && c` tests `a == b`, then `c`); a `||` after the condition
+is `E0200` (group it: `&& (a || b)`; `tests/run/if_let_chain.wk`, `tests/fail/if_let_chain_or.wk`).
+The chain must start with its `let`: `if c && let P = e` is not supported. To match a whole `&&`
+or `||` expression, parenthesize it: `if let false = (a && b)` tests `a && b`, while
+`if let false = a && b` tests `a` and then requires `b` — the same result only for a `true`
+pattern.
 
 The `else` of a `let … else` must **diverge** — `return`, `break`, `continue`, or a `loop` with no
 exit — because the names its pattern binds do not exist on that path (`E0401` otherwise). A plain
 `let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
 for every other shape, so it is `E0442`, with a witness naming a value it misses
 (`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
-`tests/fail/let_else_not_diverging.wk`). Not yet: a `rest @ ..` sub-array binding, a binding
-inside an or-pattern (`C0001` at the pattern), an array pattern on a `[]T` slice, and more than one
-`let` in an `if let` chain.
+`tests/fail/let_else_not_diverging.wk`). Where that analysis cannot see inside a type (an array of
+more than 32 elements, a struct of more than 32 fields), a `let` pattern is checked by its form, as
+a `for` head is: a literal, range, path, or-pattern, variant of a multi-variant enum, or array
+pattern listing an element of a `[]T` anywhere inside is `E0442` — `let [[a, ..]] = rows;` over a
+`[][f32; 64]` tests that `rows` has one row (`tests/fail/slice_let_wide_element.wk`).
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to

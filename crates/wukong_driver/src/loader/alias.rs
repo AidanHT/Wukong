@@ -686,6 +686,7 @@ impl Expander<'_> {
                 }
             }
             ExprKind::Loop { body, .. } => self.block(body),
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
             ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => self.ty(t),
             // A closure's annotations are types like any other, and its body may name an alias.
             ExprKind::Closure { params, ret, body } => {

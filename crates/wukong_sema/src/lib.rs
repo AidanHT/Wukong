@@ -405,6 +405,7 @@ fn collect_const_refs(e: &Expr, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>)
         // A closure is never a legal const initializer (E0411), but what its body names still
         // counts: a cycle through it would otherwise go unreported.
         ExprKind::Closure { body, .. } => collect_const_refs(body, consts, out),
+        ExprKind::Let { scrutinee, .. } => collect_const_refs(scrutinee, consts, out),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -3119,12 +3120,14 @@ impl<'a> Sema<'a> {
                 // What the binding views is read BEFORE the name is bound, so a shadowing view
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
+                let before_bind = self.diags.len();
                 self.bind_pattern(pat, &bound);
+                let pattern_typed = !self.diags[before_bind..].iter().any(|d| d.is_error());
                 self.note_literal_binding(pat, ty.as_ref(), init.as_ref(), &bound);
                 // A `let` pattern must match every value (E0442; `let … else` is the refutable
                 // form, and the parser has already rewritten it).
                 if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
-                    self.check_irrefutable(pat, &bound, patterns::PatSite::Let);
+                    self.check_let_pattern(pat, &bound, pattern_typed);
                 }
                 if let Ty::Array {
                     shared: true,
@@ -3608,13 +3611,9 @@ impl<'a> Sema<'a> {
                     }
                 }
             }
-            // An or-pattern's alternatives are typically binding-free literals/variants; bind each
-            // against the same scrutinee type so any shared identifier resolves.
-            PatKind::Or(alts) => {
-                for a in alts {
-                    self.bind_pattern(a, ty);
-                }
-            }
+            // Every alternative of an or-pattern binds the same names at the same types
+            // (`patterns.rs`).
+            PatKind::Or(alts) => self.check_or_pattern(alts, ty),
             PatKind::Wildcard | PatKind::Unit => {}
             // A data-carrying enum-variant pattern: validate the variant + payload shape and bind the
             // inner fields to their declared types (so an arm body sees `x`/`y` typed).
@@ -3645,8 +3644,16 @@ impl<'a> Sema<'a> {
             PatKind::Slice {
                 prefix,
                 rest,
+                rest_binding,
                 suffix,
-            } => self.check_slice_pattern(prefix, *rest, suffix, ty, pat.span),
+            } => self.check_slice_pattern(
+                prefix,
+                *rest,
+                rest_binding.as_deref(),
+                suffix,
+                ty,
+                pat.span,
+            ),
         }
     }
 
@@ -4941,6 +4948,14 @@ impl<'a> Sema<'a> {
             // A closure argument of a function-typed parameter is checked by `type_call_args`;
             // anywhere else it is `E0411` (`closures.rs`).
             ExprKind::Closure { .. } => self.misplaced_closure(e),
+            // `let P = e` in an `if let` / `while let` chain, which the parser puts in the first
+            // arm's guard: a test of `e` against `P`, so a `bool`, binding `P`'s names in the arm's
+            // scope for the chain's later operands and the arm's body.
+            ExprKind::Let { pat, scrutinee } => {
+                let t = self.type_expr(scrutinee);
+                self.bind_pattern(pat, &t);
+                Ty::Scalar(Scalar::Bool)
+            }
         }
     }
 

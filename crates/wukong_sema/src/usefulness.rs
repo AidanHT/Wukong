@@ -21,7 +21,16 @@
 //! | integers and `char` | ranges over the type's whole domain, split at every bound a row of the column names (a `char` holds any 32-bit value, since an integer `as char` is unchecked) |
 //! | `enum` | one per discriminant; a payload variant's fields are sub-columns ([`VariantPayload::field_tys`]) |
 //! | tuple, `()`, struct, array `[T; N]` (up to 32 fields) | the single constructor whose fields are the elements |
-//! | anything else — floats, slices, pointers, tensors, generics | none the analysis can name: only `_` or a binding covers it |
+//! | slice `[]T` | one per length — split as below — whose fields are the elements |
+//! | anything else — floats, `str`, pointers, tensors, generics | none the analysis can name: only `_` or a binding covers it |
+//!
+//! A slice column has a constructor per length, infinitely many, which the split makes finite the
+//! way rustc does: with `L` past every length a row pins down — longer than any `[a, b]` without
+//! `..` lists, and at least the longest `[a, .., z]` prefix plus the longest suffix — the lengths
+//! `0..L` are one constructor each and every length `>= L` is one variable-length constructor whose
+//! fields are its first `p` and last `s` elements (`p + s = L`). No row can tell two lengths `>= L`
+//! apart, so that constructor stands for all of them. A slice match is exhaustive only when every
+//! length is covered: `[] | [_, ..]` is, `[] | [_]` is not (witness `[_, _, ..]`).
 //!
 //! The analysis is **total or silent**. A pattern it cannot place in its column's space — a pattern
 //! of the wrong type (sema reports that on its own), a non-literal range bound, an integer pattern
@@ -160,6 +169,18 @@ pub(crate) fn refutable(
     Some(Witness { pattern, more })
 }
 
+/// Whether the analysis can place `pat` against a value of type `ty` at all. When it cannot,
+/// [`refutable`] answers `None` without having proved the pattern matches everything, and a caller
+/// that must not let a refutable pattern through decides by some other rule.
+pub(crate) fn placeable(defs: &DefMap, interner: &Interner, ty: &Ty, pat: &Pattern) -> bool {
+    let cx = Cx {
+        defs,
+        interner,
+        budget: BUDGET,
+    };
+    cx.lower(pat, ty).is_some()
+}
+
 /// How deep [`zero_value_modeled`] follows nested types before it gives up (answering `false`).
 const ZERO_DEPTH: u32 = 64;
 
@@ -217,6 +238,14 @@ enum DPat {
     Variant(usize, Vec<DPat>),
     /// The single constructor of a tuple or `()`, with its fields.
     Product(Vec<DPat>),
+    /// An array pattern on a `[]T`: without `..` (`var: false`, `suffix` empty) it matches the
+    /// slices of exactly `prefix.len()` elements; with one, those of at least
+    /// `prefix.len() + suffix.len()`.
+    Slice {
+        prefix: Vec<DPat>,
+        suffix: Vec<DPat>,
+        var: bool,
+    },
     Or(Vec<DPat>),
 }
 
@@ -231,6 +260,10 @@ enum Ctor {
     Class(usize),
     /// The one constructor of a tuple or `()`.
     Single,
+    /// The slices of exactly this many elements.
+    SliceFixed(usize),
+    /// The slices of at least `p + s` elements, whose fields are the first `p` and the last `s`.
+    SliceVar(usize, usize),
 }
 
 /// A witness under construction: one per column.
@@ -257,6 +290,8 @@ enum Space {
     Int(Scalar),
     Enum(EnumSpace),
     Product(Product),
+    /// A `[]T` slice of this element type, one constructor per length (see the module docs).
+    Slice(Ty),
     /// No constructors the analysis can name.
     Opaque,
 }
@@ -349,6 +384,7 @@ impl Cx<'_> {
                 }
                 _ => Space::Opaque,
             },
+            Ty::Slice(elem) => Space::Slice((**elem).clone()),
             _ => Space::Opaque,
         }
     }
@@ -463,7 +499,20 @@ impl Cx<'_> {
                 prefix,
                 rest,
                 suffix,
+                ..
             } => {
+                if let Ty::Slice(elem) = ty {
+                    let lower_all = |ps: &[Pattern]| {
+                        ps.iter()
+                            .map(|p| self.lower(p, elem))
+                            .collect::<Option<Vec<_>>>()
+                    };
+                    return Some(DPat::Slice {
+                        prefix: lower_all(prefix)?,
+                        suffix: lower_all(suffix)?,
+                        var: *rest,
+                    });
+                }
                 let Space::Product(Product {
                     kind: ProductKind::Array,
                     fields: tys,
@@ -692,6 +741,13 @@ impl Cx<'_> {
                     }
                 }
             },
+            (Space::Slice(_), Ctor::SliceFixed(_)) => format!("[{}]", subs.join(", ")),
+            (Space::Slice(_), Ctor::SliceVar(p, _)) => {
+                let mut parts: Vec<&str> = subs[..p].iter().map(String::as_str).collect();
+                parts.push("..");
+                parts.extend(subs[p..].iter().map(String::as_str));
+                format!("[{}]", parts.join(", "))
+            }
             _ => "_".to_string(),
         }
     }
@@ -721,6 +777,8 @@ fn ctor_fields(space: &Space, c: Ctor) -> Vec<Ty> {
     match (space, c) {
         (Space::Enum(es), Ctor::Class(k)) => es.variants[es.classes[k][0]].payload.field_tys(),
         (Space::Product(p), Ctor::Single) => p.fields.clone(),
+        (Space::Slice(elem), Ctor::SliceFixed(n)) => vec![elem.clone(); n],
+        (Space::Slice(elem), Ctor::SliceVar(p, s)) => vec![elem.clone(); p + s],
         _ => Vec::new(),
     }
 }
@@ -763,6 +821,39 @@ fn specialize(row: &[DPat], c: Ctor, arity: usize) -> Option<Vec<DPat>> {
         (DPat::Range(lo, hi), Ctor::Seg(a, b)) if *lo <= a && b <= *hi => Vec::new(),
         (DPat::Variant(k, subs), Ctor::Class(x)) if *k == x => subs.clone(),
         (DPat::Product(subs), Ctor::Single) => subs.clone(),
+        (
+            DPat::Slice {
+                prefix, var: false, ..
+            },
+            Ctor::SliceFixed(n),
+        ) if prefix.len() == n => prefix.clone(),
+        (
+            DPat::Slice {
+                prefix,
+                suffix,
+                var: true,
+            },
+            Ctor::SliceFixed(n),
+        ) if n >= prefix.len() + suffix.len() => {
+            let mut out = prefix.clone();
+            out.resize(n - suffix.len(), DPat::Wild);
+            out.extend_from_slice(suffix);
+            out
+        }
+        // The split made `p`/`s` at least every row's prefix/suffix length.
+        (
+            DPat::Slice {
+                prefix,
+                suffix,
+                var: true,
+            },
+            Ctor::SliceVar(p, s),
+        ) if p >= prefix.len() && s >= suffix.len() => {
+            let mut out = prefix.clone();
+            out.resize(p + s - suffix.len(), DPat::Wild);
+            out.extend_from_slice(suffix);
+            out
+        }
         _ => return None,
     };
     out.extend_from_slice(rest);
@@ -829,7 +920,72 @@ fn split_column(space: &Space, heads: &[&DPat]) -> Split {
             }
         }
         Space::Product(_) => Split::Complete(vec![Ctor::Single]),
+        Space::Slice(_) => {
+            if !heads.iter().any(|h| matches!(h, DPat::Slice { .. })) {
+                return Split::Incomplete(Vec::new());
+            }
+            let all = slice_ctors(heads);
+            let missing: Vec<Ctor> = all
+                .iter()
+                .copied()
+                .filter(|&c| !heads.iter().any(|h| slice_covers(h, c)))
+                .collect();
+            if missing.is_empty() {
+                Split::Complete(all)
+            } else {
+                Split::Incomplete(missing)
+            }
+        }
         Space::Opaque => Split::Incomplete(Vec::new()),
+    }
+}
+
+/// The constructors of a slice column split against `heads` (see the module docs): one per length
+/// below `L`, then the variable-length constructor for every length `>= L`.
+fn slice_ctors(heads: &[&DPat]) -> Vec<Ctor> {
+    let (mut p, mut s, mut fixed) = (0, 0, None::<usize>);
+    for h in heads {
+        if let DPat::Slice {
+            prefix,
+            suffix,
+            var,
+        } = h
+        {
+            if *var {
+                p = p.max(prefix.len());
+                s = s.max(suffix.len());
+            } else {
+                fixed = Some(fixed.map_or(prefix.len(), |f| f.max(prefix.len())));
+            }
+        }
+    }
+    // Past the longest fixed length, so a variable-length slice never equals a listed one.
+    if let Some(f) = fixed {
+        if f + 1 > p + s {
+            p = f + 1 - s;
+        }
+    }
+    let mut ctors: Vec<Ctor> = (0..p + s).map(Ctor::SliceFixed).collect();
+    ctors.push(Ctor::SliceVar(p, s));
+    ctors
+}
+
+/// Whether the head `h` matches every slice constructor `c` stands for.
+fn slice_covers(h: &DPat, c: Ctor) -> bool {
+    let DPat::Slice {
+        prefix,
+        suffix,
+        var,
+    } = h
+    else {
+        return false;
+    };
+    let listed = prefix.len() + suffix.len();
+    match (var, c) {
+        (false, Ctor::SliceFixed(n)) => prefix.len() == n,
+        (true, Ctor::SliceFixed(n)) => n >= listed,
+        (true, Ctor::SliceVar(p, s)) => listed <= p + s,
+        _ => false,
     }
 }
 
@@ -854,6 +1010,15 @@ fn head_ctors(space: &Space, head: &DPat, heads: &[&DPat]) -> Vec<Ctor> {
         }
         DPat::Variant(k, _) => vec![Ctor::Class(*k)],
         DPat::Product(_) => vec![Ctor::Single],
+        // The split counts this head too, so the variable-length constructor's `p`/`s` cover it.
+        DPat::Slice { .. } => {
+            let mut all: Vec<&DPat> = heads.to_vec();
+            all.push(head);
+            slice_ctors(&all)
+                .into_iter()
+                .filter(|&c| slice_covers(head, c))
+                .collect()
+        }
         DPat::Wild | DPat::Or(_) => Vec::new(),
     }
 }
@@ -1119,6 +1284,38 @@ mod tests {
         assert!(msgs.iter().any(|m| m.contains("(and 1 more)")), "{msgs:?}");
     }
 
+    /// A slice column has one constructor per length; `..` covers every length from its listed
+    /// count up.
+    #[test]
+    fn slice_lengths_are_checked() {
+        assert_exhaustive("fn f(s: []i32) -> i32 { return match s { [] => 0, [h, ..] => h }; }");
+        assert_exhaustive(
+            "fn f(s: []i32) -> i32 { return match s { [] => 0, [x] => x, [a, b] => a + b,              [a, .., z] => a * z }; }",
+        );
+        assert_missing(
+            "fn f(s: []i32) -> i32 { return match s { [] => 0, [x] => x }; }",
+            "[_, _, ..]",
+        );
+        assert_missing(
+            "fn f(s: []i32) -> i32 { return match s { [x, ..] => x }; }",
+            "[]",
+        );
+        // Element patterns are sub-columns: the first and last element of a long slice.
+        assert_missing(
+            "fn f(s: []bool) -> i32 { return match s { [true, ..] => 1, [false, .., true] => 2,              [] => 3 }; }",
+            "[false]",
+        );
+        assert_exhaustive(
+            "fn f(s: []bool) -> i32 { return match s { [true, ..] => 1, [false, .., true] => 2,              [false, .., false] => 4, [false] => 5, [] => 3 }; }",
+        );
+        // A prefix and a suffix of a slice may name the same element: `[_, true]` is not
+        // `[.., true]` on a one-element slice.
+        assert_missing(
+            "fn f(s: []bool) -> i32 { return match s { [] => 0, [_, .., true] => 1,              [.., false] => 2 }; }",
+            "[true]",
+        );
+    }
+
     #[test]
     fn unmodeled_patterns_stay_silent() {
         // A non-literal range bound cannot be placed: no verdict, so no E0405 (lowering reports it).
@@ -1177,6 +1374,11 @@ mod tests {
         );
         assert_eq!(
             proven("fn f(x: i32) -> i32 { return match x { 0 => 1, _ => 2 }; }"),
+            1
+        );
+        // A slice: a zero slice is the empty one, which `[]` models.
+        assert_eq!(
+            proven("fn f(s: []i32) -> i32 { return match s { [] => 0, [h, ..] => h }; }"),
             1
         );
         // Literal inference re-checks this body (`k` is decided by its use as an `i64`); the
@@ -1282,6 +1484,15 @@ mod tests {
                 "fn f(a: i32, b: i32) -> i32 { return match (a, b) { (_, _) => 1, (0, 0) => 2 }; }"
             ),
             1
+        );
+        // `[..]` covers every slice; `[_]` after it never fires, `[x, ..]` after `[]` does.
+        assert_eq!(
+            unreachable_arms("fn f(s: []i32) -> i32 { return match s { [..] => 1, [_] => 2 }; }"),
+            1
+        );
+        assert_eq!(
+            unreachable_arms("fn f(s: []i32) -> i32 { return match s { [] => 1, [x, ..] => x }; }"),
+            0
         );
     }
 }

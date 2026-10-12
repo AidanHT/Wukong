@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0405
+// EXPECT-COUNT: 1
+module tests.fail.slice_match_nonexhaustive
+
+// An array pattern on a `[]T` tests the slice's length at run time, so a `match` over a slice is
+// exhaustive only when every length is covered. These arms cover the lengths 0 and 1; the witness
+// `[_, _, ..]` names every longer slice. Add `[a, .., z] => …` or a `_` arm.
+fn first_or_zero(s: []i32) -> i32 {
+    return match s { //~ E0405
+        [] => 0,
+        [x] => x,
+    };
+}
+
+fn main() -> i32 {
+    let a: [i32; 3] = [4, 5, 6];
+    print(first_or_zero(a));
+    return 0;
+}

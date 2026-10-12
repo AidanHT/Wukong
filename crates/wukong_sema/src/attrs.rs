@@ -480,6 +480,7 @@ fn check_expr(e: &Expr, interner: &Interner, diags: &mut Vec<Diagnostic>) {
         }
         // A closure body is statements like any other; an attribute on one is checked there.
         ExprKind::Closure { body, .. } => check_expr(body, interner, diags),
+        ExprKind::Let { scrutinee, .. } => check_expr(scrutinee, interner, diags),
     }
 }
 

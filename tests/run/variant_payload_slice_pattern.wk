@@ -1,0 +1,99 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4096
+// EXPECT-OUT: 8
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+module tests.run.variant_payload_slice_pattern
+
+// An array pattern on a `[]T` inside an enum variant's payload is tested only once the
+// discriminant matched. For any other variant the payload bytes are that variant's own fields:
+// `V::P(4096, 3)` laid over `V::L`'s fat pointer reads as `data = 4096, len = 3`, which passes the
+// length test of `[7, ..]`, and loading the element behind it faulted natively and trapped on the
+// interpreter. `V::P(0, 3)` is a null data pointer with a length of 3.
+//
+// Every expectation is the program's meaning: the arm that matches by the source semantics.
+
+enum V {
+    L([]i64),
+    P(i64, i64),
+    N,
+}
+
+enum O {
+    W(V),
+    Z,
+}
+
+fn lead7(v: V) -> i32 {
+    return match v {
+        V::L([7, ..]) => 1,
+        _ => 0,
+    };
+}
+
+// The same test as one alternative of an or-pattern.
+fn either(v: V) -> i32 {
+    return match v {
+        V::L([7, ..]) | V::P(0, _) => 1,
+        _ => 0,
+    };
+}
+
+// An or-pattern that binds re-tests its alternatives to bind from the one that matched.
+fn bound(v: V) -> i64 {
+    return match v {
+        V::L([7, x, ..]) | V::P(x, 3) => x,
+        _ => -1,
+    };
+}
+
+// A nested variant: the inner payload is read only once both discriminants matched.
+fn nested(o: O) -> i32 {
+    return match o {
+        O::W(V::L([7, ..])) => 1,
+        _ => 0,
+    };
+}
+
+// A later `let` of an `if let` chain tests through the same path.
+fn chained(k: i32, v: V) -> i32 {
+    if let 0..=9 = k && let V::L([_, .., 9]) = v {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let a: [i64; 3] = [7, 8, 9];
+    let s: []i64 = a;
+    println(lead7(V::P(4096, 3)));
+    println(lead7(V::L(s)));
+    println(lead7(V::L(s[1..3])));
+    println(lead7(V::N));
+    println(either(V::P(4096, 3)));
+    println(either(V::P(0, 3)));
+    println(either(V::L(s)));
+    println(bound(V::P(4096, 3)));
+    println(bound(V::L(s)));
+    println(bound(V::P(5, 4)));
+    println(nested(O::W(V::P(4096, 3))));
+    println(nested(O::W(V::L(s))));
+    println(nested(O::Z));
+    println(chained(3, V::P(4096, 3)));
+    println(chained(3, V::L(s)));
+    println(chained(30, V::L(s)));
+    return 0;
+}

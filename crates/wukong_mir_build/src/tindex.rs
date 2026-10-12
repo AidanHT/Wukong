@@ -479,6 +479,7 @@ impl Linearizer<'_> {
                     self.expr(&mut a.body);
                 }
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
         }
 
         // A partial index is a view: its address, not an element (see the module docs).

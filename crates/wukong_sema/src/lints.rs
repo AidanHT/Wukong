@@ -474,6 +474,7 @@ fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
             }
         }
         ExprKind::Closure { body, .. } => f(Child::Expr(body)),
+        ExprKind::Let { scrutinee, .. } => f(Child::Expr(scrutinee)),
     }
 }
 
@@ -986,6 +987,12 @@ impl<'a> FnLint<'a> {
                 self.expr(body);
                 self.scopes.pop();
             }
+            // `let P = e` in an `if let` chain binds into the arm's scope, which the `Match` arm
+            // above pushed: the chain's later operands and the arm's body read its names.
+            ExprKind::Let { pat, scrutinee } => {
+                self.expr(scrutinee);
+                self.bind_pattern(pat, BindKind::Arm, false);
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Str(_)
@@ -1257,7 +1264,9 @@ impl<'a> FnLint<'a> {
             | ExprKind::Block(_)
             | ExprKind::If { .. }
             | ExprKind::Match { .. }
-            | ExprKind::Loop { .. } => return,
+            | ExprKind::Loop { .. }
+            // Only ever an operand of an `if let` chain, never a statement.
+            | ExprKind::Let { .. } => return,
         };
         let mut d = Diagnostic::warning(msg)
             .with_code("W0004")
@@ -1442,8 +1451,13 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
             }
             pattern_names(sub, out);
         }
-        PatKind::Slice { prefix, suffix, .. } => {
-            for s in prefix.iter().chain(suffix) {
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            for s in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                 pattern_names(s, out);
             }
         }

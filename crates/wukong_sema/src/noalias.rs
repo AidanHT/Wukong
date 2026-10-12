@@ -351,8 +351,13 @@ impl Walker<'_> {
                 self.bind(*name, Binding::default());
                 self.bind_pattern(sub, Binding::default());
             }
-            PatKind::Slice { prefix, suffix, .. } => {
-                for q in prefix.iter().chain(suffix) {
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                for q in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                     self.bind_pattern(q, Binding::default());
                 }
             }
@@ -457,15 +462,43 @@ impl Walker<'_> {
                     }
                 }
             }
-            PatKind::Slice { prefix, suffix, .. } => {
-                let elem = match ty {
-                    Some(Ty::Array { elem, .. }) => Some(&**elem),
-                    _ => None,
-                };
-                for q in prefix.iter().chain(suffix) {
-                    self.bind_place_pattern(q, elem, Some(root.clone()));
+            // On a `[]T` view the listed elements live in the storage the view points at, and
+            // `rest @ ..` is a narrower view of that same storage.
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => match ty {
+                Some(Ty::Slice(elem)) => {
+                    let target = self.place_view_target(&root);
+                    for q in prefix.iter().chain(suffix) {
+                        self.bind_place_pattern(q, Some(elem), Some(target.clone()));
+                    }
+                    if let Some(PatKind::Ident(s)) = rest_binding.as_deref().map(|b| &b.kind) {
+                        self.bind(
+                            *s,
+                            Binding {
+                                view_of: Some(target),
+                                storage_of: None,
+                            },
+                        );
+                    }
                 }
-            }
+                // An array's elements and its `rest @ ..` sub-array are places inside it.
+                _ => {
+                    let elem = match ty {
+                        Some(Ty::Array { elem, .. }) => Some(&**elem),
+                        _ => None,
+                    };
+                    for q in prefix.iter().chain(suffix) {
+                        self.bind_place_pattern(q, elem, Some(root.clone()));
+                    }
+                    if let Some(b) = rest_binding.as_deref() {
+                        self.bind_place_pattern(b, ty, Some(root.clone()));
+                    }
+                }
+            },
             PatKind::Or(ps) => {
                 for q in ps {
                     self.bind_place_pattern(q, ty, Some(root.clone()));
@@ -478,6 +511,33 @@ impl Walker<'_> {
             | PatKind::Bool(_)
             | PatKind::Path(_)
             | PatKind::Range { .. } => {}
+        }
+    }
+
+    /// The place a `match` (or chain `let`) scrutinee of type `ty` is matched in: a scrutinee that
+    /// names a place is matched in place, its aggregate parts bound by pointer into it
+    /// (`bind_place_pattern`); a `[]T` through the place holding the view, so an array pattern
+    /// binds into what the view points at ([`Walker::place_view_target`]); any other view is the
+    /// view value itself, which an arm binds as a copy.
+    fn scrutinee_root(&self, scrutinee: &Expr, ty: Option<&Ty>) -> Option<Root> {
+        match ty {
+            Some(Ty::Slice(_)) => self.place_storage(scrutinee),
+            Some(t) if is_view_ty(t) => None,
+            _ => self.root_of(scrutinee),
+        }
+    }
+
+    /// The storage the view value held at the place `root` points at: a plain view binding's
+    /// recorded target, the view at an exact field place, or — past a view already — the whole
+    /// pointee.
+    fn place_view_target(&self, root: &Root) -> Root {
+        match root {
+            Root::Storage(b, path) if path.is_empty() => self.bindings[*b as usize]
+                .view_of
+                .clone()
+                .unwrap_or_else(|| Root::Target(*b, Vec::new())),
+            Root::Storage(b, path) => Root::Target(*b, path.clone()),
+            target @ Root::Target(..) => target.clone(),
         }
     }
 
@@ -698,15 +758,8 @@ impl Walker<'_> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee);
-                // A scrutinee that names a place is matched in place: its aggregate parts are
-                // bound by pointer into it (`bind_place_pattern`). A view scrutinee is the view
-                // value itself, which an arm binds as a copy.
                 let ty = self.ty(scrutinee).cloned();
-                let root = if ty.as_ref().is_some_and(is_view_ty) {
-                    None
-                } else {
-                    self.root_of(scrutinee)
-                };
+                let root = self.scrutinee_root(scrutinee, ty.as_ref());
                 for arm in arms {
                     self.scopes.push(HashMap::default());
                     self.bind_place_pattern(&arm.pat, ty.as_ref(), root.clone());
@@ -716,6 +769,14 @@ impl Walker<'_> {
                     self.expr(&arm.body);
                     self.scopes.pop();
                 }
+            }
+            // `let P = e` in an `if let` chain is matched like a `match` scrutinee and binds into
+            // the arm's scope, which the `Match` arm above pushed.
+            ExprKind::Let { pat, scrutinee } => {
+                self.expr(scrutinee);
+                let ty = self.ty(scrutinee).cloned();
+                let root = self.scrutinee_root(scrutinee, ty.as_ref());
+                self.bind_place_pattern(pat, ty.as_ref(), root);
             }
             // A closure body sees the enclosing bindings by value (a captured pointer still views
             // what it viewed outside), and its parameters are fresh bindings that shadow them.
@@ -1132,6 +1193,12 @@ fn ko(@noalias mut o: [f32; 4], os: [One; 2]) { o[0] = 0.0; }
             in_grid("match grid[0] { (row, _) => k(row, b) }"),
             Vec::<&str>::new(),
             "a different buffer"
+        );
+        // A later `let` of an `if let` chain binds in place exactly as the first one does.
+        assert_eq!(
+            in_grid("if let true = b[0] > 0.0 && let (row, _) = grid[0] { kg(row, grid); }"),
+            vec!["E0316"],
+            "a chain `let`"
         );
     }
 

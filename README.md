@@ -341,11 +341,13 @@ Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `->
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
 (`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`
 that a nested `break 'outer` / `continue 'outer` can target) execute end-to-end on both backends — as do
-**`match`** (literal / range / or / enum-variant / tuple / struct / `name @ sub` / array patterns,
-with guards, and exhaustiveness decided by pattern usefulness with a witness — a proven-exhaustive
+**`match`** (literal / range / or (binding the same names in each alternative) / enum-variant /
+tuple / struct / `name @ sub` / array patterns —
+on `[T; N]` arrays and, as a run-time length test, on `[]T` slices, with `rest @ ..` sub-array and
+sub-slice bindings — with guards, and exhaustiveness decided by pattern usefulness with a witness — a proven-exhaustive
 match takes its last arm untested, so an exhaustive `bool` match is one branch), **`if let`** and
-**`while let`** (with `&& cond` chains), **`let … else`**, **destructuring `for` heads**
-(`for (i, x) in pairs`, `for Point { x, y } in pts`), **C-style and
+**`while let`** (with `&&` chains of conditions and further `let`s), **`let … else`**,
+**destructuring `for` heads** (`for (i, x) in pairs`, `for Point { x, y } in pts`), **C-style and
 data-carrying (tagged-union) enums**, **slices `[]T`** (fat-pointer views with `.len()`, indexing,
 iteration, array→slice unsizing and range indexing `s[a..b]` — and, since every kernel operand
 resolves through one base-pointer helper, a legal operand to the whole recognized-kernel family: GEMM/GEMV, the fused
