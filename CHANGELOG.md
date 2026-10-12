@@ -72,6 +72,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Runtime** `wukong_attention_kv_batch_f32[_parallel]` with `kv_batch_plan` /
   `kv_batch_check_lens` (shared by the interpreter twin), Cranelift and textual-LLVM ABI rows, and
   autodiff refusing it like `sdpa_kv`.
+
 ### Parallel per-function optimization (`gap6/parallel-optimizer`, N61)
 
 - **The optimizer's per-function work runs on several threads, and its output does not depend on
