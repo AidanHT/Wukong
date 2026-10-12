@@ -171,6 +171,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
   backend changed; over `tests/run` and `examples` the `-O2` MIR of every existing program is
   unchanged.
 
+### Optimizer: fusion over branching bodies (`gap5/opt-fuse-unswitch-cfg`)
+
+- **Loop fusion over branching bodies (N31).** `fuse` took only innermost two-block loops, so a
+  producer/consumer pair whose body still branched when it ran -- an `if`/`else` of stores, a clamp
+  written as a branch -- kept its intermediate store and reload. A loop whose body is a region of
+  jumps and two-way branches (at most 8 blocks, entered from the header by one parameterless block,
+  one latch, the header's exit its only exit) now fuses as well: the first body's latch runs on into
+  the second body, absorbing its entry block, and the second latch carries both loops' next values
+  back to the fused header. Legality is the two-block rule over every access of every block: an
+  access under a condition only removes executions, so proving every potential pair is enough. Two
+  widenable loops fuse only when the vectorizer still widens the fused loop, asked on a fused copy of
+  the function: an if-converted region sinks its stores to one address, so two widenable diamonds of
+  stores stay apart, while a widenable straight loop beside a diamond fuses into one widened loop. A
+  pair of two-block loops fuses exactly as before, byte for byte. A two-block loop fused into a
+  branching one gives up the 4x partial unroll, which takes two-block loops only. No program in
+  `tests/run` or `examples` has such a pair; `tests/run/opt5_fuse_multiblock.wk` covers a diamond in
+  either loop and in both, a third loop fusing onto the fused region, a read ahead that must not
+  fuse, and two widened fusions, every element printed for n = 0, 1, 7 and 32.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

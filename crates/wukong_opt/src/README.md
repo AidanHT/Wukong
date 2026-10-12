@@ -30,7 +30,7 @@
 | `fxhash.rs` | `FxHashMap`/`FxHashSet` — crate-internal fixed-seed hasher |
 | `branch_fold.rs` | jump threading of constant edge arguments and folding a branch into a predecessor with the same destination (`and`/`or`), both run inside `SimplifyCfg` |
 | `tre.rs` | `Tre` — tail-recursion elimination (plain and integer-accumulator), plus `pre_inline` so a fully tail-recursive function becomes inlinable |
-| `fuse.rs` | `LoopFuse` — fusion of adjacent innermost counted loops over the same range, with an affine/alias legality proof: non-negative read-behind distances, first-loop live-outs, bases compared in a common alias frame or proved disjoint |
+| `fuse.rs` | `LoopFuse` — fusion of adjacent innermost counted loops over the same range (two-block bodies, or branching bodies of up to 8 blocks spliced as regions), with an affine/alias legality proof: non-negative read-behind distances, first-loop live-outs, bases compared in a common alias frame or proved disjoint; a branching pair of widenable loops fuses only if the fused copy still widens |
 | `unswitch.rs` | `LoopUnswitch` — induction-variable range splitting (also on derived guards `ext(iv ± k) ⋈ n` proved wrap-free by a small range analysis) and non-trivial unswitching of innermost loops |
 | `switch_form.rs` | `FormSwitches` / `form_switches` — late `switch` formation from equality chains; constant/degenerate switch folding |
 

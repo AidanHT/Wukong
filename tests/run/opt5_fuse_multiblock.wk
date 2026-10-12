@@ -1,0 +1,1918 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 0
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 500
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 11
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -8
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1004
+// EXPECT-OUT: 1005
+// EXPECT-OUT: 1006
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -12
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 503
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 11
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 20
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 16
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -8
+// EXPECT-OUT: -3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 16
+// EXPECT-OUT: -4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 13
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1007
+// EXPECT-OUT: 1008
+// EXPECT-OUT: 1009
+// EXPECT-OUT: 1010
+// EXPECT-OUT: 1011
+// EXPECT-OUT: 1012
+// EXPECT-OUT: 1013
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 1015
+// EXPECT-OUT: 1016
+// EXPECT-OUT: 1017
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 1019
+// EXPECT-OUT: 1020
+// EXPECT-OUT: 1021
+// EXPECT-OUT: 1022
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1025
+// EXPECT-OUT: 1026
+// EXPECT-OUT: 1027
+// EXPECT-OUT: 1028
+// EXPECT-OUT: 1029
+// EXPECT-OUT: 1030
+// EXPECT-OUT: 1031
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -12
+// EXPECT-OUT: -5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: -3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1032
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 517
+// EXPECT-OUT: 11
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 20
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 16
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 12
+// EXPECT-OUT: 10
+// EXPECT-OUT: 3
+// EXPECT-OUT: 8
+// EXPECT-OUT: 22
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 18
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 14
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 20
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 16
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -8
+// EXPECT-OUT: -3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 16
+// EXPECT-OUT: -4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 13
+// EXPECT-OUT: -6
+// EXPECT-OUT: -1
+// EXPECT-OUT: 10
+// EXPECT-OUT: -7
+// EXPECT-OUT: -2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 18
+// EXPECT-OUT: -4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 15
+// EXPECT-OUT: -5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: -6
+// EXPECT-OUT: -2
+// EXPECT-OUT: 8
+// EXPECT-OUT: -8
+// EXPECT-OUT: -3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 16
+// EXPECT-OUT: -4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 13
+// EXPECT-OUT: -6
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1032
+// EXPECT-OUT: -12
+// EXPECT-OUT: -5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: -9
+// EXPECT-OUT: -2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -11
+// EXPECT-OUT: -4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: -6
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: -8
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -10
+// EXPECT-OUT: -3
+// EXPECT-OUT: 3
+// EXPECT-OUT: -12
+// EXPECT-OUT: -5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: -7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: -9
+// EXPECT-OUT: -2
+module tests.run.opt5_fuse_multiblock
+
+// Loop fusion over BRANCHING bodies (-O2, `wukong_opt::fuse`). Two adjacent loops over the same
+// range, either of which holds an `if`/`else` of stores, are now fused as regions: the first body's
+// latch runs on into the second body and the second latch closes the fused loop. Legality is the
+// two-block rule applied to every access of every block (a conditional access only removes
+// executions, so proving every potential pair is enough).
+//
+// Each kernel is kept OUT of line: the kernels and `again` call each other, so the inliner never
+// splices them into `main`, where the `@noalias` destinations would become plain locals. `again`
+// hands the kernels fresh arrays rather than their own, so no promised parameter escapes.
+//
+// At `--emit=mir -O2`:
+//   first, second, both   ONE loop each (`both` fuses three loops: the fused region fuses again).
+//                         The diamonds divide in their arms and the two-block partners carry the
+//                         recurrence h, so no vectorizer touches them: legality alone decides.
+//   ahead                 TWO loops (more after unrolling): the second loop reads t[j + 1], which
+//                         the first loop writes one iteration LATER, so fusing would read the
+//                         sentinel instead.
+//   dthen, thend          one fused loop, which the vectorizer then widens: a vector loop plus its
+//                         scalar tail (unfused, each loop would have its own pair). Fusion of two
+//                         widenable loops is kept only when the fused body still widens.
+//
+// a[k] = (k * 7) % 23 - 11. Before every call t[k] = 1000 + k (33 slots), u = -1 and o = -2 (32
+// slots each); `/` truncates toward zero. For n = 0, 1, 7, 32 every kernel's t then o (then u for
+// `both`) is printed in full, so a lane written early, late or past n shows. Every expected line is
+// the scalar loops' answer, derived from the loops below:
+//   first   t[i] = a[i] > 0 ? a[i]/3 : -(a[i]/5);  o[j] = t[j]/2 + h_j
+//   second  t[i] = a[i]/3 + h_i;  o[j] = t[j] > 0 ? t[j]/2 : -(t[j]/7)
+//   both    t as in first;  u[j] = t[j] > 2 ? t[j]/2 : (3*t[j])/4;  o[k] = u[k]/3 + t[k] + h_k
+//   ahead   t as in first;  o[j] = t[j+1]/2 + h_j  (t[n] is still its sentinel 1000 + n)
+//   dthen   t[i] = a[i] > 0 ? 2*a[i] : -a[i];  o[j] = t[j]/3 + a[j]
+//   thend   t[i] = a[i]/3 + 1;  o[j] = t[j] > 1 ? t[j] + 1 : a[j] - 1
+// where h_0 = 0 and h_(k+1) = (5*h_k + 1) % 7, which cycles 0 1 6 3 2 4.
+
+fn first(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    for i in 0..n {
+        if a[i] > 0 {
+            t[i] = a[i] / 3;
+        } else {
+            t[i] = 0 - a[i] / 5;
+        }
+    }
+    let mut h: i32 = 0;
+    for j in 0..n {
+        o[j] = t[j] / 2 + h;
+        h = (h * 5 + 1) % 7;
+    }
+}
+
+fn second(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    let mut h: i32 = 0;
+    for i in 0..n {
+        t[i] = a[i] / 3 + h;
+        h = (h * 5 + 1) % 7;
+    }
+    for j in 0..n {
+        if t[j] > 0 {
+            o[j] = t[j] / 2;
+        } else {
+            o[j] = 0 - t[j] / 7;
+        }
+    }
+}
+
+fn both(
+    a: [i32; 32],
+    @noalias mut t: [i32; 33],
+    @noalias mut u: [i32; 32],
+    @noalias mut o: [i32; 32],
+    n: i32,
+    d: i64,
+) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    for i in 0..n {
+        if a[i] > 0 {
+            t[i] = a[i] / 3;
+        } else {
+            t[i] = 0 - a[i] / 5;
+        }
+    }
+    for j in 0..n {
+        if t[j] > 2 {
+            u[j] = t[j] / 2;
+        } else {
+            u[j] = t[j] * 3 / 4;
+        }
+    }
+    let mut h: i32 = 0;
+    for k in 0..n {
+        o[k] = u[k] / 3 + t[k] + h;
+        h = (h * 5 + 1) % 7;
+    }
+}
+
+fn ahead(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    for i in 0..n {
+        if a[i] > 0 {
+            t[i] = a[i] / 3;
+        } else {
+            t[i] = 0 - a[i] / 5;
+        }
+    }
+    let mut h: i32 = 0;
+    for j in 0..n {
+        o[j] = t[j + 1] / 2 + h;
+        h = (h * 5 + 1) % 7;
+    }
+}
+
+fn dthen(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    for i in 0..n {
+        if a[i] > 0 {
+            t[i] = a[i] * 2;
+        } else {
+            t[i] = 0 - a[i];
+        }
+    }
+    for j in 0..n {
+        o[j] = t[j] / 3 + a[j];
+    }
+}
+
+fn thend(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    for i in 0..n {
+        t[i] = a[i] / 3 + 1;
+    }
+    for j in 0..n {
+        if t[j] > 1 {
+            o[j] = t[j] + 1;
+        } else {
+            o[j] = a[j] - 1;
+        }
+    }
+}
+
+fn again(d: i64) {
+    let a: [i32; 32] = [0; 32];
+    let mut t: [i32; 33] = [0; 33];
+    let mut u: [i32; 32] = [0; 32];
+    let mut o: [i32; 32] = [0; 32];
+    first(a, t, o, 0, d);
+    second(a, t, o, 0, d);
+    both(a, t, u, o, 0, d);
+    ahead(a, t, o, 0, d);
+    dthen(a, t, o, 0, d);
+    thend(a, t, o, 0, d);
+}
+
+fn reset(mut t: [i32; 33], mut u: [i32; 32], mut o: [i32; 32]) {
+    for k in 0..33 {
+        t[k] = 1000 + k;
+    }
+    for k in 0..32 {
+        u[k] = 0 - 1;
+        o[k] = 0 - 2;
+    }
+}
+
+fn show(v: [i32; 32]) {
+    for k in 0..32 {
+        print(v[k]);
+    }
+}
+
+fn show_t(t: [i32; 33], o: [i32; 32]) {
+    for k in 0..33 {
+        print(t[k]);
+    }
+    show(o);
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 32] = [0; 32];
+    for k in 0..32 {
+        a[k] = (k * 7) % 23 - 11;
+    }
+    let mut t: [i32; 33] = [0; 33];
+    let mut u: [i32; 32] = [0; 32];
+    let mut o: [i32; 32] = [0; 32];
+    let ns: [i32; 4] = [0, 1, 7, 32];
+    for q in 0..4 {
+        let n = ns[q];
+        reset(t, u, o);
+        first(a, t, o, n, 0);
+        show_t(t, o);
+        reset(t, u, o);
+        second(a, t, o, n, 0);
+        show_t(t, o);
+        reset(t, u, o);
+        both(a, t, u, o, n, 0);
+        show_t(t, o);
+        show(u);
+        reset(t, u, o);
+        ahead(a, t, o, n, 0);
+        show_t(t, o);
+        reset(t, u, o);
+        dthen(a, t, o, n, 0);
+        show_t(t, o);
+        reset(t, u, o);
+        thend(a, t, o, n, 0);
+        show_t(t, o);
+    }
+    return 0;
+}

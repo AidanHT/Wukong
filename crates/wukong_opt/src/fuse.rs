@@ -16,12 +16,31 @@
 //!   B2: ..; br H2(j + 1, ..)
 //! ```
 //!
+//! A body need not be one block. When either loop's body still branches -- an `if`/`else` of
+//! stores, a clamp written as a branch -- the two bodies are spliced as regions instead: the first
+//! body's latch runs on into the second body (absorbing its entry block, which only the second
+//! header entered), and the second body's latch carries both loops' next values back to the fused
+//! header (at most [`MAX_FUSE_BLOCKS`] blocks per loop):
+//!
+//! ```text
+//!   H1(i, ..):  i < e ? E1 : PH2       H1(i, .., c2..): i < e ? E1 : X2(..)
+//!   E1 .. L1(..): ..; br H1(back1)  => E1 .. L1(..): ..; <E2's instructions and branch>
+//!   H2(j, c2..): j < e ? E2 : X2       .. L2(..): ..; br H1(back1, c2_next..)
+//!   E2 .. L2(..): ..; br H2(j + 1, ..)
+//! ```
+//!
+//! `back1` still dominates `L2`: every path into the second body now passes through `L1`. When
+//! both bodies are single blocks the first form is used unchanged, so a pair that fused before
+//! produces the same MIR.
+//!
 //! # When it is legal
 //!
-//! * Both loops are innermost two-block counted loops (`iv < end` tested in the header, unit step,
-//!   one latch, one exit, no early return) with no call, `alloca`, vector-kernel call, barrier or
-//!   vector value, and they run the **same** iterations: equal start and end (the same value, or
-//!   equal constants), the same predicate and induction-variable type.
+//! * Both loops are innermost counted loops (`iv < end` tested in the header, unit step, one
+//!   latch, one exit -- the header's -- and no early return) whose body is one block, or a region
+//!   of jumps and two-way branches entered from the header by one parameterless block, with no
+//!   call, `alloca`, vector-kernel call, barrier, atomic or vector value, and they run the **same**
+//!   iterations: equal start and end (the same value, or equal constants), the same predicate and
+//!   induction-variable type.
 //! * The first loop exits straight into the second's preheader, which nothing else reaches and
 //!   whose instructions are pure and cannot trap or read memory — they move ahead of the first
 //!   loop. Parameters of that preheader are the first loop's **live-outs**, passed by its exit edge;
@@ -44,10 +63,14 @@
 //!   nothing writes) — and a base reloaded inside the loop must be stable: no store of either loop
 //!   may write the slot it is reloaded from. An unanalyzable address, a loop-invariant address that
 //!   is written, or two possibly-aliased bases decline. A store of a pointer declines (it could
-//!   move a reloaded slice base).
+//!   move a reloaded slice base). The rule covers every access in every block of both bodies, and
+//!   a branching body needs nothing more: an access under a condition runs on a subset of the
+//!   iterations, so it only removes executions from a set of pairs already proved reorderable.
 //! * **Profit.** A loop the vectorizer can widen is never fused with one it cannot, and two
-//!   widenable loops fuse only when every access has one width — so fusion never costs a loop its
-//!   vectorization.
+//!   widenable loops fuse only when every access has one width -- and, when either body branches,
+//!   only when the vectorizer still widens the fused loop (tried on a copy of the function: an
+//!   if-converted region sinks its stores to one address, which two bodies' stores may not share)
+//!   -- so fusion never costs a loop its vectorization.
 //!
 //! The fused loop evaluates every operation of both loops on the same values, in an order whose
 //! only change is the interleaving the memory rule just proved unobservable, so results are
@@ -66,6 +89,8 @@ use crate::{cfg, each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnal
 
 /// The largest loop, in instructions, considered for fusion.
 const MAX_LOOP_INSTS: usize = 64;
+/// The most blocks, header included, a loop with a branching body may have to be fused.
+const MAX_FUSE_BLOCKS: usize = 8;
 /// Fusions one invocation may perform before yielding to the rest of the fixpoint.
 const MAX_FUSIONS_PER_CALL: usize = 8;
 
@@ -94,7 +119,7 @@ impl Pass for LoopFuse {
             let Some(plan) = find_pair(f, &mut forest, &preds) else {
                 break;
             };
-            apply(f, plan);
+            apply(f, &plan);
             // The second loop's preheader and header are now unreachable.
             cfg::prune_unreachable(f);
             cache.invalidate();
@@ -112,10 +137,25 @@ struct Plan {
     ph2: usize,
     h2: usize,
     latch2: usize,
+    /// The second body's first block: its header's staying target (`latch2` for a two-block loop).
+    entry2: usize,
+    /// Both loops are [`Shape::TwoBlock`]: the second body moves into the first's block.
+    /// Otherwise the two bodies are spliced as regions (see the module docs).
+    two_block: bool,
     /// The first loop's induction variable, which replaces the second's.
     iv1: ValueId,
     /// The second loop's induction variable's position among its header's parameters.
     iv2_index: usize,
+}
+
+/// The two loop shapes fusion accepts (see [`shape_ok`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// `H: cond_br c, L, X` with `L: …; br H(..)`: one body block, which is also the latch.
+    TwoBlock,
+    /// `H: cond_br c, E, X` with `E` .. `L` a branching body: jumps and two-way branches from the
+    /// entry `E` to the latch `L: …; br H(..)`, which may take the join's parameters.
+    Region,
 }
 
 fn def_sites(f: &Function) -> Vec<Option<(usize, usize)>> {
@@ -148,39 +188,68 @@ fn movable(op: &Op) -> bool {
     }
 }
 
-/// An innermost two-block counted loop with nothing fusion cannot reorder or copy:
-/// `H: cond_br c, L, X` with `L: …; br H(..)`.
-fn shape_ok(f: &Function, l: &NaturalLoop) -> bool {
+/// An innermost counted loop with nothing fusion cannot reorder or copy, and which [`Shape`] it
+/// has: two blocks, `H: cond_br c, L, X` with `L: …; br H(..)`, or a branching body of at most
+/// [`MAX_FUSE_BLOCKS`] blocks entered by one parameterless block, whose blocks end only in jumps
+/// and two-way branches and whose one latch jumps back to the header (it may take parameters: the
+/// join of an `if`/`else` is the latch). Either way the header's false arm is the only exit.
+fn shape_ok(f: &Function, l: &NaturalLoop) -> Option<Shape> {
     if !l.children.is_empty()
         || l.preheader.is_none()
-        || l.blocks.len() != 2
+        || l.blocks.len() > MAX_FUSE_BLOCKS
         || l.latches.len() != 1
         || l.exits.len() != 1
         || l.exits[0].0 != l.header
         || !l.abnormal_exits.is_empty()
     {
-        return false;
+        return None;
     }
     let latch = l.latches[0];
-    match &f.block(l.header).term {
-        Terminator::CondBr {
-            then_blk,
-            then_args,
-            else_blk,
-            ..
-        } if *then_blk == latch && then_args.is_empty() && *else_blk == l.exits[0].1 => {}
-        _ => return false,
+    let Terminator::CondBr {
+        then_blk: entry,
+        then_args,
+        else_blk,
+        ..
+    } = &f.block(l.header).term
+    else {
+        return None;
+    };
+    if !then_args.is_empty() || *else_blk != l.exits[0].1 {
+        return None;
     }
-    if !matches!(&f.block(latch).term, Terminator::Br { target, .. } if *target == l.header)
-        || !f.block(latch).params.is_empty()
-    {
-        return false;
+    if !matches!(&f.block(latch).term, Terminator::Br { target, .. } if *target == l.header) {
+        return None;
     }
+    let shape = if l.blocks.len() == 2 {
+        if *entry != latch || !f.block(latch).params.is_empty() {
+            return None;
+        }
+        Shape::TwoBlock
+    } else {
+        if *entry == l.header
+            || *entry == latch
+            || !l.blocks.contains(entry)
+            || !f.block(*entry).params.is_empty()
+        {
+            return None;
+        }
+        let jumps_only = l.blocks.iter().all(|b| {
+            *b == l.header
+                || matches!(
+                    f.block(*b).term,
+                    Terminator::Br { .. } | Terminator::CondBr { .. }
+                )
+        });
+        if !jumps_only {
+            return None;
+        }
+        Shape::Region
+    };
     let mut n = 0;
     for b in &l.blocks {
         let blk = f.block(*b);
         if blk.params.iter().any(|p| f.value_type(*p).is_vector()) {
-            return false;
+            return None;
         }
         for inst in &blk.insts {
             n += 1;
@@ -195,11 +264,11 @@ fn shape_ok(f: &Function, l: &NaturalLoop) -> bool {
                 _ => false,
             };
             if bad || inst.result.is_some_and(|r| f.value_type(r).is_vector()) {
-                return false;
+                return None;
             }
         }
     }
-    n <= MAX_LOOP_INSTS
+    (n <= MAX_LOOP_INSTS).then_some(shape)
 }
 
 /// The counted-loop facts fusion compares: the induction variable, its position, its type, the
@@ -396,19 +465,22 @@ fn pair_ok(alias: &AliasInfo, a: &MemAccess, b: &MemAccess, stores: &[(ValueId, 
 fn find_pair(f: &Function, forest: &mut LoopForest, preds: &[Vec<u32>]) -> Option<Plan> {
     let defs = def_sites(f);
     for i1 in 0..forest.loops.len() {
-        let (h1, ph2) = {
+        let (h1, ph2, s1) = {
             let l1 = &forest.loops[i1];
-            if !shape_ok(f, l1) {
+            let Some(s1) = shape_ok(f, l1) else {
                 continue;
-            }
-            (l1.header, l1.exits[0].1)
+            };
+            (l1.header, l1.exits[0].1, s1)
         };
         let Some(i2) = forest.loops.iter().position(|l| l.preheader == Some(ph2)) else {
             continue;
         };
-        if i2 == i1 || !shape_ok(f, &forest.loops[i2]) {
+        if i2 == i1 {
             continue;
         }
+        let Some(s2) = shape_ok(f, &forest.loops[i2]) else {
+            continue;
+        };
         // The second preheader is reached only by the first loop's exit and computes nothing
         // that could not run before the first loop. Its parameters, if any, are the first loop's
         // live-outs (`plan_pair` checks that only the code after the second loop reads them).
@@ -418,7 +490,8 @@ fn find_pair(f: &Function, forest: &mut LoopForest, preds: &[Vec<u32>]) -> Optio
         }
         loop_info::analyze_one(f, forest, i1, Stages::Memory);
         loop_info::analyze_one(f, forest, i2, Stages::Memory);
-        if let Some(plan) = plan_pair(f, &defs, &forest.loops[i1], &forest.loops[i2]) {
+        let two_block = s1 == Shape::TwoBlock && s2 == Shape::TwoBlock;
+        if let Some(plan) = plan_pair(f, &defs, &forest.loops[i1], &forest.loops[i2], two_block) {
             return Some(plan);
         }
     }
@@ -430,6 +503,7 @@ fn plan_pair(
     defs: &[Option<(usize, usize)>],
     l1: &NaturalLoop,
     l2: &NaturalLoop,
+    two_block: bool,
 ) -> Option<Plan> {
     let c1 = counted(f, defs, l1)?;
     let c2 = counted(f, defs, l2)?;
@@ -528,16 +602,49 @@ fn plan_pair(
             return None;
         }
     }
-    Some(Plan {
+    let Terminator::CondBr { then_blk, .. } = &h2.term else {
+        return None;
+    };
+    let plan = Plan {
         ph1: ph1.0 as usize,
         h1: l1.header.0 as usize,
         latch1: l1.latches[0].0 as usize,
         ph2: ph2.0 as usize,
         h2: l2.header.0 as usize,
         latch2: l2.latches[0].0 as usize,
+        entry2: then_blk.0 as usize,
+        two_block,
         iv1: c1.iv,
         iv2_index: c2.index,
-    })
+    };
+    // Two widenable loops whose fused body branches: the if-converters flatten one region with one
+    // sunk store address, and the fused region may hold two. Fuse only when the vectorizer still
+    // widens the result, asked on a fused copy of the function.
+    if !two_block && w1 && !fused_loop_widens(f, &plan, c1.cond) {
+        return None;
+    }
+    Some(plan)
+}
+
+/// Would the vectorizer widen the loop `plan` produces? Fuses a copy of `f` and finds the fused loop
+/// by its header's exit test `cond` (values keep their ids when unreachable blocks are pruned).
+fn fused_loop_widens(f: &Function, plan: &Plan, cond: ValueId) -> bool {
+    let mut g = f.clone();
+    apply(&mut g, plan);
+    cfg::prune_unreachable(&mut g);
+    let mut cache = CfgAnalyses::default();
+    let mut forest = {
+        let (idom, preds) = cache.idoms_and_preds(&g);
+        loop_info::structure_with(&g, idom, preds)
+    };
+    let fused = forest.loops.iter().position(
+        |l| matches!(&g.block(l.header).term, Terminator::CondBr { cond: c, .. } if *c == cond),
+    );
+    let Some(idx) = fused else {
+        return false;
+    };
+    loop_info::analyze_one(&g, &mut forest, idx, Stages::Memory);
+    crate::vectorize::would_widen(&g, &forest.loops[idx])
 }
 
 fn fresh(f: &mut Function, ty: MirType) -> ValueId {
@@ -546,7 +653,7 @@ fn fresh(f: &mut Function, ty: MirType) -> ValueId {
     v
 }
 
-fn apply(f: &mut Function, p: Plan) {
+fn apply(f: &mut Function, p: &Plan) {
     // The second loop's carried values other than its induction variable become new parameters of
     // the first header; its induction variable becomes the first's.
     let h2_params = f.blocks[p.h2].params.clone();
@@ -613,9 +720,7 @@ fn apply(f: &mut Function, p: Plan) {
         _ => unreachable!("a counted loop's header ends in its exit test"),
     }
 
-    // The second body runs straight after the first, in the first's block, and the fused latch
-    // passes both loops' next values back: the fused loop stays a two-block counted loop, so it can
-    // fuse again with the loop after it.
+    // The fused latch passes both loops' next values back.
     let mut back = match &f.blocks[p.latch1].term {
         Terminator::Br { args, .. } => args.clone(),
         _ => unreachable!("a latch ends in an unconditional branch"),
@@ -625,13 +730,34 @@ fn apply(f: &mut Function, p: Plan) {
         _ => unreachable!("a latch ends in an unconditional branch"),
     };
     back.extend(next2);
-    let body2 = std::mem::take(&mut f.blocks[p.latch2].insts);
-    f.blocks[p.latch2].term = Terminator::Unreachable;
-    f.blocks[p.latch1].insts.extend(body2);
-    f.blocks[p.latch1].term = Terminator::Br {
-        target: BlockId(p.h1 as u32),
-        args: back,
-    };
+    if p.two_block {
+        // The second body runs straight after the first, in the first's block: the fused loop
+        // stays a two-block counted loop, so it can fuse again with the loop after it.
+        let body2 = std::mem::take(&mut f.blocks[p.latch2].insts);
+        f.blocks[p.latch2].term = Terminator::Unreachable;
+        f.blocks[p.latch1].insts.extend(body2);
+        f.blocks[p.latch1].term = Terminator::Br {
+            target: BlockId(p.h1 as u32),
+            args: back,
+        };
+    } else {
+        // The bodies are spliced as regions: the first latch runs on into the second body and the
+        // second latch closes the fused loop. The second body's entry was entered only from its
+        // header (another in-loop predecessor would make it an inner loop's header), so the first
+        // latch is now its only predecessor and simply absorbs it: the entry's instructions follow
+        // the first latch's and its terminator becomes the first latch's -- which keeps the fused
+        // loop as small as simplify-cfg would make it, so it can fuse again. Everything the second
+        // body reads from the first latch's back edge, it dominates.
+        f.blocks[p.latch2].term = Terminator::Br {
+            target: BlockId(p.h1 as u32),
+            args: back,
+        };
+        let entry_insts = std::mem::take(&mut f.blocks[p.entry2].insts);
+        let entry_term = std::mem::replace(&mut f.blocks[p.entry2].term, Terminator::Unreachable);
+        f.blocks[p.latch1].insts.extend(entry_insts);
+        f.blocks[p.latch1].term = entry_term;
+        f.blocks[p.h2].term = Terminator::Unreachable;
+    }
 
     // Every read of the second header's parameters now reads the fused header's, and every read of
     // a live-out the second preheader received reads what the first loop's exit passed for it.
@@ -1327,5 +1453,338 @@ mod tests {
             assert!(wukong_mir::verify::verify_function(f).is_empty(), "{name}");
             assert_eq!(loop_count(f), if legal { 1 } else { 2 }, "{name}");
         }
+    }
+
+    // ---- branching (multi-block) bodies ----
+
+    /// `src` lowered and run through what the `-O2` fixpoint has done by the time it reaches
+    /// `fuse` (the pre-pipeline of [`source_shapes_fuse_exactly_when_legal`]).
+    fn before_fuse(src: &str) -> (Program, Interner) {
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (mut program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let mut pm = crate::PassManager::new();
+        pm.add(Box::new(crate::Mem2Reg));
+        pm.add(Box::new(crate::Simplify));
+        pm.add(Box::new(SimplifyCfg));
+        pm.add(Box::new(crate::SimplifyPhis));
+        pm.add(Box::new(Dce));
+        pm.add(Box::new(crate::Cse));
+        pm.add(Box::new(crate::LoopCanon));
+        pm.run(&mut program);
+        (program, interner)
+    }
+
+    /// The plan that fuses the first two adjacent loops of `f` as regions, with every legality and
+    /// profit check skipped -- what [`apply`] would do if the pass said yes -- and the first
+    /// loop's exit test, which names the fused loop.
+    fn forced_plan(f: &Function) -> (Plan, ValueId) {
+        let defs = def_sites(f);
+        let forest = crate::loop_info::analyze_function(f);
+        let (l1, l2) = forest
+            .loops
+            .iter()
+            .find_map(|l1| {
+                let l2 = forest
+                    .loops
+                    .iter()
+                    .find(|l2| l2.preheader == Some(l1.exits[0].1))?;
+                Some((l1, l2))
+            })
+            .expect("two adjacent loops");
+        let (c1, c2) = (
+            counted(f, &defs, l1).unwrap(),
+            counted(f, &defs, l2).unwrap(),
+        );
+        let Terminator::CondBr { then_blk, .. } = &f.block(l2.header).term else {
+            panic!("a counted loop's header ends in its exit test");
+        };
+        let plan = Plan {
+            ph1: l1.preheader.unwrap().0 as usize,
+            h1: l1.header.0 as usize,
+            latch1: l1.latches[0].0 as usize,
+            ph2: l2.preheader.unwrap().0 as usize,
+            h2: l2.header.0 as usize,
+            latch2: l2.latches[0].0 as usize,
+            entry2: then_blk.0 as usize,
+            two_block: false,
+            iv1: c1.iv,
+            iv2_index: c2.index,
+        };
+        (plan, c1.cond)
+    }
+
+    /// The kernels of the branching-body tests. Every array parameter written is `@noalias`
+    /// (unpromised, a caller could pass one array twice). The two-block partners of a diamond carry
+    /// a running recurrence `h`, which no vectorizer widens, and the diamonds divide in their arms,
+    /// which keeps both the MIR vectorizer and the front end's elementwise vectorizer out: these
+    /// pairs test legality, not profit. (`o[j] = t[j] / 2 + 1` alone would widen, by replicating the
+    /// division, and fusion rightly refuses to trade that loop away for a diamond the vectorizer
+    /// cannot flatten.)
+    const BRANCHING_KERNELS: &str = concat!(
+        // A diamond in the first loop.
+        "fn first(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32) { ",
+        "for i in 0..n { if a[i] > 0 { t[i] = a[i] / 3; } else { t[i] = 0 - a[i] / 5; } } ",
+        "let mut h: i32 = 0; ",
+        "for j in 0..n { o[j] = t[j] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+        // A diamond in the second loop.
+        "fn second(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32) { ",
+        "let mut h: i32 = 0; ",
+        "for i in 0..n { t[i] = a[i] / 3 + h; h = (h * 5 + 1) % 7; } ",
+        "for j in 0..n { if t[j] > 0 { o[j] = t[j] / 2; } else { o[j] = 0 - t[j] / 7; } } }\n",
+        // Diamonds in both, then a third, two-block loop reading both intermediates.
+        "fn both(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut u: [i32; 32], ",
+        "@noalias mut o: [i32; 32], n: i32) { ",
+        "for i in 0..n { if a[i] > 0 { t[i] = a[i] / 3; } else { t[i] = 0 - a[i] / 5; } } ",
+        "for j in 0..n { if t[j] > 2 { u[j] = t[j] / 2; } else { u[j] = t[j] * 3 / 4; } } ",
+        "let mut h: i32 = 0; ",
+        "for k in 0..n { o[k] = u[k] / 3 + t[k] + h; h = (h * 5 + 1) % 7; } }\n",
+        // Reads one element ahead of the writer: must stay unfused.
+        "fn ahead(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32) { ",
+        "for i in 0..n { if a[i] > 0 { t[i] = a[i] / 3; } else { t[i] = 0 - a[i] / 5; } } ",
+        "let mut h: i32 = 0; ",
+        "for j in 0..n { o[j] = t[j + 1] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+    );
+
+    /// From source, after the pre-fusion pipeline: pairs whose bodies branch fuse exactly when the
+    /// two-block rules say they may -- a diamond in either loop, diamonds in both (and the fused
+    /// region fuses again with a third loop), `@noalias` slices -- and not a read ahead of the
+    /// writer, a `break` (a second exit), or slices without the promise.
+    #[test]
+    fn source_multi_block_bodies_fuse_exactly_when_legal() {
+        let src = format!(
+            "{BRANCHING_KERNELS}{}",
+            concat!(
+                "fn brk(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], ",
+                "n: i32) { ",
+                "for i in 0..n { if a[i] > 0 { t[i] = a[i] / 3; } else { break; } } ",
+                "let mut h: i32 = 0; ",
+                "for j in 0..n { o[j] = t[j] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+                "@unchecked\nfn slices(@noalias mut tmp: []i32, @noalias mut out: []i32, ",
+                "src: []i32, n: i64) { ",
+                "for i in 0..n { if src[i] > 0 { tmp[i] = src[i] / 2; } ",
+                "else { tmp[i] = 0 - src[i] / 3; } } ",
+                "let mut h: i32 = 0; ",
+                "for j in 0..n { out[j] = tmp[j] / 3 + src[j] + h; h = (h * 5 + 1) % 7; } }\n",
+                "@unchecked\nfn aliased(mut tmp: []i32, mut out: []i32, src: []i32, n: i64) { ",
+                "for i in 0..n { if src[i] > 0 { tmp[i] = src[i] / 2; } ",
+                "else { tmp[i] = 0 - src[i] / 3; } } ",
+                "let mut h: i32 = 0; ",
+                "for j in 0..n { out[j] = tmp[j] / 3 + src[j] + h; h = (h * 5 + 1) % 7; } }\n",
+                "fn main() -> i32 { return 0; }\n",
+            )
+        );
+        let (mut program, mut interner) = before_fuse(&src);
+        // (name, loops before, loops after)
+        for (name, before, after) in [
+            ("first", 2, 1),
+            ("second", 2, 1),
+            ("both", 3, 1),
+            ("ahead", 2, 2),
+            ("brk", 2, 2),
+            ("slices", 2, 1),
+            ("aliased", 2, 2),
+        ] {
+            let sym = interner.intern(name);
+            let f = program
+                .funcs
+                .iter_mut()
+                .find(|f| f.name == sym)
+                .expect("defined above");
+            let forest = crate::loop_info::analyze_function(f);
+            assert_eq!(forest.loops.len(), before, "{name}");
+            // Each case has a body that branches: the two-block form alone would decline it.
+            assert!(
+                forest.loops.iter().any(|l| l.blocks.len() > 2),
+                "{name}: no branching body\n{}",
+                wukong_mir::print::print_function(f, &interner)
+            );
+            // Neither loop of a pair is one the vectorizer widens: legality alone decides.
+            assert!(
+                forest
+                    .loops
+                    .iter()
+                    .all(|l| !crate::vectorize::would_widen(f, l)),
+                "{name}"
+            );
+            let fused = LoopFuse.run_function(f, &mut CfgAnalyses::default());
+            assert_eq!(
+                fused,
+                after < before,
+                "{name}\n{}",
+                wukong_mir::print::print_function(f, &interner)
+            );
+            assert!(wukong_mir::verify::verify_function(f).is_empty(), "{name}");
+            assert_eq!(
+                loop_count(f),
+                after,
+                "{name}\n{}",
+                wukong_mir::print::print_function(f, &interner)
+            );
+        }
+    }
+
+    /// Two division-free `if`/`else` store loops each widen alone; fused, their region would sink
+    /// stores to two addresses, which the if-converters refuse -- so they must stay apart. A
+    /// widenable straight loop beside a diamond fuses into a body the vectorizer still flattens,
+    /// so those do fuse. In every case the pass's answer is the fused copy's own verdict, and a
+    /// fused loop always widens.
+    #[test]
+    fn multi_block_fusion_never_costs_a_widened_loop() {
+        let src = concat!(
+            "fn two_diamonds(a: [f32; 64], @noalias mut t: [f32; 64], @noalias mut o: [f32; 64], ",
+            "n: i32) { ",
+            "for i in 0..n { if a[i] > 0.0 { t[i] = a[i] * 2.0; } else { t[i] = a[i] * 0.5; } } ",
+            "for j in 0..n { if a[j] > 1.0 { o[j] = a[j] + 1.0; } else { o[j] = a[j] - 1.0; } } }\n",
+            "fn diamond_then_div(a: [i32; 64], @noalias mut t: [i32; 64], ",
+            "@noalias mut o: [i32; 64], n: i32) { ",
+            "for i in 0..n { if a[i] > 0 { t[i] = a[i] * 2; } else { t[i] = 0 - a[i]; } } ",
+            "for j in 0..n { o[j] = t[j] / 3 + a[j]; } }\n",
+            "fn div_then_diamond(a: [i32; 64], @noalias mut t: [i32; 64], ",
+            "@noalias mut o: [i32; 64], n: i32) { ",
+            "for i in 0..n { t[i] = a[i] / 3 + 1; } ",
+            "for j in 0..n { if t[j] > 5 { o[j] = t[j] + 1; } else { o[j] = a[j] - 1; } } }\n",
+            "fn main() -> i32 { return 0; }\n",
+        );
+        let (mut program, mut interner) = before_fuse(src);
+        for (name, fuses) in [
+            ("two_diamonds", false),
+            ("diamond_then_div", true),
+            ("div_then_diamond", true),
+        ] {
+            let sym = interner.intern(name);
+            let f = program
+                .funcs
+                .iter_mut()
+                .find(|f| f.name == sym)
+                .expect("defined above");
+            let forest = crate::loop_info::analyze_function(f);
+            assert_eq!(forest.loops.len(), 2, "{name}");
+            assert!(
+                forest
+                    .loops
+                    .iter()
+                    .all(|l| crate::vectorize::would_widen(f, l)),
+                "{name}: each loop widens alone"
+            );
+            // What fusing regardless would leave behind.
+            let (plan, cond) = forced_plan(f);
+            assert_eq!(fused_loop_widens(f, &plan, cond), fuses, "{name}");
+            let fused = LoopFuse.run_function(f, &mut CfgAnalyses::default());
+            assert_eq!(fused, fuses, "{name}");
+            assert!(wukong_mir::verify::verify_function(f).is_empty(), "{name}");
+            let after = crate::loop_info::analyze_function(f);
+            if fused {
+                assert_eq!(after.loops.len(), 1, "{name}");
+                assert!(
+                    crate::vectorize::would_widen(f, &after.loops[0]),
+                    "{name}: the fused loop must still widen\n{}",
+                    wukong_mir::print::print_function(f, &interner)
+                );
+            } else {
+                assert_eq!(after.loops.len(), 2, "{name}");
+            }
+        }
+    }
+
+    /// Two widenable shapes whose fused region the vectorizer still flattens (see
+    /// [`multi_block_fusion_never_costs_a_widened_loop`]): a diamond, then a straight loop that
+    /// divides; a straight loop that divides, then a diamond.
+    const WIDENED_KERNELS: &str = concat!(
+        "fn dthen(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32) { ",
+        "for i in 0..n { if a[i] > 0 { t[i] = a[i] * 2; } else { t[i] = 0 - a[i]; } } ",
+        "for j in 0..n { o[j] = t[j] / 3 + a[j]; } }\n",
+        "fn thend(a: [i32; 32], @noalias mut t: [i32; 33], @noalias mut o: [i32; 32], n: i32) { ",
+        "for i in 0..n { t[i] = a[i] / 3 + 1; } ",
+        "for j in 0..n { if t[j] > 1 { o[j] = t[j] + 1; } else { o[j] = a[j] - 1; } } }\n",
+    );
+
+    /// `-O0` against `-O2` through the whole optimizer and the interpreter, over the fused shapes
+    /// and the declining one, for several trip counts (0 and 1 included). Each kernel stays out of
+    /// line (it and `again` call each other, so the inliner never splices it into `main`, where its
+    /// parameters would lose their promise), and the `-O2` kernels are checked to be fused -- one
+    /// loop, or for the widened shapes one vector loop and its scalar tail -- so the comparison is
+    /// not vacuous.
+    #[test]
+    fn fused_branching_bodies_agree_with_the_unfused_program() {
+        let kernels = format!("{BRANCHING_KERNELS}{WIDENED_KERNELS}").replace(
+            ", n: i32) { ",
+            ", n: i32, d: i64) { if d > 0 { again(d - 1); return; } ",
+        );
+        let src = format!(
+            "{kernels}{}",
+            concat!(
+                "fn again(d: i64) { let a: [i32; 32] = [0; 32]; let mut t: [i32; 33] = [0; 33]; ",
+                "let mut u: [i32; 32] = [0; 32]; let mut o: [i32; 32] = [0; 32]; ",
+                "first(a, t, o, 0, d); second(a, t, o, 0, d); both(a, t, u, o, 0, d); ",
+                "ahead(a, t, o, 0, d); dthen(a, t, o, 0, d); thend(a, t, o, 0, d); }\n",
+                "fn show(t: [i32; 33], u: [i32; 32], o: [i32; 32]) { ",
+                "for k in 0..33 { print(t[k]); } for k in 0..32 { print(u[k]); print(o[k]); } }\n",
+                "fn reset(mut t: [i32; 33], mut u: [i32; 32], mut o: [i32; 32]) { ",
+                "for k in 0..33 { t[k] = 1000 + k; } ",
+                "for k in 0..32 { u[k] = 0 - 1; o[k] = 0 - 2; } }\n",
+                "fn main() -> i32 { let mut a: [i32; 32] = [0; 32]; ",
+                "for k in 0..32 { a[k] = (k * 7) % 23 - 11; } ",
+                "let mut t: [i32; 33] = [0; 33]; let mut u: [i32; 32] = [0; 32]; ",
+                "let mut o: [i32; 32] = [0; 32]; ",
+                "let ns: [i32; 6] = [0, 1, 2, 5, 7, 32]; ",
+                "for q in 0..6 { let n = ns[q]; ",
+                "reset(t, u, o); first(a, t, o, n, 0); show(t, u, o); ",
+                "reset(t, u, o); second(a, t, o, n, 0); show(t, u, o); ",
+                "reset(t, u, o); both(a, t, u, o, n, 0); show(t, u, o); ",
+                "reset(t, u, o); ahead(a, t, o, n, 0); show(t, u, o); ",
+                "reset(t, u, o); dthen(a, t, o, n, 0); show(t, u, o); ",
+                "reset(t, u, o); thend(a, t, o, n, 0); show(t, u, o); } ",
+                "return 0; }\n",
+            )
+        );
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let main = interner.intern("main");
+        let mut outputs = Vec::new();
+        for level in [0u8, 2] {
+            let mut optimized = program.clone();
+            crate::optimize(&mut optimized, level);
+            assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+            if level == 2 {
+                // How many loops each kernel keeps: one fused loop; for a widened fused loop its
+                // vector body and its scalar tail; the declining `ahead` keeps both loops (and its
+                // two-block second loop is partially unrolled, with a remainder loop).
+                for (name, ok, vector) in [
+                    ("first", 1..=1, false),
+                    ("second", 1..=1, false),
+                    ("both", 1..=1, false),
+                    ("ahead", 2..=usize::MAX, false),
+                    ("dthen", 2..=2, true),
+                    ("thend", 2..=2, true),
+                ] {
+                    let f = optimized
+                        .function(interner.intern(name))
+                        .expect("kept out of line");
+                    let loops = loop_count(f);
+                    let widened = f.value_types.iter().any(MirType::is_vector);
+                    assert!(
+                        ok.contains(&loops) && widened == vector,
+                        "{name} at -O2: {loops} loops, widened {widened}\n{}",
+                        wukong_mir::print::print_function(f, &interner)
+                    );
+                }
+            }
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, main, &interner).unwrap();
+            assert_eq!(exit, 0);
+            outputs.push(stdout);
+        }
+        assert!(!outputs[0].is_empty());
+        assert_eq!(outputs[0], outputs[1]);
     }
 }

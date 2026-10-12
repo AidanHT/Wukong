@@ -883,8 +883,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
   equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, **loop-invariant code motion**, **MIR loop fusion** of adjacent same-range loops
   after inlining (`-O2`; also at a non-negative read-behind distance, with first-loop live-outs, and
-  over proved-disjoint parameter and `@noalias` slice bases; innermost two-block loops only, so a
-  body that still branches never fuses), **loop unswitching** and
+  over proved-disjoint parameter and `@noalias` slice bases, and over bodies that still branch -- an
+  `if`/`else` of stores, up to 8 blocks -- when the vectorizer would not lose a loop to it),
+  **loop unswitching** and
   **induction-variable range splitting** of guarded loop bodies (`-O2`, also past a bounds-check
   trap or `break`, and on guards derived from the counter -- `i + 1 < n`, the tile edge
   `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap), and **partial loop unrolling** (4×, with a
@@ -1448,6 +1449,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   as that buffer (no `@noalias` promise between them), stays serial; so does an atomic add to a
   field, a pointee or a multi-index tensor element inside the loop. Reading a location other
   iterations are still adding to is a race, as for a plain store.
+
+- **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
+  only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an
+  early `return` or a slice bounds check's trap in either loop keeps the pair apart. A two-block loop
+  fused into a branching one gives up the 4x partial unroll, which takes two-block loops only. Two
+  widenable loops of which either branches fuse only when the fused body still widens, so two
+  `if`/`else` store loops (each if-converted to one store address of its own) stay apart.
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and

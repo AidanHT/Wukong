@@ -351,6 +351,7 @@ opt4_fuse_liveout.wk: veckernel*2
 opt4_jump_thread.wk:
 opt4_promote_slice.wk:
 opt4_tile_edge_guard.wk: veckernel*3
+opt5_fuse_multiblock.wk: veckernel*6
 parallel_absmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_abssum.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_argmax.wk: wukong_argreduce_f32_parallel wukong_argreduce_f32_parallel*2
