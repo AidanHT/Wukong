@@ -32,6 +32,8 @@ by `wukong_parser`. Depends only on `wukong_span` (`SourceId`, `Span`) and `wuko
   the matching `*/`, counting nesting (an unterminated one runs to end of file).
   `Comment::text(src)` is the comment's text minus one trailing carriage return;
   `Comment::is_doc(src)` is true for `///` (not `////`) and `//!`.
+- `trivia_comments(src, source, lo, hi) -> Vec<Comment>` — the comments in one inter-token gap,
+  by the same trivia scan; how the parser finds doc comments without a second token stream.
 - `dump(tokens, src) -> String` — one `Kind "text"` line per token.
 
 Literal values are **not stored** in tokens — later stages re-slice the source text via `span`.

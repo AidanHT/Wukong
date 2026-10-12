@@ -26,7 +26,8 @@ input.wk
                + emit_native (the --emit=exe link)
 ```
 
-`--emit=tokens` / `--emit=ast` see the **root file only** — they exit before `load_imports`.
+`--emit=tokens` / `--emit=ast` / `--emit=doc` see the **root file only** — they exit before
+`load_imports` (`doc` renders through `wukong_fmt::doc`).
 
 ## Key files
 
@@ -34,6 +35,7 @@ input.wk
 |---|---|
 | `src/lib.rs` | `Options`, `EmitStage`, `BackendKind`, `GradOptions`, `compile()` |
 | `src/loader.rs` | Multi-file front end: resolve `import`s, cycle-safe, one merged flat namespace |
+| `src/doctest.rs` | `wukongc --doctest`: the ```` ```wk ```` examples of a file's doc comments, each compiled with the file's items (laid out over the file's lines and columns) and run on interp or native |
 | `src/gpu_accel.rs` | `--backend=gpu` recognizer offload bridge (`--features gpu`) |
 | `src/gpu_e2e_bench.rs` | Test-only GPU measurement round (`#[cfg(all(test, feature = "gpu"))]`) |
 

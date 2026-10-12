@@ -56,6 +56,52 @@ then reads it as that ASCII token (a lookalike space is skipped), so one charact
 paper costs one error (`tests/fail/confusable_minus.wk`); a lookalike quote cannot open a literal
 and is an error token.
 
+### Comments and doc comments ✅
+
+`// …` runs to the end of the line and `/* … */` nests (`/* a /* b */ c */` is one comment). Two
+line forms are **doc comments**, which the parser keeps on the AST:
+
+- `/// …` documents what is written **after** it: an item (`fn`, `struct`, `enum`, `const`, `type`,
+  `trait`, `impl`, `extern`, `import`), a struct field, an enum variant (and a field of a struct
+  variant), a trait or `impl` method, or a declaration in an `extern` block. Attributes and `pub` may
+  stand between the comment and what it documents (`/// Adds.`, then `@inline`, then `pub fn add`),
+  and so may blank lines and plain comments.
+- `//!` documents the **file**. It goes before the first item, after the `module` header if there
+  is one.
+
+```wukong
+//! Small geometry helpers.
+module geo
+
+/// A point in the plane.
+struct Point {
+    /// The horizontal coordinate.
+    x: f32,
+    y: f32,
+}
+
+enum Shape {
+    /// A circle of the given radius.
+    Circle(f32),
+    Dot,
+}
+```
+
+The text is Markdown: each line's text after its marker, with the indentation every non-blank line
+shares removed, so `/// Adds.` reads `Adds.` and an indented code line keeps its extra indent.
+`////…` (four or more slashes) and `/** … */` are ordinary comments, as in Rust.
+
+A doc comment that documents nothing is **`E0210`** (rustc's E0585). That is one before the `}` that
+closes a block, struct, enum, trait or `impl`; one at the end of the file; one before a statement or
+inside an expression (statements take no documentation); one on the `module` header; and a `//!`
+after the first item. The fix is `//`, which the error carries as a suggestion for a one-line
+comment. One error is reported per run of consecutive doc lines, and none in a file that already has
+a syntax error. It is an error rather than a warning because a doc comment is published by
+`--emit=doc` and run by `--doctest` (see "Documentation and doc tests"), so one that is silently
+dropped is documentation gone missing. `wukongc fmt` keeps every doc comment on what it documents:
+its self-check compares the docs of the AST it re-parses, so a reformat that moved one would be
+refused.
+
 ## Modules & imports ✅
 
 ```wukong
@@ -2904,6 +2950,8 @@ wukongc [OPTIONS] <input.wk> [-- <program args>...]
 wukongc [OPTIONS] -              read the program from standard input (named <stdin>)
 wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 wukongc --repl [OPTIONS]         an interactive session on standard input (see "The REPL")
+wukongc --doctest [OPTIONS] <input.wk>   run the examples in its doc comments (see
+                                         "Documentation and doc tests")
 
 --                    everything after it is passed to the program --run executes: arg(1),
                       arg(2), ... (arg(0) is the program); without --run it is a usage error
@@ -2917,8 +2965,10 @@ wukongc --repl [OPTIONS]         an interactive session on standard input (see "
                       native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
                       aliases: interpreter = interp, cranelift = native, cuda = gpu,
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
---emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | mir-text | grad |
-                      llvm-ir | obj | exe   (default: exe)
+--emit=<stage>        tokens | ast | doc | check | mir-high | mir (alias mir-low) | mir-text |
+                      grad | llvm-ir | obj | exe   (default: exe)
+                      doc = the file's documentation as Markdown (see "Documentation and doc
+                      tests")
 --emit=<s>,<s>,...    several artifacts from ONE compile, emitted in pipeline order whatever the
                       written order: text ones on stdout, each under a `==> <stage> <==` line, or
                       with -o <stem> every one at <stem>.<ext> (see "Several artifacts at once")
@@ -3139,8 +3189,8 @@ by this CPU trainer, and no training speedup is established by the correctness c
 ### Several artifacts at once ✅
 
 `--emit=<stage>,<stage>,...` produces several artifacts from **one** compile, in pipeline order
-(`tokens`, `ast`, `mir-high`, `mir`, `mir-text`, `llvm-ir`, `obj` / `exe`) whatever order the list
-is written in:
+(`tokens`, `ast`, `doc`, `mir-high`, `mir`, `mir-text`, `llvm-ir`, `obj` / `exe`) whatever order the
+list is written in:
 
 ```
 wukongc --emit=mir,llvm-ir -O2 kernel.wk                # both on stdout, each under its header
@@ -3151,7 +3201,7 @@ Without `-o` every artifact goes to stdout after a `==> <stage> <==` header line
 in a newline, so the stream splits at the headers); an object or an executable cannot go there, so a
 list with `obj` or `exe` needs `-o`. With `-o <stem>` every artifact — text ones included — is
 written to `<stem>.<ext>` (the `-o` path with its extension replaced) and a `wrote <file>` line goes
-to stderr for each: `.tokens`, `.ast`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` (the
+to stderr for each: `.tokens`, `.ast`, `.md` for `doc`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` (the
 form a `.mir` input is read back as), `.grad`, `.ll` for `llvm-ir`, `.o` for `obj`, and the host's
 executable extension for `exe` (`.exe` on Windows, none on unix). `--depfile` names every file
 written as the rule's targets. The list's last stage decides what is compiled. Without `exe`, and
@@ -3165,7 +3215,7 @@ generated `<fn>_grad` — which no stage prints alone (a lone `--emit=mir` ignor
 stage that fails stops the compile, after the artifacts before it.
 
 Refused, as usage errors (exit 2): an unknown or empty element, a stage named twice (`mir,mir-low`
-included), `check` or `grad` with any stage but `tokens`/`ast` (`check` stops before lowering;
+included), `check` or `grad` with any stage but `tokens`/`ast`/`doc` (`check` stops before lowering;
 `--emit=grad` is a pipeline of its own — at least `-O1`, autodiff lowering, no pruning — that ends
 where it prints the backward MIR, before any MIR or IR stage prints), `obj` with
 `exe` (a library object exports every function under its source name, an executable keeps what
@@ -3252,3 +3302,76 @@ usage error. On a terminal it prints a banner and the `wk[N]>` / `...>` prompts 
 standard input a pipe it prints neither, so `wukongc --repl < session.txt` writes only values and
 program output to stdout. `wukongc` with no arguments is still the "no input file given" usage
 error.
+
+### Documentation and doc tests: `--emit=doc`, `--doctest` ✅
+
+`--emit=doc` prints the input file's documentation as Markdown on stdout:
+
+```
+wukongc --emit=doc examples/relu.wk > relu.md
+```
+
+The page is a pure function of the file. It starts with a title — ``# Module `a.b` `` from the
+`module` header, or the file's name — and the `//!` docs. Then comes every item in source order: a
+`##` heading (``## `fn relu` ``), the item's signature in a `wk` code block, and its `///` docs. A
+function's signature stops before its body and an `impl` block's at its header; other items are
+shown whole. Each signature is printed by the formatter's own printer, so it reads as
+`wukongc fmt` writes it, with long parameter lists wrapped at the same width, but without comments
+or blank lines. A struct's fields, an enum's variants, a trait's or an `impl` block's methods and an
+`extern` block's declarations follow as a list (`### Fields`, `### Variants`, `### Methods`,
+`### Declarations`), each entry with its own docs indented under it. Undocumented items are listed
+too. Doc text is copied through as written. Like `tokens` and `ast`, the stage reads the root file
+only, after the parse: imports are not documented, a file that does not parse prints its errors and
+no page (exit 1), and in a list it combines with every stage (`--emit=doc,mir`; with `-o <stem>`
+the page is `<stem>.md`).
+
+`wukongc --doctest <file.wk>` compiles and runs the **examples** in the file's doc comments. An
+example is a fenced code block (```` ``` ```` or `~~~`) whose info string names the language,
+`wk` or `wukong`; any other fence is prose. The other comma- or space-separated words are tags:
+
+| fence | the example must |
+|---|---|
+| ```` ```wk ```` | compile, run and exit 0: a failed `assert`, a bounds check, a non-zero `return` from `main` or `exit(n)` fails it |
+| ```` ```wk,no_run ```` | compile; it is not run |
+| ```` ```wk,compile_fail ```` | fail to compile; with codes (```` ```wk,compile_fail,E0501 ````), with one of them |
+| ```` ```wk,ignore ```` | nothing: it is skipped and reported as ignored |
+
+An unknown tag fails the example, so `compile-fail` cannot silently become a run. An example is
+compiled together with **the file's own items**, except the file's `fn main`, private items
+included, and its imports resolve as the file's do. The example's own items (a helper `fn`, a
+`struct`) may come before, between or after its statements; the statements, in order, run as the
+body of `fn main() -> i32 { …; return 0; }` unless the example declares its own `fn main` (and then
+has no other statements). So an example on `fn relu` just calls it:
+
+```wukong
+/// Every lane of `out` is written:
+///
+/// ```wk
+/// let x: [i32; 6] = [-2, 4, 0, -9, 1, 3];
+/// let mut out: [i32; 6] = [7, 7, 7, 7, 7, 7];
+/// relu(x, out);
+/// assert(out[0] == 0);
+/// assert(out[1] == 4);
+/// ```
+fn relu(x: [i32; 6], mut out: [i32; 6]) { … }
+```
+
+```
+$ wukongc --doctest examples/relu.wk
+running 2 doctests in examples/relu.wk
+doctest examples/relu.wk:11 (the file) ... ok
+doctest examples/relu.wk:23 (fn relu) ... ok
+
+doctest result: ok. 2 passed; 0 failed; 0 ignored
+```
+
+The report goes to stdout: one line per example, naming its fence's line and what its doc comment
+documents, then the failures and a summary. Why an example failed goes to stderr: its compile
+errors, its captured output, and the run-time error or exit status. A diagnostic in an example
+points at the line and column of the doc comment it is written in
+(`--> examples/relu.wk:24:9`). The exit status is 0 when nothing failed and 1 otherwise; a file
+that does not parse runs nothing. Examples go through the same front end, optimizer and backend as
+`--run`, at the given `-O`, `--fp`, `--target-cpu` and `--backend` (interp or native). Their
+output is captured, their standard input is empty, and they are not linted. `--doctest` also takes
+`--color`, `--error-format`, `--error-limit` and `--threads`, and refuses every other flag
+(`--run`, `--emit`, `-o`, `-A/-W/-D`, a GPU backend, …) as a usage error.

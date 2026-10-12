@@ -19,6 +19,7 @@ calls `parse_module_tokens_from`, so imported files get disjoint `NodeId` ranges
 | `src/lib.rs:182-189` | `too_deep` — reports E0209 at most once |
 | `src/lib.rs` | Pratt expressions, statements, patterns, attributes |
 | `src/items.rs` | module header, `fn`/`struct`/`enum`/`const`/`import`/`extern` |
+| `src/docs.rs` | doc comments: the gap rescan (`scan`), `claim_docs` / `claim_inner_docs`, `E0210` for an unclaimed one (`report_stray_docs`), `parse_doctest_tokens` |
 
 ## Entry points
 
@@ -29,6 +30,8 @@ calls `parse_module_tokens_from`, so imported files get disjoint `NodeId` ranges
   continues the expression above). Every other entry point drops them, so a caller asserting a
   clean parse is never failed by a warning.
 - `parse_module(src, SourceId, &mut Interner)` — lex + parse (tests)
+- `parse_doctest_tokens(tokens, src, &mut Interner, first_node_id) -> DoctestOutput` — a doc
+  example (`--doctest`): its top-level items, and the statements before, between and after them
 - `parse_expr_str` / `parse_type_str` — standalone parse for tests
 
 ## Diagnostics owned (E02xx)
@@ -45,14 +48,21 @@ calls `parse_module_tokens_from`, so imported files get disjoint `NodeId` ranges
 | `E0207` | `parse_attr_arg` / `parse_attr_val` |
 | `E0208` | `parse_item` — expected item at module scope |
 | `E0209` | `too_deep` — nesting limit |
+| `E0210` | `report_stray_docs` — a `///`/`//!` doc comment nothing claimed (one per run; none after another error) |
 | `W0030` | `missing_semi` (lint channel) — statement without `;`; quiet after an error in the statement |
 | `W0031` | `ambiguous_continuation` (lint channel) — only where the innermost open delimiter is `{` |
 
 Codes are stable — never renumber, never recycle. Fixtures: `tests/fail/expected_expr.wk` (E0202),
-`expected_item.wk` (E0208), `deep_nesting.wk` + `deep_blocks.wk` (E0209); others in
+`expected_item.wk` (E0208), `deep_nesting.wk` + `deep_blocks.wk` (E0209),
+`doc_comment_documents_nothing.wk` (E0210); others in
 `LEXER_PARSER_PROBES` in `crates/wukongc/tests/fail.rs`.
 
 ## Invariants / landmines
+
+- **Doc comments are claimed, not found.** `Parser::new` records every doc comment with the token it
+  precedes; a construct takes its `///` lines with `claim_docs(first)` after its attributes and
+  `pub`. A new documentable construct that does not claim them turns its users' doc comments into
+  `E0210`.
 
 - **Never aborts** — placeholders on error (`TupleLit([])`, `TypeKind::Unit`, `PatKind::Wildcard`,
   interned `«error»`); `recover_item` skips to the next item keyword.

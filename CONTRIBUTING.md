@@ -153,22 +153,22 @@ unrelated rule.
 
 Three things must land together, because two gates enforce the pairing:
 
-1. **Catalogue entry** — `entry!("E0210", "<one-line title>", "<body>")` in numeric order in
+1. **Catalogue entry** — `entry!("E0211", "<one-line title>", "<body>")` in numeric order in
    `CATALOG` (`crates/wukong_diag/src/catalog.rs`). A unit test requires a leading `E`/`C`, a
    non-empty title and a body longer than 20 chars, so a placeholder fails the build.
-   `wukongc --explain E0210` prints it.
-2. **Emit site** — `Diagnostic::error("…").with_code("E0210").primary(span, "…")` in the producing
-   crate. The code must be a bare `"E0210"` **string literal on a non-comment line**: the coverage
+   `wukongc --explain E0211` prints it.
+2. **Emit site** — `Diagnostic::error("…").with_code("E0211").primary(span, "…")` in the producing
+   crate. The code must be a bare `"E0211"` **string literal on a non-comment line**: the coverage
    gate scans textually for `"Ennnn"` literals, so a code assembled at run time (e.g. with
    `format!`) is invisible to it — a `const` that holds the literal is still found (prose and doc
    comments may cite codes freely — those lines are skipped).
-3. **A fixture or probe** — `tests/fail/<name>.wk` whose first line is `// EXPECT-CODE: E0210`,
+3. **A fixture or probe** — `tests/fail/<name>.wk` whose first line is `// EXPECT-CODE: E0211`,
    followed by a `module tests.fail.<name>` header, a comment saying *why* the construct is
    rejected, and the minimal program that trips it. `crates/wukongc/tests/fail.rs` compiles every
    fixture with `--error-format=json --emit=mir` and asserts the process fails, that the first
-   diagnostic is an error with code `E0210`, and that `explain` knows the code. It also pins the
+   diagnostic is an error with code `E0211`, and that `explain` knows the code. It also pins the
    rest of the error stream: `// EXPECT-COUNT: <n>` is the exact number of errors, and a trailing
-   `//~ E0210` (`//~^` for the line above) says an error with that code has its primary span on that
+   `//~ E0211` (`//~^` for the line above) says an error with that code has its primary span on that
    line — a fixture with any `//~` must annotate every error in its own file. Write the fixture,
    run `WUKONG_BLESS=1 cargo test -p wukongc --test fail` (it writes the count and the annotations
    from the real output, never `EXPECT-CODE`, and fails on purpose), review the diff, and rerun
@@ -302,6 +302,13 @@ Prefer to land it end to end: parse → type/shape-check → lower → run via t
   parser desugars the new form, teach `crates/wukong_fmt/src/printer.rs` to recognize the desugared
   shape and print the surface form; the self-check refuses anything else (see `docs/internals.md`,
   Formatter).
+- **A new construct that can be documented claims its doc comments.** The parser attaches `///`
+  lines only where a construct calls `claim_docs` (`crates/wukong_parser/src/docs.rs`); a doc comment
+  nothing claims is `E0210`. Give the AST node a `Docs` field, claim them after its attributes and
+  `pub`, and list it in `--emit=doc` (`crates/wukong_fmt/src/doc.rs`) and `--doctest`'s walk
+  (`crates/wukong_driver/src/doctest.rs`). A ```` ```wk ```` example in a doc comment is a test:
+  `wukongc --doctest <file>` runs it (`crates/wukongc/tests/doc.rs` runs the `tests/doc/` fixtures
+  and the documented examples).
 
 `examples/` is a gated corpus, not a scratch directory. `crates/wukongc/tests/examples.rs` runs
 every example through the real binary and requires the interpreter and the Cranelift backend to

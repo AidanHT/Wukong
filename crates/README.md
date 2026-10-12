@@ -20,7 +20,7 @@ seam every execution/emission target plugs into.
 | `wukong_lexer` | `&str` → flat `Vec<Token>` + diagnostics. Never aborts; owns E01xx. |
 | `wukong_ast` | Data-only AST + the deterministic pretty-printer. Sema annotates through `NodeId` side tables and never rewrites it. Owns `BinOp::fold_const_len`. |
 | `wukong_parser` | Recursive descent (items/stmts/types/patterns) + Pratt expressions → AST. Allocates `NodeId`s, recovers from everything; owns E02xx. |
-| `wukong_fmt` | The source formatter behind `wukongc fmt`: AST + the lexer's comment side channel → canonical text, self-checked to re-parse to the identical AST with the same comments and tokens (refuses otherwise). Used only by `wukongc`. |
+| `wukong_fmt` | The source formatter behind `wukongc fmt`: AST + the lexer's comment side channel → canonical text, self-checked to re-parse to the identical AST with the same comments and tokens (refuses otherwise). Also `--emit=doc`'s Markdown page (`doc.rs`), whose signatures its printer writes. Used by `wukongc` and `wukong_driver`. |
 | `wukong_types` | The semantic type vocabulary (`Scalar`, `Dim`, `Shape`, `Layout`, `Ty`) and the **layout authority** (`size_of`/`align_of`/`tuple_offsets`). |
 | `wukong_sema` | Name resolution, type inference, generics, match exhaustiveness, and tensor **shape checking**. Owns E03xx/E04xx/E05xx (except E0305, and two `E0401` sites in `wukong_mir_build`). |
 | `wukong_mir` | The typed block-parameter SSA IR: types, `Builder`, printer, verifier, and `VecKernel` (the AVX2 recipe). No passes. |
@@ -62,7 +62,7 @@ driver stays a thin sequencer with no instrumentation woven through it.
 ```
 input.wk
  → lex   wukong_lexer::tokenize          (--emit=tokens)
- → parse wukong_parser::parse_module_*   (--emit=ast)
+ → parse wukong_parser::parse_module_*   (--emit=ast; --emit=doc via wukong_fmt::doc)
  → …     wukong_sema, wukong_mir_build, wukong_opt, backends …
 ```
 

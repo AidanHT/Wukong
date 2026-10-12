@@ -41,6 +41,8 @@ wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT execu
 wukongc --emit=exe -g examples/fib.wk               # DWARF: a debugger breaks, steps, backtraces
 wukongc --emit=mir,llvm-ir,obj -O2 -o fib examples/fib.wk  # fib.mir-low, fib.ll, fib.o
 wukongc --repl                                       # interactive session (`:help` inside)
+wukongc --emit=doc examples/relu.wk > relu.md        # the file's documentation, as Markdown
+wukongc --doctest examples/relu.wk                   # run the ```wk examples in its doc comments
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
@@ -59,7 +61,11 @@ backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `p
 several artifacts from one compile — on stdout under `==> <stage> <==` headers, or each at
 `<stem>.<ext>` with `-o <stem>` (language guide, "Several artifacts at once"); `wukongc --repl` is an
 interactive session: items are kept, statements run, an expression prints its value, and
-`:type <expr>` asks sema (language guide, "The REPL").
+`:type <expr>` asks sema (language guide, "The REPL"). `///` and `//!` doc comments are part of
+the AST: `--emit=doc` prints a file's documentation as Markdown (each item's signature as
+`wukongc fmt` writes it, then its docs), and `wukongc --doctest <file>` compiles and runs every
+```` ```wk ```` example in them against the file's own items, rustdoc-style (language guide,
+"Comments and doc comments" and "Documentation and doc tests").
 
 ## Why Wukong
 
@@ -182,6 +188,11 @@ not duplicate them. In summary, Wukong:
   fixes (`;`, `mut `, deleting an import, a did-you-mean) are emitted as machine-readable
   suggestions; see `docs/language-guide.md`. A Unicode lookalike of ASCII
   punctuation (`−` U+2212 for `-`) is `E0105`, naming the character it imitates.
+- **Documentation that is checked.** `///` comments attach to the item, field, variant or method
+  after them and `//!` to the file; one that documents nothing is `E0210`. `--emit=doc` renders them
+  as Markdown and `--doctest` runs their ```` ```wk ```` examples (`no_run`, `compile_fail[,E0501]`
+  and `ignore` tags included), so an example that stops compiling, or whose `assert` stops holding,
+  fails the run (`tests/doc/`, `examples/relu.wk`).
 
 ## Runs the real GPT-2 124M end-to-end
 
