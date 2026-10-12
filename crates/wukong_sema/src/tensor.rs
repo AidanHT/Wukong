@@ -513,6 +513,8 @@ impl Sema<'_> {
     /// parameter that is the caller's buffer, which the `mut` rule exists to protect. Any other
     /// binding of the name clears the record (a shadowing `let` in the same scope).
     pub(crate) fn note_tensor_view(&mut self, pat: &Pattern, ty: &Ty, init: Option<&Expr>) {
+        // In a closure, a view of a variable it captures shares the variable (`closures.rs`).
+        self.note_capture_view(ty, init);
         let PatKind::Ident(name) = &pat.kind else {
             return;
         };

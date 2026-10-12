@@ -146,7 +146,8 @@ vector or function-typed parameter cannot be captured (`E0418`). A write to a ca
 (`note_capture_write`: an assignment, `&mut`, an element or field store not through a pointer,
 `atomic_add`, a `mut self` receiver, an aggregate argument of a `mut` parameter —
 `note_mut_arg_writes`, from the per-function positions `collect_methods` records — or a builtin's
-output operand) makes it a **by-reference** capture of every closure it crosses
+output operand, each also through a tensor reshape `c as Tensor[..]`, and binding a tensor view of
+it, `note_capture_view`) makes it a **by-reference** capture of every closure it crosses
 (`ClosureInfo::by_ref`). A capture is typed at the width its variable is stored at: a `for` range
 counter's type is its start's, but `lower_for` stores it at the wider bound's
 (`range_counter_type`), so `enter_range_counter` records that width per counter scope and the

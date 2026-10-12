@@ -37,6 +37,14 @@
 // EXPECT-OUT: 0
 // EXPECT-OUT: 9
 // EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 9
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
 // EXPECT-OUT: 5
 // EXPECT-OUT: 0
 // EXPECT-OUT: 0
@@ -47,9 +55,10 @@
 module tests.run.closure_capture_out_params
 
 // A call that writes an aggregate argument in place -- one bound to a `mut` parameter of a
-// function or a method, or a builtin's output operand -- writes the variable the argument names.
-// Inside a closure that variable is a capture, and the closure captures it by reference, so the
-// enclosing function sees the write exactly as it sees the same call written outside the closure.
+// function or a method, or a builtin's output operand, directly or through a tensor view of it --
+// writes the variable the argument names. Inside a closure that variable is a capture, and the
+// closure captures it by reference, so the enclosing function sees the write exactly as it sees
+// the same call written outside the closure.
 // Expectations by hand, every lane printed:
 //   relu6 over x = [-3, 5, -1, 0, 8, -7] keeps the positive lanes:           0 5 0 0 8 0
 //     once through a closure literal into `out`, once through a `let`-bound closure into `out2`
@@ -61,6 +70,9 @@ module tests.run.closure_capture_out_params
 //   the builtin relu(xf, of) over xf = [-1.5, 2, -3, 4.5]:                     0 2 0 4.5
 //   the builtin argsort_f32 over [3, 1, 2], ascending:                         1 2 0
 //   the builtin sprintf of "hi" into [9, 9, 9, 9], NUL-terminated:            104 105 0 9
+//   a tensor view of a capture is its storage: relu into `v1 as Tensor[f32, 2, 2]`
+//                                                                              0 2 0 4.5
+//     and a `let`-bound 2x2 view of v2 = [9, 9, 9, 9] written at [1, 0], flat lane 2: 9 9 5 9
 //   an inner closure writing `deep` through the closure around it:            0 5 0 0 8 0
 //   a capture passed to a non-`mut` parameter is only read, so it stays a copy: the `let`-bound
 //   `total` copied snap = [1, 2, 3, 4, 5, 6] at its `let`, and sums 21 after snap[0] = 100
@@ -166,6 +178,23 @@ fn main() -> i32 {
     }, 1);
     for i in 0..4 {
         print(buf[i]);
+    }
+
+    let mut v1: [f32; 4] = [9.0; 4];
+    each(|_i| {
+        relu(xf, v1 as Tensor[f32, 2, 2]);
+    }, 1);
+    for i in 0..4 {
+        print(v1[i]);
+    }
+
+    let mut v2: [f32; 4] = [9.0; 4];
+    each(|_i| {
+        let t = v2 as Tensor[f32, 2, 2];
+        t[1, 0] = 5.0;
+    }, 1);
+    for i in 0..4 {
+        print(v2[i]);
     }
 
     let mut deep: [i32; 6] = [9; 6];

@@ -924,7 +924,8 @@ impl Sema<'_> {
     }
 
     /// The variable whose own storage a write to `e` changes, if `e` is a name or a field / element
-    /// projection of one that does not pass through a pointer or reference.
+    /// projection of one that does not pass through a pointer or reference, or a tensor view of
+    /// one (`out as Tensor[f32, 2, 3]`, a zero-copy reshape of its storage).
     fn written_root(&self, e: &Expr) -> Option<Symbol> {
         match &e.kind {
             ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
@@ -934,7 +935,22 @@ impl Sema<'_> {
                 Some(Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Slice(_)) => None,
                 _ => self.written_root(base),
             },
+            ExprKind::Cast { expr, .. }
+                if matches!(self.types.get(&e.id), Some(Ty::Tensor { .. })) =>
+            {
+                self.written_root(expr)
+            }
             _ => None,
+        }
+    }
+
+    /// A tensor local bound to `init` (`let t = out as Tensor[f32, 2, 2];`, or the rows of a `for`
+    /// over one) is a handle on the storage `init` names, so a write through it is a write of that
+    /// variable. A closure binding such a view of a variable it captures therefore shares the
+    /// variable (by reference), whether or not it then writes through the view.
+    pub(crate) fn note_capture_view(&mut self, ty: &Ty, init: Option<&Expr>) {
+        if let (Ty::Tensor { .. }, Some(e)) = (ty, init) {
+            self.note_capture_write(e);
         }
     }
 
@@ -1722,10 +1738,20 @@ mod tests {
         assert_eq!(by_ref("softmax(x, out);"), vec!["out"]);
         assert_eq!(by_ref("argsort_f32(x, ix);"), vec!["ix"]);
         assert_eq!(by_ref("sprintf(buf, \"hi\");"), vec!["buf"]);
+        // Through a tensor view of the capture, which is its storage.
+        assert_eq!(by_ref("relu(x, out as Tensor[f32, 2, 2]);"), vec!["out"]);
+        assert_eq!(
+            by_ref("let t = out as Tensor[f32, 2, 2]; t[0, 1] = 1.0;"),
+            vec!["out"]
+        );
         // Read only: the copy stays a copy.
         assert_eq!(by_ref("print(peek(out));"), Vec::<String>::new());
         assert_eq!(by_ref("print(bump(n));"), Vec::<String>::new());
         assert_eq!(by_ref("print(peek(s.o) + x[0]);"), Vec::<String>::new());
+        assert_eq!(
+            by_ref("print(sum(out as Tensor[f32, 4]));"),
+            Vec::<String>::new()
+        );
     }
 
     /// A `for` counter is stored at the wider of its bounds' integer types, and a closure captures

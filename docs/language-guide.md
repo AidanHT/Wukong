@@ -223,10 +223,12 @@ fn main() -> i32 {
   a struct, the last four copied whole. One it **writes** — `c = ..`, `c += ..`, `&mut c`, an element
   or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method, an aggregate passed
   to a `mut` parameter (`relu6(x, out)`, which writes `out` in place), or a builtin's output operand
-  (`relu(x, out)`, `argsort_f32(x, idx)`, `sprintf(buf, ..)`) — is captured **by
-  reference**: the closure and the enclosing function share the variable, so the write is seen after
-  the call (and by every later call of a `let`-bound closure), and the variable's own rules apply
-  (`E0304` for an immutable binding, exactly as outside the closure). Writing through a captured
+  (`relu(x, out)`, `argsort_f32(x, idx)`, `sprintf(buf, ..)`), directly or through a tensor view
+  of it (`relu(x, out as Tensor[f32, 2, 3])`; a view bound by `let` counts as a write, since it can
+  be written through) — is captured **by reference**: the closure and the enclosing function share
+  the variable, so the write is seen after the call (and by every later call of a `let`-bound
+  closure), and the variable's own rules apply (`E0304` for an immutable binding, exactly as outside
+  the closure). Writing through a captured
   pointer (`*pt = ..`) writes the pointee, and the pointer stays a copy. A local named as a
   dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` (a view
   of storage its copy would not carry), a tensor or vector, the enclosing function's function-typed
