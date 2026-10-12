@@ -1,31 +1,38 @@
-//! **Closures** — non-escaping `|x| body` literals, checked where they are written.
+//! **Closures** — `|x| body` literals, resolved at compile time and checked where they are written.
 //!
-//! A closure literal is legal only as a direct argument of a plain call `g(..)` to a user function
-//! whose corresponding parameter has a function type (`fn apply(f: fn(f32) -> f32, x: f32)`);
-//! anywhere else it is `E0411`. `wukong_mir_build` then lifts it to a top-level function whose
-//! leading parameters are its captures, and specializes the callee per closure exactly as it does
-//! per named function (`apply$main$closure$0`), so a call through `f` stays a direct call with no
-//! function pointer at run time. Everything that lift needs is decided here and published as a
-//! [`ClosureInfo`] per literal ([`crate::SemaResult::closures`]):
+//! A closure literal is legal as an argument of a function-typed parameter of a call — to a user
+//! function, a method (`v.map(|a| a * k)`), a function-typed parameter or a closure-bound local —
+//! and as the initializer of a `let` (`let f = |x: f32| x * k;`). The name such a `let` binds can
+//! only be called or passed to a function-typed parameter (`E0421`: it has no run-time value), and
+//! the binding must be one immutable name (`E0422` for `let mut`, a pattern or a reassignment).
+//! Anywhere else a closure is `E0411`. `wukong_mir_build` then lifts each literal to a top-level
+//! function whose leading parameters are its captures, and specializes the callee per closure
+//! exactly as it does per named function (`apply$main$closure$0`), so a call through `f` stays a
+//! direct call with no function pointer at run time. Everything that lift needs is decided here and
+//! published: a [`ClosureInfo`] per literal ([`crate::SemaResult::closures`]), and the literal each
+//! use of a closure-bound local denotes ([`crate::SemaResult::closure_refs`]).
 //!
 //! * **Typing.** Parameter `i` takes its annotation, else the `i`-th parameter of the expected
-//!   function type when that names no generic of the callee (else `E0419`). The return type is the
-//!   annotation, else the expected return when it is generic-free, else the body's type (and a body
-//!   that then uses `return` is `E0419` too: nothing fixes what it returns). The closure's type
-//!   `fn(P..) -> R` must equal the expected one after the call's generic binding — the existing
-//!   `E0401` of `check_fn_value_args`.
-//! * **Captures.** Every enclosing local the body reads is captured BY VALUE, copied when the call
-//!   evaluates that argument. Only what can be copied into a scalar parameter may be captured: a
-//!   scalar, a C-style enum, a raw pointer or a reference. Anything else — an aggregate, a slice, a
-//!   tensor, a vector, the enclosing function's function-typed parameter, a value whose type names
-//!   an enclosing generic — is `E0418`, as is any use of an enclosing generic parameter (the lifted
-//!   function is not generic). A capture is read-only: assigning it or taking `&mut` of it is
-//!   `E0304`; writing THROUGH a captured pointer is the way to update the caller's data.
+//!   function type when that names no generic of the callee; otherwise, and for every unannotated
+//!   parameter of a `let`-bound closure with no function-type annotation, it is `E0419`.
+//!   The return type is the annotation, else the expected return when it is generic-free, else the
+//!   body's type (and a body that then uses `return` is `E0419` too: nothing fixes what it
+//!   returns). The closure's type `fn(P..) -> R` must equal the expected one after the call's
+//!   generic binding — the existing `E0401` of `check_fn_value_args`.
+//! * **Captures.** Every enclosing local the body reads is captured BY VALUE, copied where the
+//!   closure is created (when the call evaluates the argument, or at the `let`). Only what can be
+//!   copied into a scalar parameter may be captured: a scalar, a C-style enum, a raw pointer or a
+//!   reference. Anything else — an aggregate, a slice, a tensor, a vector, the enclosing function's
+//!   function-typed parameter, a value whose type names an enclosing generic — is `E0418`, as is
+//!   any use of an enclosing generic parameter (the lifted function is not generic). A capture is
+//!   read-only: assigning it or taking `&mut` of it is `E0304`; writing THROUGH a captured pointer
+//!   is the way to update the caller's data. A closure-bound local is captured through its closure
+//!   ([`ClosureInfo::bound`]).
 //! * **Control.** `return` leaves the closure; `break`/`continue` cannot cross it (`E0303`, the
 //!   enclosing loops are hidden while its body is checked). Nested closures are allowed: a name an
 //!   inner closure captures is captured by every closure it crosses.
 
-use wukong_ast::{Expr, ExprKind};
+use wukong_ast::{Expr, ExprKind, NodeId, PatKind, Pattern, Stmt, TypeExpr};
 use wukong_diag::Diagnostic;
 use wukong_span::{FxHashSet as HashSet, Span, Symbol};
 use wukong_types::{Dim, Ty};
@@ -40,8 +47,12 @@ pub struct ClosureInfo {
     pub params: Vec<Ty>,
     /// Its return type.
     pub ret: Ty,
-    /// Every enclosing local it captures (by value), in order of first use, with its type.
+    /// Every enclosing local it captures (by value, copied when the closure is created), in order
+    /// of first use, with its type.
     pub captures: Vec<(Symbol, Ty)>,
+    /// The captures that are locals bound to a closure (`let f = |..| ..;` outside, `f(x)` inside),
+    /// with the literal each denotes: the lifted function receives that closure's captures instead.
+    pub bound: Vec<(Symbol, NodeId)>,
 }
 
 /// One closure whose body is being checked (innermost last in [`Sema::closure_ctx`]).
@@ -50,6 +61,8 @@ pub(crate) struct ClosureCtx {
     /// below this index belongs to the enclosing code, so reading it is a capture.
     base: usize,
     captures: Vec<(Symbol, Ty)>,
+    /// The captures that are closure-bound locals (published as [`ClosureInfo::bound`]).
+    bound: Vec<(Symbol, NodeId)>,
     /// Names already reported (`E0418`) for this closure: one report per closure and name.
     reported: Vec<Symbol>,
     /// An `E0418`/`E0419`/arity error was reported for this closure: its type is `Error`, so the
@@ -71,38 +84,66 @@ enum NoCopy {
 
 impl Sema<'_> {
     /// Type a call's arguments left to right. A closure literal passed to a function-typed
-    /// parameter of a plain call to a user function is checked against that parameter's type
-    /// ([`Self::type_closure`]); every other argument is typed as usual (a closure there is
-    /// `E0411`, from `type_expr`).
+    /// parameter of a user function, of a call through a function-typed parameter or of a call of
+    /// a closure-bound local is checked against that parameter's type ([`Self::type_closure`]);
+    /// every other argument is typed as usual (a closure there is `E0411`, from `type_expr`).
     pub(crate) fn type_call_args(&mut self, callee: &Expr, args: &[Expr]) -> Vec<Ty> {
-        let sig = if args
-            .iter()
-            .any(|a| matches!(a.kind, ExprKind::Closure { .. }))
-        {
+        let target = if self.args_need_params(args) {
             match &callee.kind {
-                ExprKind::Path(p)
-                    if p.is_single() && self.lookup_local(p.first().sym).is_none() =>
-                {
-                    match self.defs.lookup(p.first().sym).map(|d| &d.kind) {
-                        Some(DefKind::Fn(sig)) => Some(sig.clone()),
+                ExprKind::Path(p) if p.is_single() => match self.lookup_local(p.first().sym) {
+                    Some(Ty::Fn { params, .. }) => Some((params, Vec::new())),
+                    Some(_) => None,
+                    None => match self.defs.lookup(p.first().sym).map(|d| &d.kind) {
+                        Some(DefKind::Fn(sig)) => Some((sig.params.clone(), sig.generics.clone())),
                         _ => None,
-                    }
-                }
+                    },
+                },
                 _ => None,
             }
         } else {
             None
         };
+        match target {
+            Some((params, generics)) => self.type_args_against(args, &params, &generics),
+            None => args.iter().map(|a| self.type_expr(a)).collect(),
+        }
+    }
+
+    /// Whether typing `args` needs the callee's parameter types: an argument is a closure literal,
+    /// or names a closure-bound local (which may only be passed to a function-typed parameter).
+    pub(crate) fn args_need_params(&self, args: &[Expr]) -> bool {
+        args.iter().any(|a| match &a.kind {
+            ExprKind::Closure { .. } => true,
+            ExprKind::Path(p) => p.is_single() && self.closure_bound(p.first().sym).is_some(),
+            _ => false,
+        })
+    }
+
+    /// Type `args` against the parameter types `params` of a callee whose generics are `generics`
+    /// (see [`Self::type_call_args`]): a closure literal at a function-typed parameter is checked
+    /// against it, and a single name there may denote a closure-bound local.
+    pub(crate) fn type_args_against(
+        &mut self,
+        args: &[Expr],
+        params: &[Ty],
+        generics: &[Symbol],
+    ) -> Vec<Ty> {
         let mut tys = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let want = sig.as_ref().and_then(|s| match s.params.get(i) {
-                Some(t @ Ty::Fn { .. }) => Some((t, s.generics.as_slice())),
+            let want = match params.get(i) {
+                Some(t @ Ty::Fn { .. }) => Some(t),
                 _ => None,
-            });
+            };
             let t = match (want, &a.kind) {
-                (Some((want, generics)), ExprKind::Closure { .. }) => {
-                    let t = self.type_closure(a, want, generics);
+                (Some(want), ExprKind::Closure { .. }) => {
+                    let t = self.type_closure(a, Some(want), generics);
                     self.types.insert(a.id, t.clone());
+                    t
+                }
+                (Some(_), ExprKind::Path(p)) if p.is_single() => {
+                    let outer = self.fn_value_arg.replace(a.id);
+                    let t = self.type_expr(a);
+                    self.fn_value_arg = outer;
                     t
                 }
                 _ => self.type_expr(a),
@@ -112,13 +153,159 @@ impl Sema<'_> {
         tys
     }
 
+    /// `let f = |..| ..;` — bind the name to the closure. Calls through `f` and arguments `g(f)`
+    /// are resolved at compile time, exactly like a closure literal written at each such site,
+    /// with the captures copied once, here. So the binding must be immutable and a single name
+    /// (`E0422`), and the name can only be called or passed (`E0421`, [`Self::closure_value_use`]).
+    /// An annotation, if any, is the closure's function type (`let f: fn(f32) -> f32 = |x| ..`).
+    pub(crate) fn type_closure_let(
+        &mut self,
+        s: &Stmt,
+        pat: &Pattern,
+        mutable: bool,
+        ann: Option<&TypeExpr>,
+        e: &Expr,
+    ) {
+        let report = self.inst_subst.is_empty();
+        let name = match &pat.kind {
+            PatKind::Ident(n) if !mutable => *n,
+            _ => {
+                if report {
+                    let msg = if mutable {
+                        "a closure cannot be bound by a `mut` binding"
+                    } else {
+                        "a closure must be bound to a name, not a pattern"
+                    };
+                    self.diags.push(
+                        Diagnostic::error(msg)
+                            .with_code("E0422")
+                            .primary(pat.span, "the closure is bound here")
+                            .note(
+                                "calls through a closure-bound local are resolved at compile time, \
+                                 so the local must name the one closure it is initialized with",
+                            )
+                            .help("bind it with a plain `let name = |..| ..;`"),
+                    );
+                }
+                self.types.insert(e.id, Ty::Error);
+                self.bind_pattern(pat, &Ty::Error);
+                return;
+            }
+        };
+        // The one place a `let` may spell a function type: the closure it initializes.
+        let expected = ann.map(|t| {
+            self.methods.fn_type_ok = true;
+            let ty = self.lower_type(t);
+            self.methods.fn_type_ok = false;
+            ty
+        });
+        let t = match &expected {
+            Some(want @ Ty::Fn { .. }) => {
+                let t = self.type_closure(e, Some(want), &[]);
+                if matches!(t, Ty::Fn { .. }) && t != *want && report {
+                    let (w, f) = (want.display(self.interner), t.display(self.interner));
+                    self.error(
+                        s.span,
+                        "E0401",
+                        format!("type mismatch: `let` is annotated `{w}` but the closure is `{f}`"),
+                    );
+                }
+                t
+            }
+            Some(Ty::Error | Ty::Unknown) => Ty::Error,
+            Some(other) => {
+                if report {
+                    let o = other.display(self.interner);
+                    self.error(
+                        s.span,
+                        "E0401",
+                        format!(
+                            "type mismatch: `let` is annotated `{o}` but the value is a closure"
+                        ),
+                    );
+                }
+                Ty::Error
+            }
+            None => self.type_closure(e, None, &[]),
+        };
+        self.types.insert(e.id, t.clone());
+        self.bind(name, t.clone());
+        if matches!(t, Ty::Fn { .. }) {
+            if let Some(binds) = self.closure_binds.last_mut() {
+                binds.insert(name, e.id);
+            }
+        }
+        // Immutable like any initialized `let`: `f = ..` is `E0304`.
+        let mut_at = crate::let_mut_position(s, pat, ann, Some(e));
+        if let Some(set) = self.immutable_locals.last_mut() {
+            set.insert(
+                name,
+                crate::LetDecl {
+                    name: pat.span,
+                    mut_at,
+                },
+            );
+        }
+    }
+
+    /// The closure literal the local `name` is bound to, if it is a closure-bound local (resolved
+    /// innermost scope first, so a shadowing binding of any other kind hides it).
+    pub(crate) fn closure_bound(&self, name: Symbol) -> Option<NodeId> {
+        let i = (0..self.scopes.len())
+            .rev()
+            .find(|&i| self.scopes[i].contains_key(&name))?;
+        self.closure_binds.get(i)?.get(&name).copied()
+    }
+
+    /// A closure-bound local `name` used as the value expression `e`. Legal only as a single-name
+    /// argument of a function-typed parameter ([`Sema::fn_value_arg`]) — a call `f(..)` never
+    /// reaches here (`type_fn_param_call`). Anywhere else the closure would escape: `E0421`.
+    pub(crate) fn closure_value_use(&mut self, e: &Expr, name: Symbol, span: Span, t: Ty) -> Ty {
+        let Some(lit) = self.closure_bound(name) else {
+            return t;
+        };
+        if self.fn_value_arg == Some(e.id) {
+            self.closure_refs.insert(e.id, lit);
+            self.note_value_use(name, span);
+            return t;
+        }
+        if self.inst_subst.is_empty() {
+            let nm = self.sym_str(name).to_string();
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "`{nm}` is bound to a closure, which can only be called or passed to a \
+                     function-typed parameter"
+                ))
+                .with_code("E0421")
+                .primary(span, "the closure would escape here")
+                .note(format!(
+                    "a closure is resolved at compile time: every call through `{nm}` becomes a \
+                     direct call of the closure's code, so `{nm}` has no run-time value to \
+                     store, return or compute with"
+                ))
+                .help(format!(
+                    "call it (`{nm}(..)`), or pass it to a parameter of function type \
+                     (`fn apply(f: fn(f32) -> f32, ..)`)"
+                )),
+            );
+        }
+        Ty::Error
+    }
+
+    /// A call `f(..)` through the closure-bound local `f`: record which closure it calls.
+    pub(crate) fn note_closure_call(&mut self, name: Symbol, callee: &Expr) {
+        if let Some(lit) = self.closure_bound(name) {
+            self.closure_refs.insert(callee.id, lit);
+        }
+    }
+
     /// Check a closure literal passed where a value of function type `expected` is wanted (a
     /// parameter of a callee whose generics are `callee_generics`), and return its type
     /// `fn(P..) -> R` (or `Error` once something about it was reported).
     pub(crate) fn type_closure(
         &mut self,
         e: &Expr,
-        expected: &Ty,
+        expected: Option<&Ty>,
         callee_generics: &[Symbol],
     ) -> Ty {
         let ExprKind::Closure { params, ret, body } = &e.kind else {
@@ -129,8 +316,9 @@ impl Sema<'_> {
         }
         // An instantiation re-check of a generic caller neither re-reports nor re-records.
         let report = self.inst_subst.is_empty();
+        // With no expected type (a `let`-bound closure), every parameter is annotated.
         let (want_params, want_ret): (&[Ty], Option<&Ty>) = match expected {
-            Ty::Fn { params, ret } => (params, Some(ret)),
+            Some(Ty::Fn { params, ret }) => (params, Some(ret)),
             _ => (&[], None),
         };
         // At any depth, a tensor's element type and dimensions included: the callee's own `T` or
@@ -140,12 +328,13 @@ impl Sema<'_> {
         self.closure_ctx.push(ClosureCtx {
             base: self.scopes.len(),
             captures: Vec::new(),
+            bound: Vec::new(),
             reported: Vec::new(),
             failed: false,
             returns: false,
         });
 
-        if want_params.len() != params.len() {
+        if let (Some(expected), true) = (expected, want_params.len() != params.len()) {
             if report {
                 let w = expected.display(self.interner);
                 let (n, m) = (params.len(), want_params.len());
@@ -181,6 +370,11 @@ impl Sema<'_> {
                     uninferred.push(p);
                     Ty::Error
                 }
+                // A `let`-bound closure has no function type to take it from.
+                (None, None) if expected.is_none() => {
+                    uninferred.push(p);
+                    Ty::Error
+                }
                 // Past the expected arity, already reported above.
                 (None, None) => Ty::Error,
             };
@@ -192,7 +386,6 @@ impl Sema<'_> {
                     .iter()
                     .map(|p| self.sym_str(p.name.sym).to_string())
                     .collect();
-                let w = expected.display(self.interner);
                 let shown = names
                     .iter()
                     .map(|n| format!("`{n}`"))
@@ -208,15 +401,22 @@ impl Sema<'_> {
                 } else {
                     "parameters"
                 };
+                let note = match expected {
+                    Some(w) => format!(
+                        "the closure is passed as `{}`, whose parameter types are generic \
+                         parameters of the callee; the closure is checked before the call's \
+                         other arguments bind them",
+                        w.display(self.interner)
+                    ),
+                    None => "a closure bound by `let` has no function type to take its parameter \
+                             types from"
+                        .to_string(),
+                };
                 self.diags.push(
                     Diagnostic::error(format!("cannot infer the type of closure {what} {shown}"))
                         .with_code("E0419")
                         .primary(first.span, "type annotation needed")
-                        .note(format!(
-                            "the closure is passed as `{w}`, whose parameter types are generic \
-                             parameters of the callee; the closure is checked before the call's \
-                             other arguments bind them"
-                        ))
+                        .note(note)
                         .help(format!("annotate the {what}, for example `|{fix}| ..`")),
                 );
             }
@@ -298,19 +498,29 @@ impl Sema<'_> {
             .closure_ctx
             .pop()
             .expect("closure_ctx push/pop balanced");
-        if known_ret.is_none() && params_as_expected && ctx.returns && !ctx.failed {
+        if known_ret.is_none()
+            && (params_as_expected || expected.is_none())
+            && ctx.returns
+            && !ctx.failed
+        {
             if report {
-                let w = expected.display(self.interner);
+                let note = match expected {
+                    Some(w) => format!(
+                        "the closure is passed as `{}`, whose return type is a generic \
+                         parameter of the callee",
+                        w.display(self.interner)
+                    ),
+                    None => "a closure bound by `let` has no function type to take its return \
+                             type from"
+                        .to_string(),
+                };
                 self.diags.push(
                     Diagnostic::error(
                         "cannot infer the return type of a closure that uses `return`",
                     )
                     .with_code("E0419")
                     .primary(e.span, "return type annotation needed")
-                    .note(format!(
-                        "the closure is passed as `{w}`, whose return type is a generic \
-                         parameter of the callee"
-                    ))
+                    .note(note)
                     .help("annotate it: `|..| -> i32 { .. }`"),
                 );
             }
@@ -327,6 +537,7 @@ impl Sema<'_> {
                     params: ptys.clone(),
                     ret: ret.clone(),
                     captures: ctx.captures,
+                    bound: ctx.bound,
                 },
             );
         }
@@ -336,18 +547,18 @@ impl Sema<'_> {
         }
     }
 
-    /// `E0411`: a closure anywhere but a direct argument of a function-typed parameter.
+    /// `E0411`: a closure anywhere but an argument of a function-typed parameter or a `let`.
     pub(crate) fn misplaced_closure(&mut self, e: &Expr) -> Ty {
         self.diags.push(
             Diagnostic::error(
-                "a closure can only be passed directly to a function-typed parameter of a \
-                 function call",
+                "a closure can only be passed to a function-typed parameter or bound by `let`",
             )
             .with_code("E0411")
             .primary(e.span, "a closure cannot be used here")
             .help(
                 "pass it as an argument of a call whose parameter has a function type \
-                 (`fn apply(f: fn(f32) -> f32, x: f32)`), or declare a named function",
+                 (`fn apply(f: fn(f32) -> f32, x: f32)`), bind it with `let f = |..| ..;` and \
+                 call `f`, or declare a named function",
             ),
         );
         Ty::Error
@@ -395,6 +606,22 @@ impl Sema<'_> {
             .collect();
         // A name of the closure's own, or one whose type already failed to check.
         if crossed.is_empty() || matches!(ty, Ty::Error) {
+            return;
+        }
+        // A local bound to a closure: the lifted function receives that closure's captures.
+        if let Some(lit) = self
+            .closure_binds
+            .get(depth)
+            .and_then(|b| b.get(&name))
+            .copied()
+        {
+            for i in crossed {
+                let c = &mut self.closure_ctx[i];
+                if !c.captures.iter().any(|(n, _)| *n == name) {
+                    c.captures.push((name, ty.clone()));
+                    c.bound.push((name, lit));
+                }
+            }
             return;
         }
         let why = match self.capture_kind(&ty) {
@@ -544,6 +771,49 @@ impl Sema<'_> {
                 )),
         );
         true
+    }
+
+    /// Whether the assignment target `target` is a bare closure-bound local (`f = ..`).
+    pub(crate) fn closure_bound_place(&self, target: &Expr) -> bool {
+        matches!(&target.kind, ExprKind::Path(p) if p.is_single() && self.closure_bound(p.first().sym).is_some())
+    }
+
+    /// `f = ..` for a closure-bound local `f`: one `E0422` (the value is still checked).
+    pub(crate) fn reject_closure_assign(&mut self, target: &Expr, value: &Expr) {
+        match (&value.kind, self.types.get(&target.id).cloned()) {
+            (ExprKind::Closure { .. }, _) => {
+                let want = match &target.kind {
+                    ExprKind::Path(p) => self.lookup_local(p.first().sym),
+                    _ => None,
+                };
+                let t = self.type_closure(value, want.as_ref(), &[]);
+                self.types.insert(value.id, t);
+            }
+            _ => {
+                self.type_expr(value);
+            }
+        }
+        if !self.inst_subst.is_empty() {
+            return;
+        }
+        let nm = match &target.kind {
+            ExprKind::Path(p) => self.sym_str(p.first().sym).to_string(),
+            _ => String::new(),
+        };
+        self.diags.push(
+            Diagnostic::error(format!(
+                "cannot assign to `{nm}`, which is bound to a closure"
+            ))
+            .with_code("E0422")
+            .primary(target.span, "a closure-bound local cannot be reassigned")
+            .note(
+                "calls through a closure-bound local are resolved at compile time, so the \
+                     local must name the one closure it is initialized with",
+            )
+            .help(format!(
+                "bind the other closure to a new name (`let {nm}2 = |..| ..;`)"
+            )),
+        );
     }
 
     /// Whether a local of type `ty` can be captured by value.
@@ -876,25 +1146,143 @@ mod tests {
 
     #[test]
     fn a_closure_outside_a_call_argument_is_e0411() {
-        for body in ["let f = |x: f32| x; return 0;", "return |x: i32| x;"] {
-            assert_eq!(
-                error_codes(&format!("fn main() -> i32 {{ {body} }}")),
-                vec!["E0411"],
+        for body in [
+            "return |x: i32| x;",
+            "let a = [|x: i32| x]; return 0;",
+            "let t = (1, |x: i32| x); return t.0;",
+        ] {
+            assert!(
+                error_codes(&format!("fn main() -> i32 {{ {body} }}")).contains(&"E0411"),
                 "{body}"
             );
         }
-        // A method-call argument.
-        assert!(error_codes(&format!(
-            "{APPLY} struct V {{ x: f32 }} impl V {{ fn get(self, f: fn(f32) -> f32) -> f32 {{ \
-             return f(self.x); }} }} \
-             fn main() -> i32 {{ let v = V {{ x: 1.0 }}; return v.get(|x| x) as i32; }}"
-        ))
-        .contains(&"E0411"));
         // A const initializer.
         assert!(error_codes(&format!(
             "{APPLY} const C: f32 = apply(|x| x, 1.0); fn main() -> i32 {{ return C as i32; }}"
         ))
         .contains(&"E0411"));
+        // A method-call argument and a `let` are not: both are checked.
+        assert_eq!(
+            error_codes(&format!(
+                "{APPLY} struct V {{ x: f32 }} impl V {{ fn get(self, f: fn(f32) -> f32) -> f32 {{ \
+                 return f(self.x); }} }} \
+                 fn main() -> i32 {{ let v = V {{ x: 1.0 }}; let k = 2.0; \
+                 return v.get(|x| x * k) as i32; }}"
+            )),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// `let f = |..| ..;` binds a closure: every call `f(..)` and argument `g(f)` records which
+    /// literal it denotes, and the literal is checked with no expected type.
+    #[test]
+    fn a_let_bound_closure_records_each_use() {
+        let src = format!(
+            "{APPLY} fn main() -> i32 {{ let k = 2.0; let f = |x: f32| x * k; \
+             let a = f(1.0); let b = apply(f, 3.0); return (a + b) as i32; }}"
+        );
+        let (_m, res, diags, interner) = check(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(res.closures.len(), 1);
+        let (&lit, info) = res.closures.iter().next().unwrap();
+        let names: Vec<_> = info
+            .captures
+            .iter()
+            .map(|(s, _)| interner.resolve(*s))
+            .collect();
+        assert_eq!(names, vec!["k"]);
+        assert_eq!(res.closure_refs.len(), 2);
+        assert!(res.closure_refs.values().all(|l| *l == lit));
+        // An annotated binding: the annotation is the expected type.
+        assert_eq!(
+            error_codes(&format!(
+                "{APPLY} fn main() -> i32 {{ let f: fn(f32) -> f32 = |x| x + 1.0; \
+                 return apply(f, 1.0) as i32; }}"
+            )),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            error_codes("fn main() -> i32 { let f: fn(i32) -> i32 = |x: f32| x; return 0; }"),
+            vec!["E0401"]
+        );
+        // Unannotated, a parameter or a `return`-using body has nothing to be inferred from.
+        assert_eq!(
+            error_codes("fn main() -> i32 { let f = |x| x; return f(1); }"),
+            vec!["E0419"]
+        );
+        assert_eq!(
+            error_codes(
+                "fn main() -> i32 { let f = |x: i32| { if x > 0 { return x; } 0 }; return f(1); }"
+            ),
+            vec!["E0419"]
+        );
+    }
+
+    /// A closure-bound local can only be called or passed to a function-typed parameter: anything
+    /// else would need a run-time function value (`E0421`). It cannot be rebound (`E0422`).
+    #[test]
+    fn a_let_bound_closure_cannot_escape() {
+        for body in [
+            "let g = f; return 0;",
+            "print(f); return 0;",
+            "return f(1.0) as i32 + f;",
+            "let t = (f, 1); return t.1;",
+            "let p = &f; return 0;",
+        ] {
+            assert_eq!(
+                error_codes(&format!(
+                    "fn main() -> i32 {{ let f = |x: f32| x * 2.0; {body} }}"
+                )),
+                vec!["E0421"],
+                "{body}"
+            );
+        }
+        // Passed to a parameter that is not of function type.
+        assert_eq!(
+            error_codes(
+                "fn takes(x: f32) -> f32 { return x; } \
+                 fn main() -> i32 { let f = |x: f32| x; return takes(f) as i32; }"
+            ),
+            vec!["E0421"]
+        );
+        assert_eq!(
+            error_codes("fn main() -> i32 { let mut f = |x: f32| x; return f(1.0) as i32; }"),
+            vec!["E0422"]
+        );
+        assert_eq!(
+            error_codes(
+                "fn main() -> i32 { let f = |x: f32| x; f = |x: f32| x + 1.0; \
+                 return f(1.0) as i32; }"
+            ),
+            vec!["E0422"]
+        );
+        // A shadowing binding of another kind hides the closure.
+        assert_eq!(
+            error_codes(
+                "fn main() -> i32 { let f = |x: f32| x; let a = f(1.0); let f = 2.0; \
+                 return (a + f) as i32; }"
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// A closure that calls a closure-bound local of the enclosing code captures it: the lifted
+    /// function receives that closure's own captures (`ClosureInfo::bound`).
+    #[test]
+    fn a_closure_bound_local_is_captured_through_its_closure() {
+        let src = format!(
+            "{APPLY} fn main() -> i32 {{ let k = 2.0; let f = |x: f32| x * k; \
+             return apply(|y| f(y) + 1.0, 3.0) as i32; }}"
+        );
+        let (_m, res, diags, interner) = check(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let mut all: Vec<_> = res.closures.iter().collect();
+        all.sort_by_key(|(id, _)| id.0);
+        let (&f_lit, _) = all[0];
+        let outer = all[1].1;
+        assert_eq!(outer.bound.len(), 1);
+        assert_eq!(interner.resolve(outer.bound[0].0), "f");
+        assert_eq!(outer.bound[0].1, f_lit);
     }
 
     #[test]

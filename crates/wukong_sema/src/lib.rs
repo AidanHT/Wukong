@@ -309,6 +309,11 @@ pub struct SemaResult {
     /// Every closure literal that checked cleanly, keyed by the literal's `NodeId`: its parameter,
     /// return and capture types, which `wukong_mir_build` lifts it with (see `closures.rs`).
     pub closures: HashMap<NodeId, ClosureInfo>,
+    /// Every use of a local bound to a closure (`let f = |x: f32| x * k;`), keyed by the use's
+    /// `Path` expression: the closure literal the name denotes there. A call `f(..)` records its
+    /// callee, an argument `g(f)` the argument; nothing else may name such a local (`E0421`), so
+    /// `wukong_mir_build` resolves every use statically (`closures.rs`).
+    pub closure_refs: HashMap<NodeId, NodeId>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -499,6 +504,9 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         closure_ctx: Vec::new(),
         closures: HashMap::default(),
         in_fn_body: false,
+        closure_binds: Vec::new(),
+        closure_refs: HashMap::default(),
+        fn_value_arg: None,
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -552,6 +560,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         range_slice_callees: [interner.get(RANGE_SLICE), interner.get(RANGE_SLICE_FROM)],
 
         closures: s.closures,
+        closure_refs: s.closure_refs,
     };
     // `str` does not leave sema: every published type is erased to its `[]u8` layout (`strs.rs`).
     strs::erase_published(&mut result);
@@ -713,6 +722,15 @@ struct Sema<'a> {
     /// True only while a function body is being checked — the one place a closure literal can be
     /// legal (`E0411` in a `const` initializer, a `where` predicate or a `static_assert`).
     in_fn_body: bool,
+    /// Per-scope map, kept 1:1 with `scopes`: a local bound to a closure literal by an immutable
+    /// `let` -> that literal (`closures.rs`). Cleared for a name whenever it is re-bound in a scope.
+    closure_binds: Vec<HashMap<Symbol, NodeId>>,
+    /// Each use of a closure-bound local, published as [`SemaResult::closure_refs`].
+    closure_refs: HashMap<NodeId, NodeId>,
+    /// The argument expression being typed where a function value is expected (a single-name
+    /// argument of a function-typed parameter): the one value position a closure-bound local may
+    /// take (`closures.rs`).
+    fn_value_arg: Option<NodeId>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -2013,6 +2031,8 @@ impl<'a> Sema<'a> {
         self.tensor_views.push(HashMap::default());
         self.local_facts.clear();
         self.local_facts.push(HashMap::default());
+        self.closure_binds.clear();
+        self.closure_binds.push(HashMap::default());
         self.param_tys.clear();
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
@@ -2101,6 +2121,8 @@ impl<'a> Sema<'a> {
         self.tensor_views.push(HashMap::default());
         self.local_facts.clear();
         self.local_facts.push(HashMap::default());
+        self.closure_binds.clear();
+        self.closure_binds.push(HashMap::default());
         self.param_tys.clear();
         // Two parameters may not share a name: the second would silently shadow the first in the
         // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
@@ -2749,6 +2771,7 @@ impl<'a> Sema<'a> {
         self.immutable_params.push(HashMap::default());
         self.tensor_views.push(HashMap::default());
         self.local_facts.push(HashMap::default());
+        self.closure_binds.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
@@ -2757,6 +2780,7 @@ impl<'a> Sema<'a> {
         self.immutable_params.pop();
         self.tensor_views.pop();
         self.local_facts.pop();
+        self.closure_binds.pop();
     }
 
     /// The [`LocalFact`] of the binding `name` resolves to (innermost scope first), if any.
@@ -2958,6 +2982,10 @@ impl<'a> Sema<'a> {
         if let Some(facts) = self.local_facts.last_mut() {
             facts.remove(&name);
         }
+        // ...and denotes no closure (`closures.rs` records one after binding it).
+        if let Some(binds) = self.closure_binds.last_mut() {
+            binds.remove(&name);
+        }
     }
 
     fn lookup_local(&self, name: Symbol) -> Option<Ty> {
@@ -3021,6 +3049,20 @@ impl<'a> Sema<'a> {
 
     fn type_stmt(&mut self, s: &Stmt) {
         match &s.kind {
+            StmtKind::Let {
+                pat,
+                mutable,
+                ty,
+                init,
+            } if init
+                .as_ref()
+                .is_some_and(|e| matches!(e.kind, ExprKind::Closure { .. })) =>
+            {
+                // `let f = |x: f32| x * k;` binds the name to the closure (`closures.rs`).
+                if let Some(e) = init {
+                    self.type_closure_let(s, pat, *mutable, ty.as_ref(), e);
+                }
+            }
             StmtKind::Let {
                 pat,
                 mutable,
@@ -3128,6 +3170,9 @@ impl<'a> Sema<'a> {
                         }
                     }
                 }
+            }
+            StmtKind::Assign { target, value, .. } if self.closure_bound_place(target) => {
+                self.reject_closure_assign(target, value);
             }
             StmtKind::Assign { target, op, value } => {
                 let target_ty = self.type_expr(target);
@@ -4199,6 +4244,10 @@ impl<'a> Sema<'a> {
             ExprKind::Path(p) => {
                 if p.is_single() {
                     match self.resolve_value(p.first().sym) {
+                        // A local bound to a closure is only called or passed (`closures.rs`).
+                        Some(t) if self.closure_bound(p.first().sym).is_some() => {
+                            self.closure_value_use(e, p.first().sym, p.span, t)
+                        }
                         Some(t) => {
                             // Inside a closure, a local of the enclosing code is a capture.
                             self.note_value_use(p.first().sym, p.span);

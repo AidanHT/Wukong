@@ -132,10 +132,13 @@ source
 ```
 
 Three front-end surfaces lower to plain calls before any recognizer sees the tree. **Closures**:
-`wukong_sema::closures` checks each `|x| body` literal where it is written — only as an argument of
-a function-typed parameter, `E0411` elsewhere — typing its parameters from that parameter's
-function type and recording, per literal, its parameter, return and capture types
-(`SemaResult::closures`). A capture is every enclosing local the body reads: `note_local_use` sees
+`wukong_sema::closures` checks each `|x| body` literal where it is written — as an argument of a
+function-typed parameter (of a function, a method, or a call through a function-typed parameter or
+closure-bound local) or a `let` initializer, `E0411` elsewhere — typing its parameters from that
+parameter's function type and recording, per literal, its parameter, return and capture types
+(`SemaResult::closures`). A `let`-bound name is tracked per scope (`closure_binds`): every use is
+either a call or a function-typed argument, recorded with the literal it denotes
+(`SemaResult::closure_refs`), and anything else is `E0421`. A capture is every enclosing local the body reads: `note_local_use` sees
 each local read with the index of the scope that binds it, and a binding below a closure's base
 scope is a capture of that closure (and of every closure it is nested in); only a scalar, C-style
 enum, pointer or reference can be captured (`E0418`), and writing one is `E0304`. The **first**
@@ -153,7 +156,10 @@ the tree mentions. With a bare `L` in the tree a capture was invisible to all th
 read was deleted, moved or hidden, and the copy resolved to an outer binding of the same name
 (`tests/run/closure_hidden_reads.wk`). The lifted item inherits the enclosing function's
 `@strict_fp`, `@generic` and `@unchecked`, which lowering keys by item: the closure body is that
-function's code (`tests/run/closure_strict_fp.wk`). The **environment ABI**: an instance whose function-typed
+function's code (`tests/run/closure_strict_fp.wk`). A `let f = <closure>` is replaced by one hidden
+local per captured value (`$cap$L$<j>`, copied there), and each recorded use of `f` is rewritten:
+a call to `L($cap$L$.., args..)`, an argument to the value `(L, $cap$L$..)`; a closure that uses `f`
+captures those locals (`ClosureInfo::bound`). The **environment ABI**: an instance whose function-typed
 parameter `f` is bound to a closure with captures declares one hidden MIR parameter per capture at
 `f`'s position and binds them as `$env$f$<j>`; `lower_call` passes, at a function-typed argument's
 position, the capture values — the value's captures, lowered at the literal's own site, or

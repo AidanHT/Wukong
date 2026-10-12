@@ -626,10 +626,11 @@ fn main() -> i32 {
          non-function parameter; and a function-typed parameter may be neither `mut` nor named \
          after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
          the function directly at each call instead. A closure literal (`|x| x * k`) is the other \
-         value such a parameter accepts, and only there: as a direct argument of a plain call to a \
-         function whose parameter has a function type. Anywhere else — a `let`, a `return`, a \
-         field or element, an operand, a method-call argument, a `const` initializer, a `where` \
-         predicate or a `static_assert` — a closure is this error too."
+         value such a parameter accepts: as an argument of a function-typed parameter of a call \
+         or a method call, or as the initializer of a `let` (`let f = |x: f32| x * k;`), whose \
+         name can then be called or passed on. Anywhere else — a `return`, a field or element, an \
+         operand, a `const` initializer, a `where` predicate or a `static_assert` — a closure is \
+         this error too."
     ),
     entry!(
         "E0415",
@@ -703,6 +704,29 @@ fn main() -> i32 {
          `str` itself: a non-generic `fn f(s: str)`.",
         bad: "module ex.e0420\nfn first<T>(x: T) -> T {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n",
         good: "module ex.e0420\nfn first(x: str) -> str {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n"
+    ),
+    entry!(
+        "E0421",
+        "a closure-bound local used as a value",
+        "A local bound to a closure (`let f = |x: f32| x * k;`) is resolved at compile time: each \
+         call `f(..)` is a direct call of the closure's code with the values it captured, and \
+         passing `f` to a function-typed parameter specializes the callee for it. So `f` has no \
+         run-time value, and the name can only be called or passed to a parameter of function \
+         type. Copying it to another local, returning it, storing it in a field, element or \
+         tuple, taking its address, printing it or computing with it is this error. Call it, or \
+         pass it on.",
+        bad: "module ex.e0421\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    let g = f;\n    return g(1);\n}\n",
+        good: "module ex.e0421\nfn apply(f: fn(i32) -> i32, x: i32) -> i32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return apply(f, 1);\n}\n"
+    ),
+    entry!(
+        "E0422",
+        "a closure bound by a `mut` binding or a pattern, or reassigned",
+        "A closure-bound local names the one closure its `let` initializes it with, because every \
+         call through it is resolved at compile time. So the binding must be a plain, immutable \
+         `let name = |..| ..;`: a `let mut`, a destructuring pattern, and an assignment `f = ..` \
+         to a closure-bound `f` are rejected. Bind each closure to a name of its own.",
+        bad: "module ex.e0422\nfn main() -> i32 {\n    let mut f = |x: i32| x + 1;\n    return f(1);\n}\n",
+        good: "module ex.e0422\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return f(1);\n}\n"
     ),
     entry!(
         "E0430",

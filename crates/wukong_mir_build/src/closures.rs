@@ -30,6 +30,13 @@
 //! captures are ordinary reads, at the point where the copy happens, for every walker at once.
 //! [`closure_code`] is the function such a value denotes.
 //!
+//! **A `let`-bound closure** (`let f = |x: f32| x * k;`) is lifted the same way, and its `let` is
+//! replaced by one hidden local per captured value, copied there (`let $cap$L$0 = k;`). Sema
+//! recorded which literal each use of `f` denotes (`SemaResult::closure_refs`), and each is
+//! rewritten in place: a call `f(x)` becomes the direct call `L($cap$L$0, x)`, and an argument
+//! `apply(f, ..)` the closure value `(L, $cap$L$0)` read from those locals. A closure that uses `f`
+//! captures those hidden locals instead (`ClosureInfo::bound`). No use of `f` survives this pass.
+//!
 //! What closures add to lowering is the **environment ABI**:
 //!
 //! * an instance whose function-typed parameter `f` is bound to a closure with captures declares
@@ -56,10 +63,10 @@
 
 use wukong_ast::{
     Attr, Block, Expr, ExprKind, FnDecl, ForIter, Ident, Item, ItemKind, Module, NodeId, Param,
-    Path, Stmt, StmtKind, TypeExpr, TypeKind,
+    PatKind, Path, Pattern, Stmt, StmtKind, TypeExpr, TypeKind,
 };
 use wukong_mir::{MirType, Op, ValueId};
-use wukong_sema::{Def, DefKind, FnSig, SemaResult};
+use wukong_sema::{ClosureInfo, Def, DefKind, FnSig, SemaResult};
 use wukong_span::{FxHashMap as HashMap, Interner, Span, Symbol};
 use wukong_types::Ty;
 
@@ -122,10 +129,11 @@ pub(crate) fn lift_module(
         prefix: String::new(),
         counter: 0,
         attrs: Vec::new(),
-        types: Vec::new(),
+        types: HashMap::default(),
         defs: Vec::new(),
         items: Vec::new(),
         table: ClosureTable::default(),
+        bound: HashMap::default(),
     };
     for item in &mut out.items {
         let Item { attrs, kind, .. } = item;
@@ -201,10 +209,30 @@ struct Lifter<'a> {
     /// The current top-level function's [`INHERITED_ATTRS`], which every closure in it carries.
     attrs: Vec<Attr>,
     /// Types of the nodes this pass creates.
-    types: Vec<(NodeId, Ty)>,
+    types: HashMap<NodeId, Ty>,
     defs: Vec<Def>,
     items: Vec<Item>,
     table: ClosureTable,
+    /// Every closure bound by a `let`, by its literal's id (see [`Bound`]).
+    bound: HashMap<NodeId, Bound>,
+}
+
+/// A closure bound by `let f = |..| ..;`: its lifted function, the function's type, and the hidden
+/// locals (`$cap$<L>$<j>`) its `let` became — one per captured value, copied there — with their
+/// types. A use of `f` reads those locals.
+struct Bound {
+    code: Symbol,
+    code_ty: Ty,
+    env: Vec<(Symbol, Ty)>,
+}
+
+/// One value a lifted closure receives ahead of its own parameters: the parameter's name and
+/// type, and the expression, in the enclosing scope, that produces it where the closure is
+/// created.
+struct Cap {
+    name: Symbol,
+    ty: Ty,
+    value: Expr,
 }
 
 impl Lifter<'_> {
@@ -221,7 +249,7 @@ impl Lifter<'_> {
     /// A single-name path expression with a fresh id typed `ty`.
     fn path(&mut self, sym: Symbol, span: Span, ty: Ty) -> Expr {
         let id = self.fresh();
-        self.types.push((id, ty));
+        self.types.insert(id, ty);
         Expr {
             id,
             kind: ExprKind::Path(Path {
@@ -233,12 +261,115 @@ impl Lifter<'_> {
     }
 
     fn block(&mut self, b: &mut Block) {
-        for s in &mut b.stmts {
-            self.stmt(s);
+        let stmts = std::mem::take(&mut b.stmts);
+        let mut out = Vec::with_capacity(stmts.len());
+        for mut s in stmts {
+            if let Some(lets) = self.closure_let(&mut s) {
+                out.extend(lets);
+                continue;
+            }
+            self.stmt(&mut s);
+            out.push(s);
         }
+        b.stmts = out;
         if let Some(t) = &mut b.tail {
             self.expr(t);
         }
+    }
+
+    /// `let f = |..| ..;`: lift the literal, and replace the statement by one hidden `let` per
+    /// captured value (`let $cap$L$0 = k;`), where the closure is created. Every use of `f` reads
+    /// them (see [`Self::expr`]). `None` for every other statement.
+    fn closure_let(&mut self, s: &mut Stmt) -> Option<Vec<Stmt>> {
+        let StmtKind::Let {
+            pat,
+            init: Some(init),
+            ..
+        } = &mut s.kind
+        else {
+            return None;
+        };
+        if !matches!(init.kind, ExprKind::Closure { .. }) || !matches!(pat.kind, PatKind::Ident(_))
+        {
+            return None;
+        }
+        let lit = init.id;
+        let span = init.span;
+        // Lifted like a literal anywhere else; its value `(L, captures..)` is taken apart here.
+        self.expr(init);
+        let (code, code_ty, values) = match &init.kind {
+            ExprKind::TupleLit(xs) if !xs.is_empty() => {
+                let code = closure_code(init);
+                let ExprKind::Path(p) = &code.kind else {
+                    self.failed = true;
+                    return None;
+                };
+                (p.first().sym, self.ty_of(init.id), xs[1..].to_vec())
+            }
+            ExprKind::Path(p) => (p.first().sym, self.ty_of(init.id), Vec::new()),
+            _ => {
+                self.failed = true;
+                return None;
+            }
+        };
+        let base = self.interner.resolve(code).to_string();
+        let mut lets = Vec::with_capacity(values.len());
+        let mut env = Vec::with_capacity(values.len());
+        for (j, value) in values.into_iter().enumerate() {
+            let name = self.interner.intern(&format!("$cap${base}${j}"));
+            let ty = self.ty_of(value.id);
+            env.push((name, ty));
+            let pid = self.fresh();
+            lets.push(Stmt {
+                id: self.fresh(),
+                attrs: Vec::new(),
+                kind: StmtKind::Let {
+                    pat: Pattern {
+                        id: pid,
+                        kind: PatKind::Ident(name),
+                        span,
+                    },
+                    mutable: false,
+                    ty: None,
+                    init: Some(value),
+                },
+                span: s.span,
+            });
+        }
+        self.bound.insert(lit, Bound { code, code_ty, env });
+        Some(lets)
+    }
+
+    /// The type this pass gave a node it created (or sema gave an original one).
+    fn ty_of(&self, id: NodeId) -> Ty {
+        self.types
+            .get(&id)
+            .or_else(|| self.sema.types.get(&id))
+            .cloned()
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// The closure value `(L, env..)` — or the bare `L` — of the `let`-bound closure `b`, read from
+    /// its hidden locals: what a use of the bound name passes to a function-typed parameter.
+    fn bound_value(&mut self, lit: NodeId, span: Span) -> Option<Expr> {
+        let b = self.bound.get(&lit)?;
+        let (code, code_ty, env) = (b.code, b.code_ty.clone(), b.env.clone());
+        let code_path = self.path(code, span, code_ty.clone());
+        if env.is_empty() {
+            return Some(code_path);
+        }
+        let mut elems = Vec::with_capacity(env.len() + 1);
+        elems.push(code_path);
+        for (sym, ty) in env {
+            elems.push(self.path(sym, span, ty));
+        }
+        let id = self.fresh();
+        self.types.insert(id, code_ty);
+        Some(Expr {
+            id,
+            kind: ExprKind::TupleLit(elems),
+            span,
+        })
     }
 
     fn stmt(&mut self, s: &mut Stmt) {
@@ -285,12 +416,20 @@ impl Lifter<'_> {
 
     fn expr(&mut self, e: &mut Expr) {
         match &mut e.kind {
+            ExprKind::Path(_) => {
+                // A closure-bound local passed to a function-typed parameter: the closure's value.
+                if let Some(&lit) = self.sema.closure_refs.get(&e.id) {
+                    match self.bound_value(lit, e.span) {
+                        Some(v) => *e = v,
+                        None => self.failed = true,
+                    }
+                }
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
-            | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
             | ExprKind::AlignOf(_) => {}
             ExprKind::Unary { expr, .. }
@@ -302,9 +441,26 @@ impl Lifter<'_> {
                 self.expr(rhs);
             }
             ExprKind::Call { callee, args, .. } => {
-                self.expr(callee);
-                for a in args {
+                for a in args.iter_mut() {
                     self.expr(a);
+                }
+                // A call through a closure-bound local `f(x)` is the direct call `L(env.., x)`.
+                match self.sema.closure_refs.get(&callee.id).copied() {
+                    Some(lit) => match self.bound.get(&lit) {
+                        Some(b) => {
+                            let (code, code_ty, env) = (b.code, b.code_ty.clone(), b.env.clone());
+                            let span = callee.span;
+                            **callee = self.path(code, span, code_ty);
+                            let mut full = Vec::with_capacity(env.len() + args.len());
+                            for (sym, ty) in env {
+                                full.push(self.path(sym, span, ty));
+                            }
+                            full.append(args);
+                            *args = full;
+                        }
+                        None => self.failed = true,
+                    },
+                    None => self.expr(callee),
                 }
             }
             ExprKind::Index { base, indices } => {
@@ -359,6 +515,36 @@ impl Lifter<'_> {
         }
     }
 
+    /// The values the closure `info` receives ahead of its own parameters (see [`Cap`]): each
+    /// capture by value, and a captured closure-bound local as that closure's own hidden values.
+    fn caps(&mut self, info: &ClosureInfo, span: Span) -> Vec<Cap> {
+        let mut caps = Vec::with_capacity(info.captures.len());
+        for (sym, ty) in &info.captures {
+            if let Some(&(_, lit)) = info.bound.iter().find(|(n, _)| n == sym) {
+                let Some(b) = self.bound.get(&lit) else {
+                    self.failed = true;
+                    continue;
+                };
+                for (h, hty) in b.env.clone() {
+                    let value = self.path(h, span, hty.clone());
+                    caps.push(Cap {
+                        name: h,
+                        ty: hty,
+                        value,
+                    });
+                }
+            } else {
+                let value = self.path(*sym, span, ty.clone());
+                caps.push(Cap {
+                    name: *sym,
+                    ty: ty.clone(),
+                    value,
+                });
+            }
+        }
+        caps
+    }
+
     /// Replace the closure literal `e` (its body already lifted) by the value of a new function:
     /// `(L, captures..)`, or the bare `L` when it captures nothing (see the module docs).
     fn lift(&mut self, e: &mut Expr) {
@@ -376,19 +562,18 @@ impl Lifter<'_> {
             params: info.params.clone(),
             ret: Box::new(info.ret.clone()),
         };
+        // Each capture is read where its copy is taken, in the enclosing scope, so every pass
+        // that asks what this statement reads sees it.
+        let caps = self.caps(&info, span);
         let code = self.path(name, span, fn_ty.clone());
-        let value = if info.captures.is_empty() {
+        let value = if caps.is_empty() {
             code
         } else {
-            // Each capture is read where its copy is taken, in the enclosing scope, so every pass
-            // that asks what this statement reads sees it.
-            let mut elems = Vec::with_capacity(info.captures.len() + 1);
+            let mut elems = Vec::with_capacity(caps.len() + 1);
             elems.push(code);
-            for (sym, ty) in &info.captures {
-                elems.push(self.path(*sym, span, ty.clone()));
-            }
+            elems.extend(caps.iter().map(|c| c.value.clone()));
             let id = self.fresh();
-            self.types.push((id, fn_ty));
+            self.types.insert(id, fn_ty);
             Expr {
                 id,
                 kind: ExprKind::TupleLit(elems),
@@ -407,13 +592,13 @@ impl Lifter<'_> {
             kind: TypeKind::Unit,
             span,
         };
-        let mut fparams = Vec::with_capacity(info.captures.len() + params.len());
-        for (sym, _) in &info.captures {
+        let mut fparams = Vec::with_capacity(caps.len() + params.len());
+        for c in &caps {
             fparams.push(Param {
                 id: self.fresh(),
                 attrs: Vec::new(),
                 mutable: false,
-                name: Ident { sym: *sym, span },
+                name: Ident { sym: c.name, span },
                 ty: placeholder(span),
                 span,
             });
@@ -440,7 +625,7 @@ impl Lifter<'_> {
                 }
             }
         };
-        let mut sig_params: Vec<Ty> = info.captures.iter().map(|(_, t)| t.clone()).collect();
+        let mut sig_params: Vec<Ty> = caps.iter().map(|c| c.ty.clone()).collect();
         sig_params.extend(info.params.iter().cloned());
         self.defs.push(Def {
             name,
@@ -471,7 +656,7 @@ impl Lifter<'_> {
         self.table.insert(
             name,
             ClosureLift {
-                env_tys: info.captures.into_iter().map(|(_, t)| t).collect(),
+                env_tys: caps.into_iter().map(|c| c.ty).collect(),
             },
         );
     }
@@ -861,5 +1046,77 @@ mod tests {
         );
         assert!(body(&funcs, "main$closure$0").starts_with("fn main$closure$0(v0 f32)"));
         assert!(body(&funcs, "apply$main$closure$0").starts_with("fn apply$main$closure$0(v0 f32)"));
+    }
+
+    /// `let f = |..| ..;` is lifted like any literal; its `let` becomes one hidden local per
+    /// captured value, copied there, and every use reads them: a call `f(x)` is the direct call
+    /// `L(env.., x)`, and an argument `apply(f, ..)` passes the closure value `(L, env..)`.
+    #[test]
+    fn a_let_bound_closure_is_called_directly_with_its_hidden_captures() {
+        let funcs = lower(
+            "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+             fn main() -> i32 { let k = 2.0; let f = |x: f32| x * k; \
+             return (f(1.0) + apply(f, 3.0)) as i32; }",
+        );
+        assert!(
+            body(&funcs, "main$closure$0").starts_with("fn main$closure$0(v0 f32, v1 f32)"),
+            "{funcs:?}"
+        );
+        let main = body(&funcs, "main");
+        assert!(main.contains("call main$closure$0("), "{main}");
+        assert!(main.contains("call apply$main$closure$0("), "{main}");
+        assert!(body(&funcs, "apply$main$closure$0").contains("call main$closure$0("));
+    }
+
+    /// The lift's view of a `let`-bound closure: the statement is replaced by its hidden locals
+    /// (none for a closure that captures nothing), and no use of the name survives.
+    #[test]
+    fn a_closure_let_becomes_its_hidden_captures() {
+        use wukong_ast::{ItemKind, PatKind, StmtKind};
+        let src = "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+                   fn main() -> i32 { let k = 2.0; let f = |x: f32| x * k; \
+                   let g = |x: f32| x + 1.0; return (f(1.0) + apply(g, 3.0)) as i32; }";
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (out, _, table) =
+            super::lift_module(&module, &sema, &mut interner).expect("the module has closures");
+        let main = out
+            .items
+            .iter()
+            .find_map(|it| match &it.kind {
+                ItemKind::Fn(f) if interner.resolve(f.name.sym) == "main" => f.body.as_ref(),
+                _ => None,
+            })
+            .expect("main");
+        let lets: Vec<String> = main
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Let { pat, .. } => match &pat.kind {
+                    PatKind::Ident(n) => Some(interner.resolve(*n).to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lets, vec!["k", "$cap$main$closure$0$0"]);
+        assert_eq!(table.len(), 2);
+    }
+
+    /// A closure passed to a method is lifted and the method specialized for it, exactly as for a
+    /// free function.
+    #[test]
+    fn a_closure_argument_of_a_method_specializes_the_method() {
+        let funcs = lower(
+            "struct V { x: f32 } \
+             impl V { fn map(self, f: fn(f32) -> f32) -> f32 { return f(self.x); } } \
+             fn main() -> i32 { let k = 3.0; let v = V { x: 2.0 }; \
+             return v.map(|x| x * k) as i32; }",
+        );
+        assert!(body(&funcs, "main").contains("call V.map$main$closure$0("));
+        assert!(body(&funcs, "V.map$main$closure$0").contains("call main$closure$0("));
     }
 }

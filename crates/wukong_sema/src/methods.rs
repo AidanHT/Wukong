@@ -676,8 +676,10 @@ impl Sema<'_> {
         let Some(Ty::Fn { params, ret }) = self.lookup_local(name) else {
             return None;
         };
-        // Inside a closure, the enclosing function's function-typed parameter cannot be captured.
+        // Inside a closure, the enclosing function's function-typed parameter cannot be captured
+        // (a closure-bound local can: `closures.rs`).
         self.note_local_use(name, callee.span);
+        self.note_closure_call(name, callee);
         self.types.insert(
             callee.id,
             Ty::Fn {
@@ -946,9 +948,16 @@ impl Sema<'_> {
         let offset = usize::from(recv.is_some());
         let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len() + offset);
         arg_tys.extend(recv);
-        for a in args {
-            let t = self.type_expr(a);
-            arg_tys.push(t);
+        // A closure argument is checked against its function-typed parameter, as at a plain call
+        // (`closures.rs`).
+        if self.args_need_params(args) {
+            let params = sig.params.get(offset..).unwrap_or(&[]);
+            arg_tys.extend(self.type_args_against(args, params, &sig.generics));
+        } else {
+            for a in args {
+                let t = self.type_expr(a);
+                arg_tys.push(t);
+            }
         }
         self.adapt_scalar_literals(&sig.params, args, &mut arg_tys, offset);
         // The receiver is no function value; check the written arguments against the parameters

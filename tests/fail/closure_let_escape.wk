@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0421
+// EXPECT-COUNT: 1
+module tests.fail.closure_let_escape
+
+// `scale` is bound to a closure. Every call through it is resolved at compile time to a direct
+// call of the closure's code, and passing it to a function-typed parameter specializes the callee
+// for it; there is no run-time function value. Copying it into another local would need one.
+// tests/run/closure_let.wk is the positive control.
+
+fn main() -> i32 {
+    let k = 3.0;
+    let scale = |x: f32| x * k;
+    let other = scale; //~ E0421
+    print(scale(2.0));
+    return 0;
+}

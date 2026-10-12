@@ -5,6 +5,22 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Closures beyond the call argument (`gap6/closures-escaping`, N27)
+
+- **Added: closures bound by `let`.** `let f = |x: f32| x * k;` binds a closure; `f(2.0)` calls it
+  and `apply(f, 3.0)` passes it to a function-typed parameter, with its captures copied once, at the
+  `let`. Each use is resolved at compile time: the `let` becomes one hidden local per captured value
+  and every call is a direct call of the lifted function, so there is still no function pointer.
+  An annotation is the closure's function type (`let f: fn(f32) -> f32 = |x| x * k;`); a closure
+  that calls `f` captures what `f` captured. Any other use of `f` (copied, returned, stored,
+  printed, an operand) is the new `E0421`; `let mut f = ..`, a pattern, or `f = ..` is the new
+  `E0422`. Before, a closure in a `let` was `E0411` (`tests/run/closure_let.wk`,
+  `tests/fail/closure_let_escape.wk`, `tests/fail/closure_let_mut.wk`).
+- **Added: closure arguments of methods.** `v.map(|a| a * k)`, through a reference
+  (`pv.reduce(..)`) and as an associated function (`V::make(|i| ..)`), specializes the method per
+  closure exactly like a free function (`V.map$main$closure$0`); it was `E0411`
+  (`tests/run/closure_method.wk`).
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native
