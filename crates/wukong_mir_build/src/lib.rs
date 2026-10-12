@@ -1551,6 +1551,7 @@ fn lower_program_pooled(
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
         now_ns: interner.intern("wukong_now_ns"),
         bounds_fail: interner.intern("wukong_rt_bounds_fail"),
+        check_fail: interner.intern("wukong_rt_check_fail"),
         // Overwritten per function by `@unchecked`, below; checked is the default.
         bounds_checks: true,
         unroll_for_autodiff: opts.unroll_for_autodiff,
@@ -2507,7 +2508,12 @@ fn lower_program_pooled(
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
     // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
-    bounds::attach_sites(&mut program, interner, gemm.bounds_fail, locate);
+    bounds::attach_sites(
+        &mut program,
+        interner,
+        &[(gemm.bounds_fail, 3), (gemm.check_fail, 4)],
+        locate,
+    );
     (program, diags, par_regions.exhausted)
 }
 
@@ -4130,6 +4136,10 @@ struct GemmSyms {
     /// The failure edge of a checked slice access: `wukong_rt_bounds_fail(index: i64, len: i64,
     /// site: *u8)`, which never returns normally (see `bounds.rs`).
     bounds_fail: Symbol,
+    /// The failure edge of every other run-time check — a range index, `str_from_utf8`:
+    /// `wukong_rt_check_fail(kind: i64, a: i64, b: i64, site: *u8)`, which never returns normally
+    /// either (see `bounds.rs`).
+    check_fail: Symbol,
     /// Emit slice bounds checks (`true`, the default). Cleared per function by `@unchecked`, at the
     /// same place `@generic` clears `recognize`; it rides here for the same reason that does.
     bounds_checks: bool,

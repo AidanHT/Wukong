@@ -1,15 +1,16 @@
 // RUN: --run
 // EXPECT-EXIT: 1
 // EXPECT-OUT: wu
-// EXPECT-STDERR: index out of bounds: the len is 6 but the index is 9 at
-// EXPECT-STDERR: str_slice_bounds.wk:22:13
+// EXPECT-STDERR: range end index 9 out of range for slice of length 6 at
+// EXPECT-STDERR: str_slice_bounds.wk:23:13
 module tests.run.str_slice_bounds
 
 // A range index is checked at run time, `lo <= hi <= len`, on every backend and at every -O level
-// — the same check, failure message and exit code as an element access out of bounds
-// (`slice_bounds_oob.wk`). `s[..2]` is in bounds and prints "wu"; `s[2..end]` asks for bytes up to
-// 9 of a 6-byte `str`, so the upper bound fails against the length: "the len is 6 but the index
-// is 9", at line 22, column 13 — the start of `s[2..end]`. Nothing after it runs.
+// — the same stop and exit code as an element access out of bounds (`slice_bounds_oob.wk`), with
+// Rust's range wording. `s[..2]` is in bounds and prints "wu"; `s[2..end]` asks for bytes up to
+// 9 of a 6-byte `str`, so the upper bound fails against the length: "range end index 9 out of
+// range for slice of length 6", at line 23, column 13 — the start of `s[2..end]`. Nothing after
+// it runs. (A start past the end has its own message: `str_range_order.wk`.)
 //
 // The bound is a run-time value (`end` is read from a loop, not a literal) so that no constant
 // folding could ever decide the check early; the check itself is a pair of unsigned `<=`

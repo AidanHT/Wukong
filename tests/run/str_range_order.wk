@@ -1,0 +1,24 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: g
+// EXPECT-STDERR: slice index starts at 5 but ends at 3 at
+// EXPECT-STDERR: str_range_order.wk:21:13
+module tests.run.str_range_order
+
+// A range index whose start is past its end stops the program with its own message — Rust's
+// wording, "slice index starts at 5 but ends at 3" — instead of reusing the element-access one
+// with the end in the role of the length. `lo` is 5, read from a loop so no folding can decide
+// the check early. `s[lo..]` is the last byte of "wukong" ("g", 5 <= 6), and `s[lo..3]` fails
+// at line 21, column 13; nothing after it runs.
+
+fn main() -> i32 {
+    let s: str = "wukong";
+    let mut lo: i64 = 0;
+    for _ in 0..5 {
+        lo = lo + 1;
+    }
+    println(s[lo..]);
+    println(s[lo..3]);
+    println(s);
+    return 0;
+}

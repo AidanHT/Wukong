@@ -90,6 +90,9 @@ fn census_path() -> PathBuf {
 /// The slice bounds-failure intrinsic. A safety edge, not a dispatched kernel: how many survive
 /// `-O2` is a property of bounds-check elimination, so the census does not record it.
 const BOUNDS_FAIL: &str = "wukong_rt_bounds_fail";
+/// The failure edge of every other run-time check (a range index, `str_from_utf8`): a safety edge
+/// like [`BOUNDS_FAIL`], which range indexes called before it existed, so not recorded either.
+const CHECK_FAIL: &str = "wukong_rt_check_fail";
 
 /// Runtime symbols plus multiplicity witnesses and the number of inline vector-recipe calls.
 /// Keep bare symbols so the original symbol/fixture floors retain their meaning.
@@ -101,7 +104,7 @@ fn kernel_calls(mir: &str) -> BTreeSet<String> {
         let end = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        if &rest[..end] == BOUNDS_FAIL {
+        if &rest[..end] == BOUNDS_FAIL || &rest[..end] == CHECK_FAIL {
             continue;
         }
         *counts.entry(rest[..end].to_string()).or_default() += 1;
