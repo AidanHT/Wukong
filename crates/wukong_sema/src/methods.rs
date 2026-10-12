@@ -192,6 +192,8 @@ impl Sema<'_> {
         crate::shape::intrinsic_ret_ty(nm, &[]).is_some()
             || crate::kernel_builtin(nm, 2).is_some()
             || crate::scalar_builtin(nm).is_some()
+            || crate::ml_builtins::ml_builtin(nm).is_some()
+            || crate::decode_builtin(nm).is_some()
             || crate::heap_alloc_elem(nm).is_some()
             || crate::file_io_elem(nm).is_some()
             || crate::text::text_builtin(nm).is_some()
@@ -1459,9 +1461,17 @@ mod tests {
         let generic =
             format!("{APPLY} fn main() -> i32 {{ let g: fn(f32) -> f32 = id; return 0; }}");
         assert_eq!(codes(&generic), vec!["E0429"]);
-        let builtin_name =
-            format!("{APPLY} fn main() -> i32 {{ let gelu = square; return gelu(1.0) as i32; }}");
-        assert_eq!(codes(&builtin_name), vec!["E0411"]);
+        // A builtin's name, of any family the compiler reads by name: a math intrinsic, an
+        // ML builtin the `@parallel` region proof admits as pure.
+        for nm in ["gelu", "rand_f32"] {
+            let src = format!(
+                "fn myr(a: i64, b: i64) -> f32 {{ return (a + b) as f32; }} \
+                 fn gf(x: f32) -> f32 {{ return x; }} \
+                 fn main() -> i32 {{ let {nm} = {}; let _u = {nm}; return 0; }}",
+                if nm == "gelu" { "gf" } else { "myr" }
+            );
+            assert_eq!(codes(&src), vec!["E0411"], "{nm}");
+        }
     }
 
     #[test]

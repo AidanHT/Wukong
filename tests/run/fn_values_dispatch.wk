@@ -25,6 +25,14 @@
 // EXPECT-OUT: 81
 // EXPECT-OUT: 81
 // EXPECT-OUT: 16
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 8
+// EXPECT-OUT: 27
+// EXPECT-OUT: 64
+// EXPECT-OUT: 125
+// EXPECT-OUT: 216
+// EXPECT-OUT: 343
 module tests.run.fn_values_dispatch
 
 // Dispatch through function values chosen at run time. Expectations by hand:
@@ -40,6 +48,9 @@ module tests.run.fn_values_dispatch
 //   outer forwards its parameter to apply_twice: given sq at compile time and given the
 //     run-time value fs[0] = sq, both compute sq(sq(3))                       = 81, 81
 //   the identity closure from by_name passed on at run time: apply_twice(id, 16) = 16
+//   fill8 is `@parallel`, but its loop calls a run-time function value (fs[1] = cube), which
+//     the region proof cannot see, so it runs serially: every lane, cube(0..8)
+//     = 0 1 8 27 64 125 216 343
 
 struct Instr {
     op: i32,
@@ -127,6 +138,13 @@ fn outer(f: fn(i32) -> i32, x: i32) -> i32 {
     return apply_twice(f, x);
 }
 
+@parallel
+fn fill8(mut out: [i32; 8], f: fn(i32) -> i32) {
+    for i in 0..8 {
+        out[i] = f(i);
+    }
+}
+
 fn main() -> i32 {
     let table: [fn(i64, i64) -> i64; 4] = [op_add, op_mul, op_sub, op_neg];
     let prog: [Instr; 6] = [
@@ -156,5 +174,10 @@ fn main() -> i32 {
     print(outer(sq, 3));
     print(outer(fs[0], 3));
     print(apply_twice(id, 16));
+    let mut o8: [i32; 8] = [0; 8];
+    fill8(o8, fs[1]);
+    for i in 0..8 {
+        print(o8[i]);
+    }
     return (total - 42) as i32;
 }

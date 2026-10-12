@@ -75,6 +75,11 @@ fn a_run_time_choice_stays_an_indirect_call() {
     // pointer and calling through it.
     let map6 = function(&o0, "map6$fn1$i32$to$i32");
     assert!(map6.contains("call_indirect"), "{map6}");
+    // A `@parallel` loop around a call through a run-time value is not outlined: the region
+    // proof cannot see what the callee writes.
+    let fill8 = function(&o0, "fill8$fn1$i32$to$i32");
+    assert!(fill8.contains("call_indirect"), "{fill8}");
+    assert!(!fill8.contains("wukong_parallel_for"), "{fill8}");
     // At -O2 everything is inlined into `main`, and the run-time choices are still indirect.
     let o2 = mir("fn_values_dispatch.wk", 2);
     let main2 = function(&o2, "main");

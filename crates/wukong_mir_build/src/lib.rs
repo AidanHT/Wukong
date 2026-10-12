@@ -15830,8 +15830,11 @@ impl FnLowerer<'_> {
                     return;
                 }
                 // The RNG scalars (`rand_f32(seed, i)`, …) are pure too: counter-based, no state.
+                // A local is never a builtin: a call through a function value reaches code the
+                // region proof cannot see.
                 let pure_math = !self.sema.builtin_calls.contains_key(&e.id)
                     && single_path(callee)
+                        .filter(|s| self.lookup(*s).is_none())
                         .map(|s| {
                             math_intrinsic(self.interner.resolve(s)).is_some()
                                 || self.is_pure_ml_builtin(s)
