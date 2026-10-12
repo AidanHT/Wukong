@@ -1,0 +1,259 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 0.1015625
+// EXPECT-OUT: 0.09375
+// EXPECT-OUT: 0.3125
+// EXPECT-OUT: 3.25
+// EXPECT-OUT: 2.25
+// EXPECT-OUT: 1.25
+// EXPECT-OUT: 6.5
+// EXPECT-OUT: 0.125
+// EXPECT-OUT: -2.75
+// EXPECT-OUT: 3.25
+// EXPECT-OUT: 1.375
+// EXPECT-OUT: -0.625
+// EXPECT-OUT: -1.25
+// EXPECT-OUT: 3.5
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 40960
+// EXPECT-OUT: inf
+// EXPECT-OUT: -inf
+// EXPECT-OUT: 288
+// EXPECT-OUT: 448
+// EXPECT-OUT: -448
+// EXPECT-OUT: 448
+// EXPECT-OUT: inf
+// EXPECT-OUT: NaN
+// EXPECT-OUT: 0.001953125
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0.005859375
+// EXPECT-OUT: 1
+// EXPECT-OUT: false
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: false
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: -96
+// EXPECT-OUT: 448
+// EXPECT-OUT: -7
+// EXPECT-OUT: 16
+// EXPECT-OUT: 49152
+// EXPECT-OUT: 192
+// EXPECT-OUT: 57344
+// EXPECT-OUT: 3
+// EXPECT-OUT: 9
+// EXPECT-OUT: 8
+// EXPECT-OUT: 32
+// EXPECT-OUT: 5
+// EXPECT-OUT: -1
+// EXPECT-OUT: -96
+// EXPECT-OUT: 448
+// EXPECT-OUT: 1.25
+// EXPECT-OUT: 192
+// EXPECT-OUT: 0.3125
+// EXPECT-OUT: 1.125
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 448
+// EXPECT-OUT: 0.75
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2.75
+// EXPECT-OUT: 2.75
+// EXPECT-OUT: 2.75
+// EXPECT-OUT: false
+// EXPECT-OUT: true
+// EXPECT-OUT: 67
+// EXPECT-OUT: 128
+// EXPECT-OUT: 126
+// EXPECT-OUT: 123
+// EXPECT-OUT: inf
+// EXPECT-OUT: 0.001953125
+// EXPECT-OUT: 126
+// EXPECT-OUT: 255
+// EXPECT-OUT: 2.75 0.44 -2.75
+module tests.run.f8_scalar
+
+// The first-class 8-bit floats: `f8e4m3` (OCP E4M3FN — bias 7, 3 mantissa bits, no infinity,
+// saturating at ±448) and `f8e5m2` (OCP E5M2 — bias 15, 2 mantissa bits, IEEE infinities). A value
+// is computed in f32 and every result rounds to nearest, ties to even, onto its own grid — the rule
+// of the `f32_to_f8e4m3` / `f32_to_f8e5m2` builtins. Every operand is a run-time value (an opaque
+// zero from `arg_count() - 1` is added to it), so nothing is folded at compile time.
+//
+// Every expected line is the format's arithmetic done by hand. The grid of E4M3FN on [2^e, 2^(e+1))
+// has step 2^(e-3), E5M2's 2^(e-2), so for example: 0.1 = 1.6·2^-4 lies between 1.5 and 1.625 times
+// 2^-4 (E4M3FN) and rounds to 1.625·2^-4 = 0.1015625, and between 1.5 and 1.75 (E5M2), rounding to
+// 1.5·2^-4 = 0.09375; 2.75 + 0.4375 = 3.1875 lies between 3.0 and 3.25 (step 0.25) and rounds up;
+// 2.75 · 0.4375 = 1.203125 rounds to 1.25 (step 0.125); 2.75 / 0.4375 = 6.2857… rounds to 6.5 (step
+// 0.5); E5M2 3.0 · 0.625 = 1.875 is a tie between 1.75 (odd mantissa 11) and 2.0 (even), so 2.0.
+// 300 lies between 288 and 320 (step 32) and rounds to 288; 576 saturates to 448 in E4M3FN, 81920
+// overflows to infinity in E5M2. Integer conversions round the same way: 100 is a tie between 96
+// and 104 (step 8) and goes to the even 96; 17 is a tie between 16 and 18, so 16; 200 between 192
+// and 208, so 192; E5M2 50000 lies between 49152 and 57344 (step 8192), nearer 49152; 60000
+// stays below the overflow midpoint 61440, so 57344. A double 1.0625 + 1e-10 rounds once,
+// straight to E4M3FN, past the midpoint of 1.0 and 1.125, giving 1.125; through f32 it is first
+// exactly 1.0625 and then ties to the even 1.0. The bit patterns are the OCP codes: 2.75 = 1.011·2^1
+// is sign 0, exponent 1 + 7 = 8, mantissa 011: 0x43 = 67; -0 is 0x80; 448 is 0x7E; 57344 is 0x7B;
+// an E5M2 NaN code (0x7D, payload 01) holds as the canonical NaN 0x7E, E4M3FN's -NaN is 0xFF.
+fn main() -> i32 {
+    let z: i64 = arg_count() - 1;
+    let zf: f32 = z as f32;
+    let zd: f64 = z as f64;
+
+    // Literals: suffixed, and unsuffixed adapting to an annotation.
+    let a: f8e4m3 = 1.5;
+    let b = 0.1f8e4m3;
+    let c: f8e5m2 = 0.1;
+    let d = 0.3f8e5m2;
+    print(a);
+    print(b);
+    print(c);
+    print(d);
+
+    // E4M3FN arithmetic, each result rounded onto the grid.
+    let x: f8e4m3 = (zf + 2.75) as f8e4m3;
+    let y: f8e4m3 = (zf + 0.4375) as f8e4m3;
+    print(x + y);
+    print(x - y);
+    print(x * y);
+    print(x / y);
+    print(x % y);
+    print(-x);
+    let mut acc: f8e4m3 = x;
+    acc += y;
+    print(acc);
+    acc *= y;
+    print(acc);
+    acc -= 2.0f8e4m3;
+    print(acc);
+    acc /= 0.5f8e4m3;
+    print(acc);
+
+    // E5M2 arithmetic.
+    let p: f8e5m2 = (zf + 3.0) as f8e5m2;
+    let q: f8e5m2 = (zf + 0.625) as f8e5m2;
+    print(p + q);
+    print(p - q);
+    print(p * q);
+    print(p / q);
+
+    // Overflow: E5M2 to infinity, E4M3FN saturating; division by zero and 0/0.
+    let big: f8e5m2 = (zf + 40000.0) as f8e5m2;
+    print(big);
+    print(big + big);
+    print(-(big + big));
+    let m: f8e4m3 = (zf + 300.0) as f8e4m3;
+    print(m);
+    print(m + m);
+    print(m * -2.0f8e4m3);
+    let zero4: f8e4m3 = zf as f8e4m3;
+    let zero5: f8e5m2 = zf as f8e5m2;
+    print(x / zero4);
+    print(p / zero5);
+    print(zero4 / zero4);
+
+    // Subnormals: 2^-9 is E4M3FN's least value; half of it ties to the even 0.
+    let s: f8e4m3 = (zf + 0.001953125) as f8e4m3;
+    print(s);
+    print(s / 2.0f8e4m3);
+    print(s * 3.0f8e4m3);
+    let s5: f8e5m2 = f8e5m2_from_bits(0x01);
+    print(bits(s5 + zero5));
+
+    // Comparisons, NaN unordered, -0 == 0.
+    let nan: f8e4m3 = zero4 / zero4;
+    print(x < y);
+    print(x > y);
+    print(x == x);
+    print(x != y);
+    print(x <= 2.75f8e4m3);
+    print(nan == nan);
+    print(nan != nan);
+    print(-zero4 == zero4);
+
+    // Every integer type in, rounded once.
+    let v8: i8 = (z - 100) as i8;
+    let v16: i16 = (z + 1000) as i16;
+    let v32: i32 = (z as i32) - 7;
+    let v64: i64 = z + 17;
+    let v128: i128 = (z as i128) + 50000;
+    let w8: u8 = (z + 200) as u8;
+    let w16: u16 = (z + 60000) as u16;
+    let w32: u32 = (z as u32) + 3;
+    let w64: u64 = (z as u64) + 9;
+    let w128: u128 = (z as u128) + 33;
+    let us: usize = (z as usize) + 5;
+    let is: isize = (z as isize) - 1;
+    print(v8 as f8e4m3);
+    print(v16 as f8e4m3);
+    print(v32 as f8e4m3);
+    print(v64 as f8e4m3);
+    print(v128 as f8e5m2);
+    print(w8 as f8e4m3);
+    print(w16 as f8e5m2);
+    print(w32 as f8e5m2);
+    print(w64 as f8e4m3);
+    print(w64 as f8e5m2);
+    print(w128 as f8e4m3);
+    print(us as f8e5m2);
+    print(is as f8e4m3);
+    // ... and back out (`as` truncates toward zero and saturates).
+    print((v8 as f8e4m3) as i8);
+    print((v16 as f8e4m3) as i16);
+
+    // Every float type in.
+    let h: f16 = (zf + 1.3) as f16;
+    let g: bf16 = (zf + 200.0) as bf16;
+    let f: f32 = zf + 0.3;
+    let dd: f64 = zd + 1.0625 + 0.0000000001;
+    print(h as f8e4m3);
+    print(g as f8e5m2);
+    print(f as f8e4m3);
+    print(dd as f8e4m3);
+    print((dd as f32) as f8e4m3);
+    let t4: f8e4m3 = (zf + 1.375) as f8e4m3;
+    let u4: f8e4m3 = (zf + 1.125) as f8e4m3;
+    print(t4 as f8e5m2);
+    print(u4 as f8e5m2);
+    let t5: f8e5m2 = (zf + 57344.0) as f8e5m2;
+    let u5: f8e5m2 = (zf + 0.75) as f8e5m2;
+    print(t5 as f8e4m3);
+    print(u5 as f8e4m3);
+
+    // Out to every integer and float type.
+    print(x as i8);
+    print(x as u8);
+    print(-x as i64);
+    print(-x as u32);
+    print((big + big) as i32);
+    print(nan as i32);
+    print(x as f16);
+    print(x as bf16);
+    print(x as f64);
+    print(zero4 as bool);
+    print(x as bool);
+
+    // The OCP code: `bits` and `*_from_bits`.
+    print(bits(x));
+    print(bits(-zero4));
+    print(bits(m + m));
+    print(bits(t5));
+    print(f8e5m2_from_bits(0x7c));
+    print(f8e4m3_from_bits(0x01));
+    print(bits(f8e5m2_from_bits(0x7d)));
+    print(bits(f8e4m3_from_bits(0xff)));
+
+    printf("{} {:.2} {:?}\n", x, y, -x);
+    return 0;
+}

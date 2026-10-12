@@ -179,6 +179,9 @@ exp10_log10.wk: veckernel*1 wukong_vmath_f32 wukong_vmath_f32*2
 expm1_log1p.wk: wukong_vmath_f32 wukong_vmath_f32*2
 extern_c_libm.wk:
 f16.wk:
+f8_aggregates.wk: wukong_parallel_for wukong_rt_alloc wukong_rt_arg_count wukong_rt_fmt_f32 wukong_rt_fmt_f32*12 wukong_rt_fmt_int wukong_rt_fmt_int*2 wukong_rt_fmt_lit wukong_rt_fmt_lit*36 wukong_rt_fmt_slice wukong_rt_fmt_slice*6 wukong_rt_free
+f8_code_round_trip.wk: wukong_rt_fmt_int wukong_rt_fmt_int*5 wukong_rt_fmt_str wukong_rt_fmt_str*5
+f8_scalar.wk: wukong_rt_arg_count wukong_rt_fmt_f32 wukong_rt_fmt_f32*57 wukong_rt_fmt_lit wukong_rt_fmt_lit*54 wukong_rt_fmt_str wukong_rt_fmt_str*3
 ffn_block.wk: wukong_sgemm_nt wukong_sgemm_nt*2
 float.wk:
 float_cast_narrow.wk:
@@ -227,6 +230,7 @@ gevm_f32.wk: wukong_sgevm_f32 wukong_sgevm_f32*2
 glu_gate.wk: wukong_vmath2_f32
 gram.wk: wukong_sgemm_nt
 hadamard.wk: wukong_velem_f32 wukong_velem_f32*3
+half_int_conversion_rounds.wk: wukong_rt_arg_count wukong_rt_fmt_f32 wukong_rt_fmt_f32*2 wukong_rt_fmt_lit wukong_rt_fmt_lit*2
 hardsigmoid_nan.wk: wukong_vmath_f32
 hardswish.wk: wukong_vmath_f32 wukong_vmath_f32*2
 heap_alloc.wk: veckernel*1 wukong_rt_alloc wukong_rt_free
