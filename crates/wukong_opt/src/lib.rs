@@ -49,7 +49,11 @@
 //! per-function pipeline, and loop unrolling ([`unroll_program`] — complete for a small known trip
 //! count, partial otherwise) runs once *after* it — a reduced pipeline is then re-run over the
 //! functions unrolling changed, so the duplicated bodies get the same simplify/cse/dce treatment as
-//! everything else. Last of all, [`FormSwitches`] turns each chain of equality tests on one
+//! everything else. Then straight-line **SLP** ([`slp_program`]) packs `W` isomorphic stores to
+//! consecutive elements of one object — a complete unroll's copies, a hand-written `vec4` — into
+//! one 128-bit vector store, and the same reduced pipeline cleans the functions it packed (not in a
+//! program autodiff will differentiate: [`OptimizeOptions::AUTODIFF_INPUT`]). Last of
+//! all, [`FormSwitches`] turns each chain of equality tests on one
 //! scrutinee into a single `switch` terminator (once, after every loop transform — see
 //! `switch_form`). `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
@@ -76,6 +80,7 @@ mod phi;
 mod promote;
 mod simplify;
 mod simplify_cfg;
+mod slp;
 mod sroa;
 mod unroll;
 mod unroll_jam;
@@ -109,6 +114,7 @@ pub use phi::SimplifyPhis;
 pub use promote::Promote;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
+pub use slp::slp_program;
 pub use sroa::Sroa;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
@@ -151,6 +157,9 @@ pub struct Timings {
     /// index within [`PassManager::standard`], and the cleanup pipeline numbers its passes
     /// differently.
     pub unroll: Duration,
+    /// Straight-line SLP time (runs at `-O2`+, after unrolling): the pass plus the cleanup sweep
+    /// over the functions it packed, bucketed together for the same reason as [`Timings::unroll`].
+    pub slp: Duration,
     /// Total time inside `optimize` (inlining + every pass + fixpoint bookkeeping).
     pub total: Duration,
     /// The largest per-function fixpoint iteration count observed across the program.
@@ -441,6 +450,36 @@ impl Default for PassManager {
     }
 }
 
+/// The optimizer stages a caller can switch off independently of the `-O` level. Every entry point
+/// without a `_with` suffix runs [`OptimizeOptions::FULL`] (also the [`Default`]); the level still
+/// decides whether a stage can run at all (SLP needs `-O2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptimizeOptions {
+    /// Straight-line SLP ([`slp_program`]) after unrolling, at `-O2` and above.
+    pub slp: bool,
+}
+
+impl OptimizeOptions {
+    /// Every stage the level enables.
+    pub const FULL: OptimizeOptions = OptimizeOptions { slp: true };
+    /// The pipeline for a program `wukong_autodiff` will differentiate (`--emit=grad`, `--train`,
+    /// `--emit=obj --grad-of`): everything but SLP. Autodiff takes the *optimized* single-block
+    /// forward and differentiates it one scalar at a time; it has no VJP rule for a vector load or
+    /// store, so a packed bundle storing into a buffer whose gradient is live — in the loss, or in
+    /// a helper `inline_calls` splices into it — turned a forward that differentiated into a hard
+    /// error. The gradient-compile lowering (`unroll_for_autodiff`) and complete unrolling produce
+    /// exactly the straight-line copies SLP packs, so this is the common case there, not an edge.
+    /// The generated backward is never differentiated again, so it is optimized with
+    /// [`OptimizeOptions::FULL`].
+    pub const AUTODIFF_INPUT: OptimizeOptions = OptimizeOptions { slp: false };
+}
+
+impl Default for OptimizeOptions {
+    fn default() -> OptimizeOptions {
+        OptimizeOptions::FULL
+    }
+}
+
 /// Optimize a whole program at the given level.
 pub fn optimize(program: &mut Program, opt_level: u8) {
     optimize_preserving(program, opt_level, &[]);
@@ -449,6 +488,16 @@ pub fn optimize(program: &mut Program, opt_level: u8) {
 /// Optimize normally while retaining externally selected function entry points. Calls to these
 /// functions may still inline, and their bodies receive the full requested optimization pipeline.
 pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong_span::Symbol]) {
+    optimize_preserving_with(program, opt_level, roots, OptimizeOptions::FULL);
+}
+
+/// Like [`optimize_preserving`], running only the stages `options` leaves on.
+pub fn optimize_preserving_with(
+    program: &mut Program,
+    opt_level: u8,
+    roots: &[wukong_span::Symbol],
+    options: OptimizeOptions,
+) {
     // Inlining is a whole-program transform (it needs callee bodies), so it runs before the
     // function-level pipeline — which then optimizes the spliced-in code in context.
     if opt_level >= 2 {
@@ -462,6 +511,12 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
     if opt_level >= 2 {
         let changed = unroll_program(program);
         PassManager::unroll_cleanup().run_subset(program, &changed);
+        // Straight-line SLP, after unrolling so a complete unroll's copies are visible with their
+        // counters folded; the packed functions get the same cleanup (`slp`).
+        if options.slp {
+            let packed = slp::slp_program(program);
+            PassManager::unroll_cleanup().run_subset(program, &packed);
+        }
         // Last, and outside the fixpoint: a multi-way branch must not reach the loop passes.
         switch_form::form_switches(program);
     }
@@ -481,6 +536,16 @@ pub fn optimize_verified_preserving(
     opt_level: u8,
     roots: &[wukong_span::Symbol],
 ) -> Result<(), VerificationFailure> {
+    optimize_verified_preserving_with(program, opt_level, roots, OptimizeOptions::FULL)
+}
+
+/// Like [`optimize_verified_preserving`], running only the stages `options` leaves on.
+pub fn optimize_verified_preserving_with(
+    program: &mut Program,
+    opt_level: u8,
+    roots: &[wukong_span::Symbol],
+    options: OptimizeOptions,
+) -> Result<(), VerificationFailure> {
     // O0 still validates its input; a malformed lowering must not reach even the first transform.
     verify_program_stage(program, "optimization input")?;
     if opt_level >= 2 {
@@ -492,6 +557,11 @@ pub fn optimize_verified_preserving(
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
         PassManager::unroll_cleanup().run_subset_checked(program, &changed, true)?;
+        if options.slp {
+            let packed = slp::slp_program(program);
+            verify_program_stage(program, "slp")?;
+            PassManager::unroll_cleanup().run_subset_checked(program, &packed, true)?;
+        }
         switch_form::form_switches(program);
         verify_program_stage(program, "form-switches")?;
     }
@@ -523,6 +593,11 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         let changed = unroll_program(program);
         PassManager::unroll_cleanup().run_subset(program, &changed);
         t.unroll = u0.elapsed();
+        // The SLP bucket, likewise, is the stage and its cleanup.
+        let s0 = Instant::now();
+        let packed = slp::slp_program(program);
+        PassManager::unroll_cleanup().run_subset(program, &packed);
+        t.slp = s0.elapsed();
         // Counted in `total` only: one scan per function, and a cleanup only where one formed.
         switch_form::form_switches(program);
     }

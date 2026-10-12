@@ -599,10 +599,11 @@ pub struct MemAccess {
     /// The type transferred (the `Load`'s result type / the stored value's type).
     pub value_ty: MirType,
     pub addr: AddrForm,
-    /// For a **load** whose address is [`AddrForm::Unknown`] only because its index does not
-    /// follow the induction variable — a gather, `lut[q[i]]` — the object it reads, when the
-    /// pointer is one `gep` off a known base. The dependence test accepts such a load when nothing
-    /// the loop stores can be that object. `None` for every other access.
+    /// For an access whose address is [`AddrForm::Unknown`] only because its index does not follow
+    /// the induction variable, the object it touches, when the pointer is one `gep` off a known
+    /// base: a **gather** for a load (`lut[q[i]]`), a **scatter** for a store (`o[q[i]] = v`). The
+    /// dependence test accepts a gather when nothing the loop stores can be that object, and a
+    /// scatter when nothing else the loop reads or writes can be. `None` for every other access.
     pub gather_base: Option<MemBase>,
 }
 
@@ -1689,8 +1690,9 @@ fn collect_accesses(
                 _ => continue,
             };
             let addr = ctx.addr_form(ptr, memo);
-            let gather_base = match (&addr, kind) {
-                (AddrForm::Unknown, AccessKind::Load) => ctx.gather_base(ptr),
+            // A gather (load) or a scatter (store): the object, when one `gep` names it.
+            let gather_base = match &addr {
+                AddrForm::Unknown => ctx.gather_base(ptr),
                 _ => None,
             };
             out.push(MemAccess {
@@ -2348,8 +2350,17 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     // cannot follow, so no distance can be computed for it. It is independent of every store in
     // the loop exactly when the store's object is provably a different one: two distinct slots, a
     // `@noalias` promise, or the alias analysis's provenance (a local table whose address never
-    // escapes cannot be what a parameter points into). Any other unknown address — a store through
-    // one, or a pointer the analysis cannot trace to an object — may touch anything.
+    // escapes cannot be what a parameter points into).
+    //
+    // A scattered store (`o[q[i]] = v`) is the mirror image, and it asks more: it is independent of
+    // the loop only when NO other access — load or store, affine, invariant, gathered or scattered —
+    // can touch its object. Then the only accesses to that object are the scatter's own, and a
+    // consumer that performs them in iteration order (lane order, which is iteration order in both
+    // directions) leaves every element holding exactly what the scalar loop's last writer left;
+    // nothing in the loop can observe the order in between. A read-modify-write (`h[q[i]] += x`),
+    // two scatters into one object, and a scatter beside any other access of its own object all
+    // stay carried. Any other unknown address — a pointer the analysis cannot trace to an object —
+    // may touch anything.
     let mut alias: Option<crate::alias::AliasInfo> = None;
     let handle = |m: MemBase| match m {
         MemBase::Outer(v) => v,
@@ -2362,8 +2373,12 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
         let Some(gb) = a.gather_base else {
             return carried("an address the analysis could not decompose");
         };
-        for s in accesses.iter().filter(|s| s.kind == AccessKind::Store) {
-            let Some(sb) = s.addr.base() else {
+        let scatter = a.kind == AccessKind::Store;
+        for s in accesses.iter().filter(|s| {
+            (s.block, s.inst) != (a.block, a.inst) && (scatter || s.kind == AccessKind::Store)
+        }) {
+            // A scatter has no `addr.base()`; its object is its `gather_base`.
+            let Some(sb) = s.addr.base().or(s.gather_base) else {
                 return carried("an address the analysis could not decompose");
             };
             let apart = !gb.same_object(sb)
@@ -2373,7 +2388,11 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                         .get_or_insert_with(|| crate::alias::AliasInfo::analyze(ctx.f))
                         .may_alias(handle(gb), handle(sb)));
             if !apart {
-                return carried("a gathered load may read what the loop stores");
+                return carried(if scatter {
+                    "a scattered store may touch what the loop reads or writes"
+                } else {
+                    "a gathered load may read what the loop stores"
+                });
             }
         }
         if matches!(gb, MemBase::ReloadedOuter { .. }) {
@@ -3710,6 +3729,62 @@ mod tests {
         assert_eq!(gather.kind, AccessKind::Load);
         assert!(gather.gather_base.is_some(), "no object for {gather:?}");
         assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+    }
+
+    /// The scatter mirror of the case above: `o[idx[i]] = x[i]` into promised storage. The store's
+    /// address is `Unknown` but it records the object it writes, and nothing else the loop touches
+    /// can be that object — so lane-order stores reproduce the scalar loop's last writer, and the
+    /// loop is not carried.
+    #[test]
+    fn a_scatter_to_storage_nothing_else_touches_is_independent() {
+        let src = "@unchecked fn k(idx: []i32, x: []f32, @noalias mut o: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[idx[i] as i64] = x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let scatter = l
+            .accesses
+            .iter()
+            .find(|a| matches!(a.addr, AddrForm::Unknown))
+            .expect("the scattered store");
+        assert_eq!(scatter.kind, AccessKind::Store);
+        assert!(scatter.gather_base.is_some(), "no object for {scatter:?}");
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+    }
+
+    /// The scatter writes the object the loop also reads at `o[i]`: an earlier iteration's scatter
+    /// may land on a later iteration's `o[i]`, so the loop is carried, promise or not.
+    #[test]
+    fn a_scatter_into_storage_the_loop_reads_is_carried() {
+        let src = "@unchecked fn k(idx: []i32, x: []f32, @noalias mut o: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[idx[i] as i64] = o[i] + x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+    }
+
+    /// Two scatters into one object: which one lands last on a shared element depends on the
+    /// interleaving of the two, so the pair is carried.
+    #[test]
+    fn two_scatters_into_one_object_are_carried() {
+        let src = "@unchecked fn k(p: []i32, q: []i32, x: []f32, @noalias mut o: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[p[i] as i64] = x[i]; o[q[i] as i64] = x[i] * 2.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+    }
+
+    /// Without the promise `o` may be `x` or `idx`, so the scatter may write what the loop reads.
+    #[test]
+    fn a_scatter_without_a_promise_is_carried() {
+        let src = "@unchecked fn k(idx: []i32, x: []f32, mut o: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[idx[i] as i64] = x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
     }
 
     // ---- stage 4: carried values -------------------------------------------------------------

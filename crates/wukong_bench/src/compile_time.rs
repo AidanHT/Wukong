@@ -46,6 +46,7 @@ pub fn report(files: &[PathBuf]) {
     let mut agg: Vec<wukong_opt::PassStat> = Vec::new();
     let mut tot_inline = Duration::ZERO;
     let mut tot_unroll = Duration::ZERO;
+    let mut tot_slp = Duration::ZERO;
     let mut measured = 0u32;
     let mut skipped = 0u32;
     let mut failures: Vec<String> = Vec::new();
@@ -57,6 +58,7 @@ pub fn report(files: &[PathBuf]) {
                 tot_opt += m.opt;
                 tot_inline += m.timed.inline;
                 tot_unroll += m.timed.unroll;
+                tot_slp += m.timed.slp;
                 merge_passes(&mut agg, &m.timed.per_pass);
                 measured += 1;
                 println!(
@@ -90,11 +92,12 @@ pub fn report(files: &[PathBuf]) {
 
     // Per-pass breakdown: where the optimizer spends its time across the whole corpus. Sorted by
     // cost so the hottest pass — the lever — is on top. `inline` is a whole-program prepass and
-    // `unroll` a whole-program postpass; both are listed alongside (leave neither out of
-    // `timed_total`, or every other pass's share reads high). Times here come from the instrumented run (a small `Instant`-per-call overhead), so
-    // they are for *attribution*; the headline opt time above is the clean best-of-N.
+    // `unroll` and `slp` whole-program postpasses; all three are listed alongside (leave none out
+    // of `timed_total`, or every other pass's share reads high). Times here come from the
+    // instrumented run (a small `Instant`-per-call overhead), so they are for *attribution*; the
+    // headline opt time above is the clean best-of-N.
     let timed_total: Duration =
-        agg.iter().map(|p| p.time).sum::<Duration>() + tot_inline + tot_unroll;
+        agg.iter().map(|p| p.time).sum::<Duration>() + tot_inline + tot_unroll + tot_slp;
     println!("\nper-pass share of the optimizer (summed over corpus):");
     println!(
         "  {:<14} {:>10} {:>7} {:>10}",
@@ -112,6 +115,7 @@ pub fn report(files: &[PathBuf]) {
         tot_unroll,
         if tot_unroll > Duration::ZERO { 1 } else { 0 },
     ));
+    rows.push(("slp", tot_slp, if tot_slp > Duration::ZERO { 1 } else { 0 }));
     rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (name, time, calls) in rows {
         println!(

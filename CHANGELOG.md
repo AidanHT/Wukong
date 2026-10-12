@@ -131,6 +131,46 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `tests/fail/align_misplaced.wk`). Every lane of `tests/run/align_local.wk` matches across
   backends and `-O` levels.
 
+### Vectorizer: replicated scatters and straight-line SLP (`gap5/vectorizer-scatter-slp`)
+
+- **Straight-line SLP (N40).** A new `-O2` stage after unrolling (`wukong_opt::slp_program`) packs
+  `W` stores in one block to consecutive elements of one object, whose values are one lane-wise
+  operation tree, into one 128-bit vector store: `o[0..4] = a[0..4]*s + b[0..4]` written out by hand
+  becomes two `<4 x f32>` loads, one splat, one vector `fma` and one vector store, and the eight
+  stores a complete unroll leaves from `for k in 0..8 step 2` become two. VECTOR nodes take one
+  lane-wise shape with single-use lanes and never swap commutative operands; LOAD, SPLAT and BUILD
+  nodes cover the leaves; an untuned cost model packs only when the vector side is strictly
+  cheaper. Soundness is one crossing rule over `AliasInfo::may_alias_sized`: the chunk's stores and
+  vector loads move down to its last store, so every store, load, call or barrier they pass, and
+  every chunk store a LOAD lane followed, must be proved unobservable. `WUKONG_NO_SLP` turns it off
+  (read inside the stage, so the timed path and the `wukong_bench compile-work` replica honour it
+  too), `WUKONG_SLP_TRACE=1` prints each decision, `--time-passes` reports it as `slp`, and both
+  variables join the scrubbed compiler-env lists of the determinism, parallel-lane and census
+  gates. A gradient compile (`--emit=grad`, `--train`, `--emit=obj --grad-of`) optimizes the forward
+  it differentiates without SLP (`wukong_opt::OptimizeOptions::AUTODIFF_INPUT` through the new
+  `optimize_preserving_with` / `optimize_verified_preserving_with`): `wukong_autodiff` has no VJP
+  rule for a vector store, and a packed store into a buffer whose gradient is live had turned
+  losses that differentiated at `-O1` into an error at `-O2`/`-O3`; the generated backward is still
+  packed. Over `tests/run` and `examples` it packs `tensor_dim_arith.wk` and `type_alias.wk`; every
+  other program's `-O2` MIR is unchanged, and it costs 0.2% of optimizer time. No MIR op and no
+  backend changed (`tests/run/vec5_slp_bundles.wk`: f32x4 fma, i32x4 add/sub/mul, f64x2 mul, a
+  copy, a constant splat and the unrolled step-2 loop, every element printed).
+
+- **A store through a data-dependent index no longer keeps its loop scalar (N37, scatter half).**
+  `o[q[i]] = x[i] * 2.0 + 1.0` used to decline the whole loop (`loop_info::dependence` read the
+  store's unknown address as "may touch anything"). The scattered store now records its object
+  (`MemAccess::gather_base`), and when no other access in the loop — load or store, affine,
+  invariant, gathered or scattered — can touch that object, the loop widens around it and the store
+  runs once per lane (`Plan::Scatter`), in lane order. Lane order is iteration order in both
+  directions, so of two iterations writing one element the later one lands last, exactly as in the
+  scalar loop. The `x`/`q` loads and the arithmetic go 4-wide; the four stores stay scalar. A
+  histogram (`h[q[i]] += x`), two scatters into one object, a scatter beside another access of its
+  object, an unpromised destination, a scatter in an `if` arm and a checked scatter stay scalar
+  (`tests/run/vec5_scatter.wk`: f32, i32 and f64 destinations behind `@noalias` and a local table,
+  indices repeated inside one group and across groups, every slot printed). No MIR op and no
+  backend changed; over `tests/run` and `examples` the `-O2` MIR of every existing program is
+  unchanged.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

@@ -11,7 +11,7 @@ use wukong_mir::{MirLevel, Program};
 use wukong_span::{SourceMap, Symbol};
 
 /// Lex → parse → sema → mir_build, then optimize at `level` (floored at 1, the autodiff contract)
-/// preserving `root` exactly as `compile` does for `--emit=grad` / `--train`.
+/// preserving `root`, without SLP, exactly as `compile` does for `--emit=grad` / `--train`.
 fn compile_at(src: &str, level: u8, root: &str) -> (Program, Interner) {
     let mut sm = SourceMap::new();
     let id = sm.add("grad_model.wk".to_string(), src.to_string());
@@ -25,7 +25,12 @@ fn compile_at(src: &str, level: u8, root: &str) -> (Program, Interner) {
     let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
     assert!(!md.iter().any(|d| d.is_error()), "mir_build errors: {md:?}");
     let root = interner.intern(root);
-    wukong_opt::optimize_preserving(&mut program, level.max(1), &[root]);
+    wukong_opt::optimize_preserving_with(
+        &mut program,
+        level.max(1),
+        &[root],
+        wukong_opt::OptimizeOptions::AUTODIFF_INPUT,
+    );
     (program, interner)
 }
 

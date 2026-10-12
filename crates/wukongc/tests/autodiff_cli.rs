@@ -7,7 +7,10 @@
 //!   included, where no inliner runs;
 //! * `--train` of a kernel-backed model on the interpreter AND the native JIT, required to agree byte
 //!   for byte at every level — the only differential the synthesized backward has — and to descend;
-//! * `--emit=obj --grad-of` exports the gradient as a linkable symbol.
+//! * `--emit=obj --grad-of` exports the gradient as a linkable symbol;
+//! * a loss whose four straight-line stores into a kernel-read buffer are an SLP bundle in an
+//!   ordinary `-O2` compile still differentiates and trains at every level (gradient compiles
+//!   optimize the forward without SLP).
 //!
 //! The training loop ahead of time (`--train --emit=exe`, byte-identical to `--train` on both
 //! backends, this file's GEMM + bias model among its cases) is `train_exe.rs`.
@@ -298,5 +301,126 @@ fn object_emission_exports_the_gradient() {
     assert!(
         !plain.windows(b"loss_grad".len()).any(|w| w == b"loss_grad"),
         "without --grad-of the object must not grow a gradient"
+    );
+}
+
+/// Four straight-line stores into a local buffer the `sreduce` kernel then reads: `h[k] = x[k]²`
+/// for `k < 4`, `L = Σ h = Σ_{k<4} x[k]²`. An ordinary `-O2` compile packs the four stores into one
+/// `<4 x f32>` store (SLP); `wukong_autodiff` has no VJP rule for a vector store into a buffer whose
+/// gradient is live, so a gradient compile must not see that bundle.
+const LANE_STORES_LOCAL: &str = "@parallel
+fn loss(x: [f32; 8], mut out: [f32; 1]) -> f32 {
+    let mut h: [f32; 8] = [0.0; 8];
+    h[0] = x[0] * x[0];
+    h[1] = x[1] * x[1];
+    h[2] = x[2] * x[2];
+    h[3] = x[3] * x[3];
+    let mut l: f32 = 0.0;
+    for i in 0..8 { l = l + h[i]; }
+    out[0] = l;
+    return l;
+}
+fn main() -> i32 { return 0; }
+";
+
+/// The same bundle into a `@noalias` parameter, differentiated under the default `--grad-wrt` (every
+/// buffer, `h` included): it packs with no dead-store elimination involved.
+const LANE_STORES_PARAM: &str = "@parallel
+fn loss(x: [f32; 8], @noalias mut h: [f32; 8], mut out: [f32; 1]) -> f32 {
+    h[0] = x[0] * x[0];
+    h[1] = x[1] * x[1];
+    h[2] = x[2] * x[2];
+    h[3] = x[3] * x[3];
+    let mut l: f32 = 0.0;
+    for i in 0..8 { l = l + h[i]; }
+    out[0] = l;
+    return l;
+}
+fn main() -> i32 { return 0; }
+";
+
+/// A forward whose straight-line stores SLP packs in an ordinary `-O2` compile differentiates at
+/// every level, on every gradient surface: `--emit=grad`, `--train` (interpreter and native JIT)
+/// and `--emit=obj --grad-of`. At `-O2`/`-O3` these used to exit 1 with "store into buffer vN has
+/// no VJP rule, but that buffer's gradient is live", because the optimized forward autodiff takes
+/// held a `<4 x f32>` store.
+#[test]
+fn slp_shaped_lane_stores_differentiate_at_every_level() {
+    let scratch = Scratch::new("slp");
+    let local = scratch.source("lane_stores_local.wk", LANE_STORES_LOCAL);
+    let param = scratch.source("lane_stores_param.wk", LANE_STORES_PARAM);
+    // Not vacuous: an ordinary -O2 compile of each forward does pack the bundle.
+    for path in [&local, &param] {
+        let out = wukongc(&["--emit=mir", "-O2"], path);
+        assert_ok(&out, "--emit=mir -O2");
+        assert!(
+            stdout(&out).contains("load <4 x f32>"),
+            "{}: SLP no longer packs this shape, so this test proves nothing:
+{}",
+            path.display(),
+            stdout(&out)
+        );
+    }
+    for (path, wrt) in [(&local, Some("--grad-wrt=0")), (&param, None)] {
+        for level in ["-O0", "-O1", "-O2", "-O3"] {
+            let mut args = vec!["--emit=grad", level];
+            args.extend(wrt);
+            let out = wukongc(&args, path);
+            assert_ok(&out, &format!("{} {level}", path.display()));
+            backward(&stdout(&out));
+        }
+    }
+    // Training descends, identically on both backends and at every level. SGD at lr = 0.25 on
+    // L = Σ_{k<4} x[k]² sets x ← x - 0.25·2x = x/2, exact in binary floating point, so each step's
+    // loss is exactly a quarter of the last (up to the 6-decimal print).
+    let mut baseline: Option<String> = None;
+    for level in ["-O0", "-O1", "-O2", "-O3"] {
+        for backend in ["--backend=interp", "--backend=native"] {
+            let args = [
+                "--train",
+                "--grad-wrt=0",
+                "--train-steps=3",
+                "--train-lr=0.25",
+                "--train-seed=7",
+                level,
+                backend,
+            ];
+            let out = wukongc(&args, &local);
+            assert_ok(&out, &format!("--train {level} {backend}"));
+            let text = stdout(&out);
+            let losses = trajectory(&text);
+            assert_eq!(losses.len(), 4, "{level} {backend}: {text}");
+            assert!(
+                losses[0] > 1e-3,
+                "{level} {backend}: degenerate start: {text}"
+            );
+            for pair in losses.windows(2) {
+                assert!(
+                    (pair[1] - pair[0] / 4.0).abs() <= 1e-6,
+                    "{level} {backend}: a step must quarter the loss: {text}"
+                );
+            }
+            match &baseline {
+                Some(b) => assert_eq!(&text, b, "{level} {backend} differs from -O0 interp"),
+                None => baseline = Some(text),
+            }
+        }
+    }
+    let obj = scratch.0.join("lane_stores.o");
+    let out = wukongc(
+        &[
+            "--emit=obj",
+            "-O2",
+            "--grad-of=loss",
+            "-o",
+            obj.to_str().expect("utf-8 scratch path"),
+        ],
+        &local,
+    );
+    assert_ok(&out, "--emit=obj -O2 --grad-of=loss");
+    let bytes = std::fs::read(&obj).expect("the object was written");
+    assert!(
+        bytes.windows(b"loss_grad".len()).any(|w| w == b"loss_grad"),
+        "the object must export loss_grad"
     );
 }

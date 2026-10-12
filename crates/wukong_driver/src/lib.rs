@@ -690,17 +690,26 @@ pub fn compile(opts: &Options) -> i32 {
     // --- Optimization ---
     // The autodiff transform (`--emit=grad` / `--train` / an exported gradient) consumes single-block
     // SSA, so it forces at least `-O1` (mem2reg + simplify-cfg) regardless of the requested level.
-    // Every other path honors the requested level exactly.
-    let opt_level = if opts.emit == EmitStage::Grad || opts.grad.train || exports_gradient(opts) {
-        opts.opt_level.max(1)
+    // Every other path honors the requested level exactly. It also differentiates one scalar at a
+    // time, so the forward it takes is optimized without straight-line SLP, whose vector stores
+    // have no VJP rule (`OptimizeOptions::AUTODIFF_INPUT`).
+    let feeds_autodiff = opts.emit == EmitStage::Grad || opts.grad.train || exports_gradient(opts);
+    let (opt_level, opt_options) = if feeds_autodiff {
+        (
+            opts.opt_level.max(1),
+            wukong_opt::OptimizeOptions::AUTODIFF_INPUT,
+        )
     } else {
-        opts.opt_level
+        (opts.opt_level, wukong_opt::OptimizeOptions::FULL)
     };
     timer.begin("optimize");
     if opts.verify_each {
-        if let Err(failure) =
-            wukong_opt::optimize_verified_preserving(&mut program, opt_level, &roots)
-        {
+        if let Err(failure) = wukong_opt::optimize_verified_preserving_with(
+            &mut program,
+            opt_level,
+            &roots,
+            opt_options,
+        ) {
             emit_diag(
                 &optimization_failure_diag(&failure, &interner),
                 opts.error_format,
@@ -711,11 +720,13 @@ pub fn compile(opts: &Options) -> i32 {
         }
     } else if timer.enabled() && roots.is_empty() {
         // The timed optimizer runs the identical pipeline (byte-identical MIR) with a clock around
-        // each pass; with no extra roots it is exactly `optimize_preserving(.., &[])`.
+        // each pass; with no extra roots it is exactly `optimize_preserving(.., &[])`. That is the
+        // full pipeline, SLP included; a gradient compile always roots its loss, so never gets here.
+        debug_assert_eq!(opt_options, wukong_opt::OptimizeOptions::FULL);
         let timings = wukong_opt::optimize_timed(&mut program, opt_level);
         timer.optimizer_passes(&timings);
     } else {
-        wukong_opt::optimize_preserving(&mut program, opt_level, &roots);
+        wukong_opt::optimize_preserving_with(&mut program, opt_level, &roots, opt_options);
     }
     timer.mir_summary(&program, &interner);
 
@@ -2397,7 +2408,8 @@ fn build_grad(
     // Optimize only newly generated MIR: rerunning the pipeline over the input program could
     // change the forward or inline/delete its callees after the caller has selected them. The
     // backward still gets the requested local passes and unrolling, with the same O1 floor used
-    // to prepare the forward for autodiff. Preserve its externally invoked entry point explicitly.
+    // to prepare the forward for autodiff, and SLP too: nothing differentiates the backward.
+    // Preserve its externally invoked entry point explicitly.
     let grad_name = gradfn.name;
     let mut generated = wukong_mir::Program {
         funcs: vec![gradfn],
@@ -3363,15 +3375,22 @@ mod grad_cli_tests {
                         opts.grad.train_opt = TrainOpt::Sgd;
                         opts.grad.train_lr = 0.25;
                         let roots = autodiff_roots(&program, &mut interner, &opts).unwrap();
+                        let options = wukong_opt::OptimizeOptions::AUTODIFF_INPUT;
                         if verified {
-                            wukong_opt::optimize_verified_preserving(
+                            wukong_opt::optimize_verified_preserving_with(
                                 &mut program,
                                 level.max(1),
                                 &roots,
+                                options,
                             )
                             .unwrap();
                         } else {
-                            wukong_opt::optimize_preserving(&mut program, level.max(1), &roots);
+                            wukong_opt::optimize_preserving_with(
+                                &mut program,
+                                level.max(1),
+                                &roots,
+                                options,
+                            );
                         }
                         let fsym = interner.intern(target);
                         assert!(

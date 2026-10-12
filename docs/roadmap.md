@@ -603,9 +603,18 @@ another architecture or OS is not supported. A native-backend failure is a catal
   **Countdowns** (`while i > 0 { i = i - 1; .. }`, `while i >= 0 { ..; i = i - 1 }`) widen with
   each part loaded and stored as one vector reversed by a shuffle (`tests/run/vec4_reverse_loops.wk`).
   A runtime trip whose `end - start` wraps runs no vector group, and every fold returns its seed
-  bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`). Still scalar: an
+  bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`). A **scatter**
+  (`o[q[i]] = v`: a permutation or unpermute, an `index_put`, an embedding-row write, a sparse-to-dense
+  fill) widens everything around it and stores lane by lane in iteration order, so the last writer
+  of a repeated index is the scalar loop's, when nothing else in the loop can touch the scattered
+  object — a `@noalias` destination or a local table (`tests/run/vec5_scatter.wk`). Still scalar: an
   `else`-arm argmax update and 64-bit argmax values, stores to different places in one nested
-  region, nested guarded reductions, and in a countdown a search, an argmax or an interleave group.
+  region, nested guarded reductions, and in a countdown a search, an argmax or an interleave group;
+  and among scatters a read-modify-write histogram (the `scatter_add` recognizer's), two scatters
+  into one object, a scatter beside any other access of its own object, a **predicated** scatter
+  (one inside an `if` arm), a **checked** scatter (its bounds check is on data, not the counter), and
+  an unpromised destination the analysis cannot prove apart. There is no hardware gather or scatter:
+  each lane is a scalar access (AVX2's `vgatherdps` is not emitted, and AVX2 has no scatter).
   The per-lane accesses are scalar under Cranelift (no masked vector memory op is emitted yet). A
   loop needing more than eight runtime alias checks stays scalar, and so does one whose estimated
   vector group costs more than its `W` scalar iterations (`WUKONG_VEC_COST=0` lifts that). A two-deep nest whose inner loop carries a recurrence or
@@ -614,6 +623,22 @@ another architecture or OS is not supported. A native-backend failure is a catal
   loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
   is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
   bounds-check versioning split stay as written.
+- **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
+  consecutive elements of one object whose values are one lane-wise operation tree pack into one
+  128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane
+  builds: the register tile a complete unroll leaves, hand-written `vec4`/quaternion/complex-pair
+  code, small fixed-array kernels (`tests/run/vec5_slp_bundles.wk`). Bit-exact by construction
+  (lane-wise ops only, no reassociation, no operand swap). Still scalar: **alternate opcodes**
+  (`+ - + -` in one bundle, LLVM's alt-shuffle), **`i8`/`i16` lanes** and `bf16`/`f16`, **`select`,
+  compare and cast nodes** (a mask is not a value across backends, and a cast changes the lane
+  count), a bundle whose lanes are not in one block or whose stores are not contiguous, a chunk
+  shorter than one full vector, a store moved past a possibly-aliased access, a call that can name
+  the stored or loaded storage, or a barrier. Reductions and horizontal ops are not formed, and the
+  cost model is untuned: no speed claim without a same-run release A/B against `WUKONG_NO_SLP`. The
+  vector accesses it emits on frame slots reach `gpu-native` too, which only the device suite checks.
+  A gradient compile does not run it on the forward it differentiates: autodiff has no lane-wise
+  VJP rules for vector loads, stores and arithmetic, so the whole program of an `--emit=grad`,
+  `--train` or `--emit=obj --grad-of` compile stays unpacked (its generated backward is packed).
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.

@@ -128,8 +128,9 @@ fn emit_obj_o2(path: &Path, dst: &Path, serial_codegen: bool) -> Option<Vec<u8>>
 /// The `WUKONG_*` environment variables that change the MIR `--emit=mir` prints. Enumerated so the
 /// hermeticity arm below is grounded rather than guessing: `WUKONG_NO_RECOGNIZE` removes recognizer
 /// dispatch (`wukong_driver`), `WUKONG_P4_NO_256` disables the 256-bit veckernel recipe
-/// (`wukong_mir_build`), and the three optimizer kill-switches gate vectorization, unrolling and the
-/// induction-variable ramp (`wukong_opt`). Pure tracing switches (`WUKONG_VEC_TRACE`), the linker
+/// (`wukong_mir_build`), and the four optimizer kill-switches gate vectorization, unrolling, the
+/// induction-variable ramp and straight-line SLP (`wukong_opt`). Pure tracing switches
+/// (`WUKONG_VEC_TRACE`, `WUKONG_SLP_TRACE`), the linker
 /// (`WUKONG_BUILD_RUSTC`) and the GPU-only variables are deliberately excluded: they do not alter
 /// the emitted MIR. A new kill-switch that does must be added here in the same change.
 const MIR_AFFECTING_ENV: &[&str] = &[
@@ -138,6 +139,7 @@ const MIR_AFFECTING_ENV: &[&str] = &[
     "WUKONG_NO_VECTORIZE",
     "WUKONG_NO_UNROLL",
     "WUKONG_NO_IV_RAMP",
+    "WUKONG_NO_SLP",
 ];
 
 /// `--emit=mir -O2` for one program in a fresh process with `removed` cleared from the child's

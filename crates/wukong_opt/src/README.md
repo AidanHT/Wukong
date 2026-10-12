@@ -23,6 +23,7 @@
 | `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — complete (small known trip count) or partial loop unrolling at `-O2`+ |
+| `slp.rs` | `slp_program` — straight-line SLP at `-O2`+, after unrolling: packs `W` isomorphic stores to consecutive elements of one object, with the lane-wise arithmetic and contiguous loads feeding them, into one 128-bit vector store; legality is a crossing rule over `AliasInfo` (`WUKONG_NO_SLP`, `WUKONG_SLP_TRACE`) |
 | `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation, plus the `@noalias` parameter facts (`promised_storage`, `is_invariant_slice_header`, `promised_disjoint_bases`) |
 | `effects.rs` | `CallEffects`, `CallGraph` — interprocedural call-effect summaries (side-effect free, reads memory, always returns, speculatable) built callees-first for `cse`/`dce`/`licm` |
 | `loop_info.rs` | Natural-loop analysis (induction vars, trip counts, dependences) |
