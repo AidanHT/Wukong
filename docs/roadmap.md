@@ -135,7 +135,7 @@ line table built from them is not emitted yet.
   b)` over `Tensor[i32, P]` and `Tensor[i32, Q]` checked clean and read past `b`;
   `tests/fail/call_two_generic_dims.wk`); a local that reuses a generic dimension's name no longer
   changes that dimension's extents (`tests/run/generic_dim_shadowed.wk`); a turbofish dimension must
-  be an integer (`E0401`); and the canonicalizer counts a turbofish as a
+  be an integer (`E0401`) and name something (`E0504`); and the canonicalizer counts a turbofish as a
   mention of the local it reads (it sank `let mut n = 3;` below `f::<n>(..)`, a `C0001`, or a read of
   an outer `n`).
 - **`E0401` is a plain type mismatch again.** The catch-all was split by rule, each with its own

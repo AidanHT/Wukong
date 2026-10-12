@@ -28,8 +28,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **A local named like a generic dimension no longer changes it.** `let N = 2;` in `fn f<N>(a:
   Tensor[i32, N])` made every later extent and stride of `a` read 2 (`a.dim(0)` printed 2); a type's
   `N` is the generic again (`tests/run/generic_dim_shadowed.wk`).
-- **A turbofish dimension names an integer.** A float local (`first::<x>(a)` with `x = 2.5`) was
-  converted and ran with `N = 2`; it is `E0401` (`tests/fail/turbofish_dim_not_integer.wk`).
+- **A turbofish dimension names an integer in scope.** A float local (`first::<x>(a)` with
+  `x = 2.5`) was converted and ran with `N = 2`; it is `E0401`. A name that is nothing in scope
+  (`first::<lne>(a)`) was dropped in favour of the argument's length; it is `E0504`
+  (`tests/fail/turbofish_dim_not_integer.wk`, `tests/fail/turbofish_unknown_dim.wk`).
 - **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
   sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
   then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was

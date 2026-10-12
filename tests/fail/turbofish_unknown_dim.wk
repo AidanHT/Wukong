@@ -1,0 +1,18 @@
+// EXPECT-CODE: E0504
+// EXPECT-COUNT: 1
+module tests.fail.turbofish_unknown_dim
+
+// A turbofish dimension must name something: an integer literal, a `const`, a generic dimension or
+// an integer variable in scope. A name that is none of them (a typo of `len` here) used to bind a
+// dimension no value carried, and lowering quietly took `N` from the argument's length instead, so
+// `first::<lne>(a)` returned `a[5]` whatever `len` held.
+fn first<N>(a: Tensor[i32, N]) -> i32 {
+    return a[N - 1];
+}
+
+fn main() -> i32 {
+    let a: [i32; 6] = [1, 2, 3, 4, 5, 6];
+    let len = 3;
+    print(len);
+    return first::<lne>(a); //~ E0504
+}

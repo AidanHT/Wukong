@@ -916,7 +916,8 @@ faults:
 - `E0503` — the wrong number of value arguments, **or** a turbofish whose generic-argument count does
   not match the declared generic list.
 - `E0504` — a tensor type named a dimension that is not a declared generic parameter, an integer
-  literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic).
+  literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic);
+  likewise a turbofish dimension that names nothing in scope (`first::<lne>(a)`).
 - `E0505` — a dimension expression that is not an extent: it folds to a negative constant, divides by
   zero, overflows, or uses `?` as an operand — at the declaration, or for the dimensions a call binds.
 - `E0506` — a reshape (`x as Tensor[…]`) whose element count is not provably unchanged.

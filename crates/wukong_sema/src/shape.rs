@@ -773,6 +773,8 @@ impl Sema<'_> {
                                     // named no slot, so lowering fell back to a `?` argument's
                                     // run-time extent and `f::<C>(t)` disagreed with `f::<4>(t)`.
                                     dims.insert(*g, Dim::Const(self.const_length(nm, 0)));
+                                } else if self.unknown_turbofish_dim(sig, *g, nm, ga.span) {
+                                    // Reported (`E0504`); nothing to bind.
                                 } else {
                                     // One of the caller's own dimensions, fixed for its whole
                                     // body (in a closure, an enclosing generic is `E0418`).

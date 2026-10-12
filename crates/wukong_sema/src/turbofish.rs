@@ -28,7 +28,7 @@ use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
 use crate::lints::{for_each_child, Child};
-use crate::Sema;
+use crate::{FnSig, Sema};
 
 /// One run-time dimension of a call: the value a local holds when the call is made
 /// (`f::<n>(..)`), published per call in [`crate::SemaResult::dim_snapshots`].
@@ -139,6 +139,47 @@ impl Sema<'_> {
             source: name,
             unsigned,
         })
+    }
+
+    /// Report `E0504` when the turbofish argument at `at` names `name` for the dimension generic
+    /// `generic` of `sig` and `name` is nothing at all — no local, no generic or `const` (both tried
+    /// before this), no definition. Such a name used to bind a dimension no slot carries, so
+    /// lowering silently took the extent from an argument instead: `first::<zzz>(a)` read `a`'s
+    /// length. `false` (and nothing reported) for any name that resolves, and for a TYPE generic,
+    /// whose argument is a type.
+    pub(crate) fn unknown_turbofish_dim(
+        &mut self,
+        sig: &FnSig,
+        generic: Symbol,
+        name: Symbol,
+        at: Span,
+    ) -> bool {
+        if self.generics.contains(&name) || self.defs.lookup(name).is_some() {
+            return false;
+        }
+        if !sig
+            .params
+            .iter()
+            .chain(std::iter::once(&sig.ret))
+            .any(|t| names_dimension(t, generic))
+        {
+            return false;
+        }
+        let (nm, g) = (
+            self.sym_str(name).to_string(),
+            self.sym_str(generic).to_string(),
+        );
+        let d = Diagnostic::error(format!(
+            "unknown dimension `{nm}` in the turbofish (a dimension must be an integer literal, a \
+             `const`, a generic dimension, or an integer variable in scope)"
+        ))
+        .with_code("E0504")
+        .primary(
+            at,
+            format!("no integer named `{nm}` is in scope to give `{g}`"),
+        );
+        self.diags.push(d);
+        true
     }
 
     /// Publish the run-time dimensions of the call whose callee is `call_id` (none clears a record
@@ -262,6 +303,22 @@ fn borrowed_in_expr(e: &Expr, out: &mut HashSet<Symbol>) {
         Child::Expr(x) => borrowed_in_expr(x, out),
         Child::Block(b) => borrowed_in_block(b, out),
     });
+}
+
+/// Does `g` occur as a tensor dimension anywhere in `t` — the way a dimension generic is used?
+fn names_dimension(t: &Ty, g: Symbol) -> bool {
+    match t {
+        Ty::Tensor { shape, .. } => shape.symbolic_dims().contains(&g),
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            names_dimension(pointee, g)
+        }
+        Ty::Array { elem, .. } => names_dimension(elem, g),
+        Ty::Tuple(items) => items.iter().any(|t| names_dimension(t, g)),
+        Ty::Fn { params, ret } => {
+            params.iter().any(|t| names_dimension(t, g)) || names_dimension(ret, g)
+        }
+        _ => false,
+    }
 }
 
 /// The variable whose storage the place `e` names: the root of an `x`, `x.f`, `x.0`, `x[i]` chain.
@@ -433,13 +490,17 @@ mod tests {
         assert!(d.message.contains("the run-time dimension `n`"), "{d:?}");
     }
 
-    /// A turbofish dimension names an integer: a float local is `E0401`, an unsigned one is
-    /// fine. A type generic's argument is a type, and stays one.
+    /// A turbofish dimension names an integer: a float local is `E0401`, and a name that is
+    /// nothing at all is `E0504`. A type generic's argument is a type, and stays one.
     #[test]
     fn a_turbofish_dimension_names_an_integer() {
         rejects(
             &with_lib("let x = 2.5; let a = row::<2, x>(buf, 0); return a[0];"),
             "E0401",
+        );
+        rejects(
+            &with_lib("let a = row::<2, lne>(buf, 0); return a[0];"),
+            "E0504",
         );
         ok("struct P { a: i32 } fn id<T>(x: T) -> T { return x; } \
             fn g() -> i32 { let p = P { a: 1 }; let q = id::<P>(p); return q.a; }");
