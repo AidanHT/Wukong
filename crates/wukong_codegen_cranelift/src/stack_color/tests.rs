@@ -87,7 +87,7 @@ fn sequential_scratch_shares_a_slot_and_computes_the_same_values() {
     for opt in [0u8, 2] {
         let (program, interner) = lower(SEQUENTIAL, opt);
         let main = interner.get("main").expect("main");
-        let bytes = frame_bytes(&program, opt);
+        let bytes = frame_bytes(&program, &interner, opt);
         assert!(
             bytes.colored + 2 * 1024 <= bytes.separate,
             "-O{opt}: two of the three 1 KiB scratch arrays should fold into the third: {bytes:?}"
@@ -116,7 +116,7 @@ fn the_phases_fixture_shares_disjoint_arrays_and_separates_overlapping_ones() {
     let array = padded(alloca_slot(256, 0).0);
     for opt in [0u8, 2] {
         let (program, interner) = lower(src, opt);
-        let bytes = frame_bytes(&program, opt);
+        let bytes = frame_bytes(&program, &interner, opt);
         assert!(
             bytes.separate - bytes.colored >= 2 * array,
             "-O{opt}: {bytes:?}"
@@ -152,6 +152,115 @@ fn the_phases_fixture_shares_disjoint_arrays_and_separates_overlapping_ones() {
                 "-O{opt}: c overlaps {name} and must not share with it: {colors:?}"
             );
         }
+    }
+}
+
+/// `tests/run/stack_color_kills.wk`: every array is zeroed at its `let` and fully rewritten later —
+/// by loop nests (one with its inner loop vectorized), by a recognized GEMM (`c`) and by a
+/// recognized elementwise kernel (`e`). Those rewrites end the zeros' lifetime, so arrays used in
+/// different phases have disjoint lifetimes and the frame shrinks; every pair the program keeps live
+/// together still interferes, and never shares a slot. The fixture's printed lanes, checked by the
+/// run gates on both backends, prove the shared slots hold the right values.
+#[test]
+fn full_overwrites_separate_phases_and_keep_overlapping_arrays_apart() {
+    let src = include_str!("../../../../tests/run/stack_color_kills.wk");
+    const NAMES: [&str; 11] = ["keep", "p", "q", "r", "a", "b", "c", "e", "w", "v", "acc"];
+    // Used in different phases: p dies filling q; q once r is filled and q printed; w and v with
+    // the `h` loop, acc once printed after it (its zeros are read: it accumulates); a and b at the
+    // GEMM. r, c and e live on to the end.
+    const DISJOINT: [(usize, usize); 15] = [
+        (1, 3),
+        (1, 4),
+        (1, 6),
+        (1, 7),
+        (1, 8),
+        (2, 6),
+        (2, 7),
+        (2, 8),
+        (8, 4),
+        (8, 6),
+        (8, 7),
+        (10, 4),
+        (10, 5),
+        (10, 6),
+        (10, 7),
+    ];
+    // Live together.
+    const OVERLAP: [(usize, usize); 12] = [
+        (0, 1),
+        (0, 7),
+        (1, 2),
+        (2, 3),
+        (3, 7),
+        (3, 6),
+        (6, 7),
+        (4, 5),
+        (4, 6),
+        (5, 6),
+        (8, 9),
+        (10, 9),
+    ];
+    for opt in [0u8, 2] {
+        let (program, interner) = lower(src, opt);
+        let bytes = frame_bytes(&program, &interner, opt);
+        assert!(bytes.separate - bytes.colored >= 512, "-O{opt}: {bytes:?}");
+        let main = interner.get("main").expect("main");
+        let f = program.function(main).unwrap();
+        let calls = capture_summary(&program, &interner);
+        let alias = AliasInfo::analyze(f);
+        let cfg = ColorConfig {
+            calls: &calls,
+            mix_regions: opt == 0,
+        };
+        let plan = SlotPlan::new(f, cfg, &alias);
+        let lifetimes = SlotLifetimes::analyze(f, &calls);
+        // The eleven arrays in declaration order (mir_build appends each to the entry block, ahead
+        // of the scratch the kernel guards and the vectorizer add later).
+        let arrays: Vec<ValueId> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|inst| match (&inst.op, inst.result) {
+                (
+                    Op::Alloca {
+                        ty: MirType::Array(e, n),
+                        ..
+                    },
+                    Some(v),
+                ) if *n >= 8 && matches!(**e, MirType::F32 | MirType::I32) => Some(v),
+                _ => None,
+            })
+            .take(11)
+            .collect();
+        assert_eq!(arrays.len(), 11, "-O{opt}");
+        let index = |k: usize| lifetimes.index_of(arrays[k]).unwrap();
+        for (x, y) in DISJOINT {
+            assert!(
+                !lifetimes.interfere(index(x), index(y)),
+                "-O{opt}: {} and {} are used in different phases",
+                NAMES[x],
+                NAMES[y]
+            );
+        }
+        for (x, y) in OVERLAP {
+            assert!(
+                lifetimes.interfere(index(x), index(y)),
+                "-O{opt}: {} and {} are live together",
+                NAMES[x],
+                NAMES[y]
+            );
+            let (cx, cy) = (plan.color_of(arrays[x]), plan.color_of(arrays[y]));
+            assert!(
+                cx.is_none() || cx.map(|c| c.0) != cy.map(|c| c.0),
+                "-O{opt}: {} and {} must not share",
+                NAMES[x],
+                NAMES[y]
+            );
+        }
+        assert!(
+            plan.color_of(arrays[6]).is_some() && plan.color_of(arrays[7]).is_some(),
+            "-O{opt}: the GEMM's and the elementwise kernel's outputs share frame space"
+        );
     }
 }
 
@@ -274,8 +383,8 @@ fn coloring_shrinks_the_machine_frame() {
             colored + 2 * 4096 <= separate,
             "-O{opt}: coloring should save two 4 KiB slots: {colored} vs {separate}"
         );
-        let (program, _, _) = probe_program();
-        let bytes = frame_bytes(&program, opt);
+        let (program, interner, _) = probe_program();
+        let bytes = frame_bytes(&program, &interner, opt);
         assert!(bytes.separate - bytes.colored >= 2 * 4096, "{bytes:?}");
     }
 }
@@ -407,7 +516,7 @@ fn main() -> i32 {
 }
 ";
     let (program, interner) = lower(src, 1);
-    let bytes = frame_bytes(&program, 2);
+    let bytes = frame_bytes(&program, &interner, 2);
     assert!(bytes.separate >= 512, "{bytes:?}");
     assert_eq!(bytes.colored, bytes.separate, "{bytes:?}");
     let on = with_coloring(true, || crate::emit_object(&program, &interner)).unwrap();
@@ -416,7 +525,9 @@ fn main() -> i32 {
 }
 
 /// Corpus-wide static frame bytes — `tests/run` and `examples`, every program that needs no import —
-/// with and without coloring, at -O0 and -O2. A report, not a gate: run with
+/// with and without coloring, at -O0 and -O2, plus at -O2 what letting private and non-private slots
+/// share would add, and every function of `examples/llama_block.wk` on its own. A report, not a
+/// gate: run with
 /// `cargo test -p wukong_codegen_cranelift --lib corpus_frame_bytes -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -431,6 +542,7 @@ fn corpus_frame_bytes() {
         files.sort();
         for opt in [0u8, 2] {
             let mut total = FrameBytes::default();
+            let mut mixed = FrameBytes::default();
             let (mut measured, mut skipped, mut shrunk) = (0, 0, 0);
             let mut top: Vec<(u64, u64, String)> = Vec::new();
             for path in &files {
@@ -454,14 +566,28 @@ fn corpus_frame_bytes() {
                     continue;
                 }
                 wukong_opt::optimize(&mut program, opt);
-                let b = frame_bytes(&program, opt);
+                let b = frame_bytes(&program, &interner, opt);
+                mixed += frame_bytes_mixing(&program, &interner, true);
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name == "llama_block.wk" {
+                    let calls = capture_summary(&program, &interner);
+                    let cfg = ColorConfig {
+                        calls: &calls,
+                        mix_regions: opt == 0,
+                    };
+                    for f in &program.funcs {
+                        let fb = function_frame_bytes(f, cfg);
+                        eprintln!(
+                            "    {name} fn {} -O{opt}: {} -> {} slot bytes",
+                            interner.resolve(f.name),
+                            fb.separate,
+                            fb.colored
+                        );
+                    }
+                }
                 if b.colored < b.separate {
                     shrunk += 1;
-                    top.push((
-                        b.separate - b.colored,
-                        b.separate,
-                        path.file_name().unwrap().to_string_lossy().into_owned(),
-                    ));
+                    top.push((b.separate - b.colored, b.separate, name));
                 }
                 total += b;
                 measured += 1;
@@ -474,6 +600,13 @@ fn corpus_frame_bytes() {
                 total.colored,
                 100.0 * (total.separate - total.colored) as f64 / total.separate.max(1) as f64
             );
+            if opt > 0 {
+                eprintln!(
+                    "    with private and non-private slots sharing: {} slot bytes ({:.1}% saved)",
+                    mixed.colored,
+                    100.0 * (mixed.separate - mixed.colored) as f64 / mixed.separate.max(1) as f64
+                );
+            }
             for (saved, of, name) in top.iter().take(8) {
                 eprintln!("    {saved:>8} of {of:>8} bytes  {name}");
             }
