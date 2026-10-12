@@ -48,11 +48,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
   its buffered output. It now stops like a failed `assert` on every CPU backend, keeping that
   output: `assertion failed: no `match` arm matched its value at <the match's site>`, exit 1
   (`tests/run/match_no_arm_trap.wk`).
-- **`--backend=gpu-native` is unchanged.** It keeps one assert-failed flag on the device, reports a
-  bare `assertion failed` and declines a `GlobalAddr`, so the driver hands it a copy of the program
-  stripped of the site and message operands (`wukong_opt::strip_assert_sites`). MIR lowered
-  without a source locator (`lower_program_with`, the GPU device gates) keeps the one-operand
-  `assert(cond)`.
+- **`--backend=gpu-native` keeps its bare `assertion failed`.** It keeps one assert-failed flag on
+  the device and declines a `GlobalAddr`, so the driver hands it a copy of the program stripped of
+  the site and message operands (`wukong_opt::strip_assert_sites`). MIR lowered without a source
+  locator (`lower_program_with`, the GPU device gates) keeps the one-operand `assert(cond)`.
+- **Fixed: a reached `unreachable` faulted the GPU instead of stopping the program.** gpu-native
+  lowered the terminator to PTX `trap;`, which fails the launch with a sticky CUDA error: the
+  context is lost for the rest of the process. `tests/run/match_no_arm_trap.wk` is the first
+  corpus program to reach one (its `match` falls into `assert(false)`, then `unreachable`), so the
+  device corpus gate (`run_corpus_matches_interp_oracle`) would have recorded a driver fault and
+  listed every later program as NOT RUN. The terminator now sets a flag in the device context and
+  `exit`s, which also ends the thread inside a called function. The run reports `assertion failed`
+  as the interpreter does when an `assert(false)` came first, and the interpreter's
+  ``execution reached `unreachable` `` for a bare one.
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

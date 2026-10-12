@@ -1000,7 +1000,8 @@ analysis models (such an enum, or a struct or tuple holding one) is therefore no
 every test, and the forged value takes no arm. A value `match` then stops the program like a failed
 `assert`, naming the `match`: `error: assertion failed: no `match` arm matched its value at
 <file>:<line>:<col>`, exit 1, on every CPU backend (`tests/run/match_no_arm_trap.wk`; the native
-backend used to execute a hardware trap there, which killed the process).
+backend used to execute a hardware trap there, which killed the process). 🟡 `--backend=gpu-native`
+stops there too, with a bare `assertion failed` (it used to fail the launch with a CUDA error).
 
 ## Tuples and structs ✅
 

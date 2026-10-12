@@ -35,7 +35,8 @@ traps through `assert` and names the builtin call), a value `match` no arm of wh
 slice index out of bounds, a range index and `str_from_utf8`
 (`crates/wukongc/tests/runtime_sites.rs`). 🟡 `--backend=gpu-native` still reports a bare
 `assertion failed`: it keeps one assert-failed flag on the device and is handed a copy of the
-program without the site operands (`wukong_opt::strip_assert_sites`).
+program without the site operands (`wukong_opt::strip_assert_sites`). It stops at a `match` no arm
+matched as well, rather than failing the launch with a CUDA error.
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 `--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` picks the instruction-set level of that

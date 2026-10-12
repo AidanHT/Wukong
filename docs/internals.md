@@ -708,7 +708,12 @@ into when no arm matched (`emit_match_fallthrough_trap`, the `match`; its messag
 compiler-made placeholder `attach_sites` turns into a blob, and the block keeps its
 `unreachable`). `--backend=gpu-native` keeps one device assert flag and declines a `GlobalAddr`, so
 the driver hands it a copy stripped of the site and message operands
-(`wukong_opt::strip_assert_sites`). `Op::VecKernelCall` — a call into a synthesized 256-bit
+(`wukong_opt::strip_assert_sites`). It lowers a reached `unreachable` to a store of the device
+context's unreachable flag and an `exit` (`FnEmit::emit_unreachable_stop`), never to `trap`, which
+fails the launch with a sticky CUDA error that loses the context for the rest of the process.
+`decode_ctx` reads the assert flag first, so the match fall-through reports `assertion failed` as
+the interpreter does, and a bare `unreachable` reports the interpreter's own
+``execution reached `unreachable` ``. `Op::VecKernelCall` — a call into a synthesized 256-bit
 AVX2 kernel — is covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
