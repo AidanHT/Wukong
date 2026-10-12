@@ -2756,6 +2756,7 @@ fn parallel_spec<'a>(
         sema,
         interner,
         alias_free: gemm.alias_free,
+        memo: None,
     })
     .block(body)
     {
@@ -2858,6 +2859,7 @@ fn parallel_spec<'a>(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -2933,6 +2935,7 @@ fn is_batched_norm_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -2990,6 +2993,7 @@ fn is_bias_bcast_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -3073,6 +3077,7 @@ fn lower_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn,
         vec_loads: HashMap::default(),
@@ -3400,6 +3405,7 @@ fn lower_parallel(
             field_bases: vec![HashMap::default()],
             terminated: false,
             loops: Vec::new(),
+            bias_memo: Default::default(),
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::default(),
@@ -3506,6 +3512,7 @@ fn lower_parallel(
             field_bases: vec![HashMap::default()],
             terminated: false,
             loops: Vec::new(),
+            bias_memo: Default::default(),
             gemm,
             parallel_fn: false,
             vec_loads: HashMap::default(),
@@ -4351,6 +4358,10 @@ struct FnLowerer<'a> {
     /// labeled `break`/`continue` `'l` searches this stack for the matching label; an unlabeled one
     /// targets the innermost (the top).
     loops: Vec<(Option<Symbol>, wukong_mir::BlockId, wukong_mir::BlockId)>,
+    /// The loops and blocks the GEMM bias-alias preflight has already proven clean, keyed by
+    /// address and scoped to the `lower_for` call whose borrow keeps them alive, so each node is
+    /// walked once rather than once per enclosing loop (`bias_memo.rs`).
+    bias_memo: bias_memo::BiasAliasMemo,
     /// Every pre-interned `wukong_runtime` symbol any recognizer can lower to — not just the GEMM
     /// family. Interned once at the top of [`lower_program`] and copied down, because `FnLowerer`
     /// holds only a shared `&Interner` and cannot mint a name itself.
@@ -6170,12 +6181,10 @@ impl FnLowerer<'_> {
             // Keep both consumed statements in source order when the epilogue
             // rereads output as bias, even with recognition disabled. Declining
             // fusion alone would still allow an inner loop to be outlined.
-            if (GemmBiasAlias {
-                sema: self.sema,
-                interner: self.interner,
-                alias_free: self.gemm.alias_free,
-            })
-            .window(&b.stmts[i..])
+            // An enclosing loop's preflight walk that proved this block clean
+            // probed every one of its windows already (`bias_memo.rs`).
+            if !self.bias_memo.block_clean(b, self.gemm.alias_free)
+                && self.bias_alias().window(&b.stmts[i..])
             {
                 let (parallel, recognize) = (self.parallel_fn, self.gemm.recognize);
                 self.parallel_fn = false;
@@ -14238,6 +14247,20 @@ impl FnLowerer<'_> {
         true
     }
 
+    /// The GEMM bias-alias preflight over this lowerer's memo (see [`GemmBiasAlias`]).
+    fn bias_alias(&self) -> GemmBiasAlias<'_> {
+        GemmBiasAlias {
+            sema: self.sema,
+            interner: self.interner,
+            alias_free: self.gemm.alias_free,
+            memo: Some(&self.bias_memo),
+        }
+    }
+
+    /// Lower one `for` loop ([`Self::lower_for_scoped`]) as one scope of the bias-alias memo:
+    /// every entry the preflight records meanwhile names a node reachable from `pat` / `iter` /
+    /// `body`, which this borrow keeps alive and unchanged, and is released on the way out, before
+    /// any temporary those nodes belong to can be dropped and its address reused (`bias_memo.rs`).
     fn lower_for(
         &mut self,
         label: Option<Symbol>,
@@ -14246,13 +14269,22 @@ impl FnLowerer<'_> {
         body: &Block,
         stmt_attrs: &[ast::Attr],
     ) {
+        let mark = self.bias_memo.mark();
+        self.lower_for_scoped(label, pat, iter, body, stmt_attrs);
+        self.bias_memo.release(mark);
+    }
+
+    fn lower_for_scoped(
+        &mut self,
+        label: Option<Symbol>,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+        stmt_attrs: &[ast::Attr],
+    ) {
+        // A loop an enclosing loop's walk already proved clean is answered from the memo.
         if (self.parallel_fn || self.gemm.recognize)
-            && (GemmBiasAlias {
-                sema: self.sema,
-                interner: self.interner,
-                alias_free: self.gemm.alias_free,
-            })
-            .loop_or_body(pat, iter, body)
+            && self.bias_alias().loop_or_body(pat, iter, body)
         {
             let (parallel, recognize) = (self.parallel_fn, self.gemm.recognize);
             self.parallel_fn = false;
@@ -15977,6 +16009,7 @@ impl FnLowerer<'_> {
                 field_bases: vec![HashMap::default()],
                 terminated: false,
                 loops: Vec::new(),
+                bias_memo: Default::default(),
                 // A fresh function starts with no alias-versioning context: a guard state belongs to
                 // the builder that opened it (`kernel_guard.rs`), never to an outlined body.
                 gemm: GemmSyms {
@@ -28169,13 +28202,24 @@ fn recognize_matmul<'a>(
         .or_else(|| detile::match_matmul_ijk_cseed(pat, iter, body, sema, interner))
 }
 
+// The address-keyed memo that walks each loop once for the GEMM bias-alias preflight below,
+// instead of once per enclosing loop (see the module docs). Declared beside its one user, not with
+// the other `mod`s at the top, so it does not collide with the modules other branches add there.
+mod bias_memo;
+#[cfg(test)]
+mod bias_memo_tests;
+
 /// Source-only preflight for a recognized GEMM whose bias can overlap its output.
 /// Visit enclosing blocks too: outlining a batch first would hide the dependency
 /// from the inner loop's decline. This is not a general alias/dependence analysis.
+///
+/// With a `memo` (every `FnLowerer` probe; see `bias_memo.rs`), a loop or block an earlier walk
+/// in scope proved clean is not walked again, and every clean one this walk reaches is recorded.
 struct GemmBiasAlias<'a> {
     sema: &'a SemaResult,
     interner: &'a Interner,
     alias_free: bool,
+    memo: Option<&'a bias_memo::BiasAliasMemo>,
 }
 
 impl GemmBiasAlias<'_> {
@@ -28184,11 +28228,22 @@ impl GemmBiasAlias<'_> {
     }
 
     fn loop_or_body(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
-        recognize_matmul(pat, iter, body, self.sema, self.interner)
+        if self
+            .memo
+            .is_some_and(|m| m.loop_clean(pat, iter, body, self.alias_free))
+        {
+            return false;
+        }
+        bias_memo::count_probe();
+        let overlap = recognize_matmul(pat, iter, body, self.sema, self.interner)
             .is_some_and(|nest| self.overlaps(nest.c, nest.bias.as_ref().map(|(base, _)| *base)))
             || match_matmul_residual(pat, iter, body, self.sema, self.interner)
                 .is_some_and(|(nest, bias, _)| self.overlaps(nest.c, bias))
-            || self.block(body)
+            || self.block(body);
+        if let (false, Some(m)) = (overlap, self.memo) {
+            m.record_loop(pat, iter, body, self.alias_free);
+        }
+        overlap
     }
 
     fn window(&self, stmts: &[Stmt]) -> bool {
@@ -28201,6 +28256,7 @@ impl GemmBiasAlias<'_> {
         else {
             return false;
         };
+        bias_memo::count_probe();
         // Match only the GEMM + epilogue dependency; no MIR or scope state is
         // changed. Being conservative about other fusion eligibility is safe:
         // these two source loops still require ordered bias reads.
@@ -28223,9 +28279,19 @@ impl GemmBiasAlias<'_> {
     }
 
     fn block(&self, block: &Block) -> bool {
-        block.stmts.windows(2).any(|s| self.window(s))
+        if self
+            .memo
+            .is_some_and(|m| m.block_clean(block, self.alias_free))
+        {
+            return false;
+        }
+        let overlap = block.stmts.windows(2).any(|s| self.window(s))
             || block.stmts.iter().any(|s| self.stmt(s))
-            || block.tail.as_ref().is_some_and(|e| self.expr(e))
+            || block.tail.as_ref().is_some_and(|e| self.expr(e));
+        if let (false, Some(m)) = (overlap, self.memo) {
+            m.record_block(block, self.alias_free);
+        }
+        overlap
     }
 
     fn stmt(&self, stmt: &Stmt) -> bool {
@@ -30489,6 +30555,7 @@ fn lower_matmul_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -32219,6 +32286,7 @@ fn xent_bwd_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -32271,6 +32339,7 @@ fn xent_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -32331,6 +32400,7 @@ fn logsumexp_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -32479,6 +32549,7 @@ fn probe_single_for(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
@@ -33514,6 +33585,7 @@ fn lower_i8matmul_fn(
         field_bases: vec![HashMap::default()],
         terminated: false,
         loops: Vec::new(),
+        bias_memo: Default::default(),
         gemm,
         parallel_fn: false,
         vec_loads: HashMap::default(),
