@@ -887,8 +887,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `if`/`else` of stores, up to 8 blocks -- when the vectorizer would not lose a loop to it),
   **loop unswitching** and
   **induction-variable range splitting** of guarded loop bodies (`-O2`, also past a bounds-check
-  trap or `break`, and on guards derived from the counter -- `i + 1 < n`, the tile edge
-  `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap), and **partial loop unrolling** (4×, with a
+  trap or `break`, on guards derived from the counter -- `i + 1 < n`, the tile edge
+  `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap, and on loops whose calls sit
+  in one guarded arm, `if dbg { print(i) }`, whose call-free copy then widens), and **partial loop unrolling** (4×, with a
   wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
   serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a
   float reduction). Guarded by an `-O0`-vs-`-O{1,2,3}` differential
@@ -1456,6 +1457,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   fused into a branching one gives up the 4x partial unroll, which takes two-block loops only. Two
   widenable loops of which either branches fuse only when the fused body still widens, so two
   `if`/`else` store loops (each if-converted to one store address of its own) stay apart.
+
+- **A call keeps its loop whole unless one guarded arm holds it** (2026-10-12). Unswitching and
+  IV-range splitting clone a loop holding calls only when one arm, which the decided condition kills
+  in one copy, dominates every call. A call every iteration makes, calls on both arms of the
+  branch, or a call under an `and`/`or` of which the condition is only one operand keep the loop in
+  one piece, and the call's "may touch any memory" verdict keeps it scalar. The copy that keeps the
+  calls stays scalar too.
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and

@@ -59,10 +59,23 @@
 //! edges, so this is restricted to loops whose values reach the code after them only through exit
 //! edge arguments.
 //!
+//! # Calls
+//!
+//! A call in the loop -- a guarded diagnostic `if dbg { print(i) }`, or work done only for a prefix
+//! of the iterations, `if i < m { log(i) }` -- keeps the dependence verdict "a call may touch any
+//! memory" in every iteration, and with it the whole loop scalar. Cloning such a loop is exact (each
+//! iteration still runs in exactly one copy, in order), but a call must never be *duplicated*: two
+//! live copies would double the code of every dispatched kernel. So a loop holding a call is
+//! rewritten only on a condition that decides, in one of the two copies, to skip an arm holding
+//! every call ([`calls_confined_to_one_arm`]): there the arm is dead and simplify-cfg deletes it,
+//! leaving a call-free copy the vectorizer can widen, and the calls live on in the other copy only.
+//! A call outside such an arm -- unguarded, on both arms, or under an `and`/`or` the condition is
+//! only an operand of -- still blocks the rewrite.
+//!
 //! # Limits
 //!
-//! Innermost loops with a preheader and no `alloca`, call, vector-kernel call or barrier (a call
-//! would be duplicated, and with it any dispatched kernel), at most [`MAX_LOOP_INSTS`]
+//! Innermost loops with a preheader and no `alloca`, vector-kernel call, barrier or atomic, and no
+//! call except under an arm the rewrite kills in one copy (see above), at most [`MAX_LOOP_INSTS`]
 //! instructions, in a function under [`MAX_FUNCTION_INSTS`]; a loop fed by an already-vectorized
 //! loop (its scalar epilogue) is left alone. Each rewrite removes its condition from both copies, so
 //! every loop is rewritten at most once per guard it holds, and the function cap bounds the total.
@@ -105,11 +118,15 @@ impl Pass for LoopUnswitch {
             {
                 break;
             }
-            let forest = {
+            let (forest, idom, preds) = {
                 let (idom, preds) = cache.idoms_and_preds(f);
-                loop_info::structure_with(f, idom, preds)
+                (
+                    loop_info::structure_with(f, idom, preds),
+                    idom.to_vec(),
+                    preds.to_vec(),
+                )
             };
-            let Some(plan) = pick(f, forest) else {
+            let Some(plan) = pick(f, forest, &idom, &preds) else {
                 break;
             };
             match plan {
@@ -350,41 +367,44 @@ fn op_of<'a>(f: &'a Function, defs: &[Option<(usize, usize)>], v: ValueId) -> Op
     Some(&f.blocks[b].insts[i].op)
 }
 
-/// Does this loop qualify for duplication at all (see the module's limits)?
-fn clonable(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> bool {
+/// Does this loop qualify for duplication at all (see the module's limits)? `Some(has_calls)` when
+/// it does: a loop holding an [`Op::Call`] may still be cloned, but only by a rewrite that leaves
+/// every call in one copy ([`calls_confined_to_one_arm`]).
+fn clonable(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> Option<bool> {
     if l.preheader.is_none() || !l.children.is_empty() {
-        return false;
+        return None;
     }
     let mut n = 0;
+    let mut has_calls = false;
     for b in &l.blocks {
         let blk = f.block(*b);
         if blk.params.iter().any(|p| f.value_type(*p).is_vector())
             || matches!(blk.term, Terminator::Switch { .. })
         {
-            return false;
+            return None;
         }
         for inst in &blk.insts {
             n += 1;
-            if matches!(
-                inst.op,
+            match inst.op {
+                Op::Call { .. } => has_calls = true,
                 Op::Alloca { .. }
-                    | Op::Call { .. }
-                    | Op::VecKernelCall { .. }
-                    | Op::Barrier
-                    | Op::AtomicAdd { .. }
-            ) || inst.result.is_some_and(|r| f.value_type(r).is_vector())
-            {
-                return false;
+                | Op::VecKernelCall { .. }
+                | Op::Barrier
+                | Op::AtomicAdd { .. } => return None,
+                _ => {}
+            }
+            if inst.result.is_some_and(|r| f.value_type(r).is_vector()) {
+                return None;
             }
         }
     }
     if n > MAX_LOOP_INSTS || func_insts(f) + n > MAX_FUNCTION_INSTS {
-        return false;
+        return None;
     }
     // The scalar epilogue of a loop the vectorizer already widened is entered from that loop's
     // exit; it is the remainder, not a loop worth duplicating.
     let ph = l.preheader.expect("checked above");
-    !forest.loops.iter().any(|v| {
+    let epilogue = forest.loops.iter().any(|v| {
         v.id != l.id
             && v.exits.iter().any(|&(_, to)| to == ph)
             && v.blocks.iter().any(|b| {
@@ -395,6 +415,80 @@ fn clonable(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> bool {
                         .iter()
                         .any(|i| i.result.is_some_and(|r| f.value_type(r).is_vector()))
             })
+    });
+    (!epilogue).then_some(has_calls)
+}
+
+/// The idom of an unreachable block.
+const NO_IDOM: u32 = u32::MAX;
+
+/// Does block `a` dominate block `b`? `false` when `b` is unreachable.
+fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
+    if idom.get(b as usize).copied().unwrap_or(NO_IDOM) == NO_IDOM {
+        return false;
+    }
+    let mut x = b;
+    loop {
+        if x == a {
+            return true;
+        }
+        let id = idom[x as usize];
+        if id == x || id == NO_IDOM {
+            return false;
+        }
+        x = id;
+    }
+}
+
+/// Will deciding `decided` leave every call of the loop in **one** copy? That holds when a body
+/// block `bb` branches on exactly `decided` (not on an `and`/`or` it is an operand of, which may stay
+/// undecided in one copy) into an arm `A` -- a loop block other than the latch, entered only from
+/// `bb` -- that dominates every block holding a call. Each copy assumes `decided` constant, so in one
+/// of them `bb` never enters `A`: `A` and everything it dominates, every call included, is dead
+/// there, and simplify-cfg deletes it. The other copy keeps the calls, in iteration order, for
+/// exactly the iterations it runs, so no call is duplicated, dropped or reordered.
+fn calls_confined_to_one_arm(
+    f: &Function,
+    l: &NaturalLoop,
+    idom: &[u32],
+    preds: &[Vec<u32>],
+    decided: ValueId,
+) -> bool {
+    let call_blocks: Vec<u32> = l
+        .blocks
+        .iter()
+        .filter(|b| {
+            f.block(**b)
+                .insts
+                .iter()
+                .any(|i| matches!(i.op, Op::Call { .. }))
+        })
+        .map(|b| b.0)
+        .collect();
+    l.blocks.iter().any(|&bb| {
+        if bb == l.header {
+            return false;
+        }
+        let Terminator::CondBr {
+            cond,
+            then_blk,
+            else_blk,
+            ..
+        } = &f.block(bb).term
+        else {
+            return false;
+        };
+        if *cond != decided || then_blk == else_blk {
+            return false;
+        }
+        [*then_blk, *else_blk].into_iter().any(|arm| {
+            l.blocks.contains(&arm)
+                && !l.latches.contains(&arm)
+                && preds
+                    .get(arm.0 as usize)
+                    .is_some_and(|p| p.as_slice() == [bb.0])
+                && call_blocks.iter().all(|&c| dominates(arm.0, c, idom))
+        })
     })
 }
 
@@ -411,19 +505,19 @@ fn branch_conditions(f: &Function, defs: &[Option<(usize, usize)>], cond: ValueI
     out
 }
 
-/// The first rewrite any innermost loop admits, innermost first.
-fn pick(f: &Function, mut forest: LoopForest) -> Option<Plan> {
+/// The first rewrite any innermost loop admits, innermost first. `idom` and `preds` describe `f`.
+fn pick(f: &Function, mut forest: LoopForest, idom: &[u32], preds: &[Vec<u32>]) -> Option<Plan> {
     if forest.is_empty() {
         return None;
     }
     let defs = def_sites(f);
     for id in forest.innermost_first() {
         let idx = id.0 as usize;
-        {
+        let has_calls = {
             let l = forest.get(id);
-            if !clonable(f, &forest, l) {
+            let Some(has_calls) = clonable(f, &forest, l) else {
                 continue;
-            }
+            };
             // Something to decide: a two-way branch in the body.
             let any_guard = l.blocks.iter().any(|b| {
                 *b != l.header
@@ -433,7 +527,8 @@ fn pick(f: &Function, mut forest: LoopForest) -> Option<Plan> {
             if !any_guard {
                 continue;
             }
-        }
+            has_calls
+        };
         loop_info::analyze_one(f, &mut forest, idx, Stages::Ivs);
         let outer = outer_ivs(f, &defs, &mut forest, id);
         let l = forest.get(id);
@@ -449,11 +544,18 @@ fn pick(f: &Function, mut forest: LoopForest) -> Option<Plan> {
             defs: &defs,
             outer: &outer,
         };
+        // A call is cloned only by a rewrite that keeps it in one copy.
+        let confined =
+            |decided: ValueId| !has_calls || calls_confined_to_one_arm(f, l, idom, preds, decided);
         if let Some(p) = plan_split(f, l, &defs, &in_loop, &defined, &ranges) {
-            return Some(Plan::Split(p));
+            if confined(p.guard) {
+                return Some(Plan::Split(p));
+            }
         }
         if let Some(p) = plan_unswitch(f, l, &defs, &in_loop, &defined) {
-            return Some(Plan::Unswitch(p));
+            if confined(p.cond) {
+                return Some(Plan::Unswitch(p));
+            }
         }
     }
     None
@@ -2239,5 +2341,279 @@ mod tests {
             "{}",
             wukong_mir::print::print_function(tile, &interner)
         );
+    }
+
+    // ---- loops holding calls ----
+
+    /// Lower `src`, optimize it at `-O0` and `-O2` through the whole optimizer, check that both
+    /// print the same, and return the `-O2` program.
+    fn o0_against_o2(src: &str, interner: &mut Interner) -> Program {
+        let (module, parse) = wukong_parser::parse_module(src, SourceId(0), interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let main = interner.intern("main");
+        let mut outputs = Vec::new();
+        let mut last = None;
+        for level in [0u8, 2] {
+            let mut optimized = program.clone();
+            crate::optimize(&mut optimized, level);
+            assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, main, interner).unwrap();
+            assert_eq!(exit, 0);
+            outputs.push(String::from_utf8(stdout).unwrap());
+            last = Some(optimized);
+        }
+        assert!(!outputs[0].is_empty());
+        assert_eq!(outputs[0], outputs[1]);
+        last.unwrap()
+    }
+
+    /// How many calls to `callee` `f` makes, and whether it computes anything vector-typed.
+    fn calls_and_vectors(f: &Function, callee: wukong_span::Symbol) -> (usize, bool) {
+        let calls = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(&i.op, Op::Call { func, .. } if *func == callee))
+            .count();
+        (calls, f.value_types.iter().any(MirType::is_vector))
+    }
+
+    /// A diagnostic call under a loop-invariant flag: the loop is unswitched on the flag, the copy
+    /// where it is false has no call, and the vectorizer widens that copy. The call itself is not
+    /// duplicated -- it lives on in the flag-true copy only -- and both flag values print what the
+    /// scalar loop prints, at `-O0` and `-O2`. (`k` and `again` call each other, which keeps `k` out
+    /// of line, where its `@noalias` output keeps its promise.)
+    #[test]
+    fn an_invariant_guarded_call_is_unswitched_and_the_free_copy_widens() {
+        let src = concat!(
+            "fn k(@noalias mut o: [f32; 37], a: [f32; 37], n: i64, dbg: bool, d: i64) { ",
+            "if d > 0 { again(d - 1); return; } ",
+            "let mut i: i64 = 0; ",
+            "while i < n { if dbg { print(i); } o[i] = a[i] * 2.0 + 1.0; i = i + 1; } }\n",
+            "fn again(d: i64) { let a: [f32; 37] = [0.0; 37]; let mut o: [f32; 37] = [0.0; 37]; ",
+            "k(o, a, 0, false, d); }\n",
+            "fn main() -> i32 { let mut a: [f32; 37] = [0.0; 37]; let mut o: [f32; 37] = [0.0; 37]; ",
+            "let mut j: i64 = 0; while j < 37 { a[j] = (j as f32) - 18.0; j = j + 1; } ",
+            "k(o, a, 37, true, 0); ",
+            "j = 0; while j < 37 { print(o[j] as i64); o[j] = 0.0 - 99.0; j = j + 1; } ",
+            "k(o, a, 37, false, 0); ",
+            "j = 0; while j < 37 { print(o[j] as i64); j = j + 1; } ",
+            "k(o, a, 5, true, 0); ",
+            "j = 0; while j < 37 { print(o[j] as i64); j = j + 1; } return 0; }\n",
+        );
+        let mut interner = Interner::new();
+        let optimized = o0_against_o2(src, &mut interner);
+        let k = optimized
+            .function(interner.intern("k"))
+            .expect("kept out of line");
+        let (prints, widened) = calls_and_vectors(k, interner.intern("print"));
+        assert_eq!(
+            (prints, widened),
+            (1, true),
+            "{}",
+            wukong_mir::print::print_function(k, &interner)
+        );
+    }
+
+    /// A call made only for a prefix of the iterations (`if i < m`, `m` a parameter): the loop is
+    /// split at `m`, the `[m, n)` half has no call and widens, and the call is not duplicated.
+    #[test]
+    fn a_prefix_guarded_call_is_split() {
+        let src = concat!(
+            "fn k(@noalias mut o: [f32; 37], a: [f32; 37], n: i64, m: i64, d: i64) { ",
+            "if d > 0 { again(d - 1); return; } ",
+            "let mut i: i64 = 0; ",
+            "while i < n { if i < m { print(i); } o[i] = a[i] * 2.0 + 1.0; i = i + 1; } }\n",
+            "fn again(d: i64) { let a: [f32; 37] = [0.0; 37]; let mut o: [f32; 37] = [0.0; 37]; ",
+            "k(o, a, 0, 0, d); }\n",
+            "fn main() -> i32 { let mut a: [f32; 37] = [0.0; 37]; let mut o: [f32; 37] = [0.0; 37]; ",
+            "let mut j: i64 = 0; while j < 37 { a[j] = (j as f32) - 18.0; j = j + 1; } ",
+            "let ms: [i64; 4] = [0, 5, 37, 50]; let ns: [i64; 4] = [37, 36, 35, 34]; ",
+            "for q in 0..4 { j = 0; while j < 37 { o[j] = 0.0 - 99.0; j = j + 1; } ",
+            "k(o, a, ns[q], ms[q], 0); ",
+            "j = 0; while j < 37 { print(o[j] as i64); j = j + 1; } } return 0; }\n",
+        );
+        let mut interner = Interner::new();
+        let optimized = o0_against_o2(src, &mut interner);
+        let k = optimized
+            .function(interner.intern("k"))
+            .expect("kept out of line");
+        let (prints, widened) = calls_and_vectors(k, interner.intern("print"));
+        assert_eq!(
+            (prints, widened),
+            (1, true),
+            "{}",
+            wukong_mir::print::print_function(k, &interner)
+        );
+    }
+
+    /// Where the call of [`call_loop`] sits.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum CallAt {
+        /// In the flag's `then` arm only: confined to one arm.
+        Arm,
+        /// In the latch, which every iteration runs.
+        Unguarded,
+        /// In both arms of the flag's branch.
+        BothArms,
+        /// In the `then` arm, but the branch tests `flag && (acc is odd)`.
+        AndOperand,
+        /// No call: a barrier in the `then` arm.
+        Barrier,
+    }
+
+    /// `f(n, x, y) -> i32` over `0..n`, a loop-invariant `flag = x > 0` guarding an
+    /// order-dependent update, with a `print` (or a barrier) placed by `at`:
+    ///
+    /// ```text
+    ///   entry: flag = x > 0; br H(0, y)
+    ///   H(j, acc):  cond_br (j < n), B, X(acc)
+    ///   B:          cond_br flag, T, E          (AndOperand: flag && acc & 1 != 0)
+    ///   T:          [print j]; br L(acc * 3 + j)
+    ///   E:          [print j + 100]; br L(acc)  (a call only for BothArms)
+    ///   L(p):       [print j]; br H(j + 1, p)   (a call only for Unguarded)
+    ///   X(r):       ret r
+    /// ```
+    fn call_loop(it: &mut Interner, at: CallAt) -> Function {
+        let print = it.intern("print");
+        let mut b = Builder::new(it.intern("f"), MirType::I32);
+        let n = b.add_param(MirType::I32);
+        let x = b.add_param(MirType::I32);
+        let y = b.add_param(MirType::I32);
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        let flag = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, x, zero));
+        let h = b.new_block();
+        let j = b.block_param(h, MirType::I32);
+        let acc = b.block_param(h, MirType::I32);
+        let body = b.new_block();
+        let then = b.new_block();
+        let els = b.new_block();
+        let latch = b.new_block();
+        let p = b.block_param(latch, MirType::I32);
+        let exit_blk = b.new_block();
+        let r = b.block_param(exit_blk, MirType::I32);
+        let say = |b: &mut Builder, v: ValueId| {
+            b.build_void(Op::Call {
+                func: print,
+                args: vec![v],
+            });
+        };
+        b.br(h, vec![zero, y]);
+        b.switch_to(h);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, j, n));
+        b.cond_br(c, body, vec![], exit_blk, vec![acc]);
+        b.switch_to(body);
+        let g = if at == CallAt::AndOperand {
+            let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+            let bit = b.build(MirType::I32, Op::Bin(BinOp::And, acc, one));
+            let odd = b.build(MirType::I1, Op::Cmp(CmpOp::Ne, bit, zero));
+            b.build(MirType::I1, Op::Bin(BinOp::And, flag, odd))
+        } else {
+            flag
+        };
+        b.cond_br(g, then, vec![], els, vec![]);
+        b.switch_to(then);
+        match at {
+            CallAt::Arm | CallAt::BothArms | CallAt::AndOperand => say(&mut b, j),
+            CallAt::Barrier => b.build_void(Op::Barrier),
+            CallAt::Unguarded => {}
+        }
+        let three = b.build(MirType::I32, Op::ConstInt(3, MirType::I32));
+        let m = b.build(MirType::I32, Op::Bin(BinOp::Mul, acc, three));
+        let s = b.build(MirType::I32, Op::Bin(BinOp::Add, m, j));
+        b.br(latch, vec![s]);
+        b.switch_to(els);
+        if at == CallAt::BothArms {
+            let hundred = b.build(MirType::I32, Op::ConstInt(100, MirType::I32));
+            let jh = b.build(MirType::I32, Op::Bin(BinOp::Add, j, hundred));
+            say(&mut b, jh);
+        }
+        b.br(latch, vec![acc]);
+        b.switch_to(latch);
+        if at == CallAt::Unguarded {
+            say(&mut b, j);
+        }
+        let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let j2 = b.build(MirType::I32, Op::Bin(BinOp::Add, j, one));
+        b.br(h, vec![j2, p]);
+        b.switch_to(exit_blk);
+        b.ret(Some(r));
+        b.finish()
+    }
+
+    const CALL_INPUTS: [(i128, i128, i128); 6] = [
+        (0, 1, 5),
+        (4, 1, 5),
+        (4, -1, 5),
+        (6, 3, 2),
+        (6, 0, 2),
+        (1, 2, 9),
+    ];
+
+    /// The positive control for the refusals below: a call in one arm of an invariant branch is
+    /// unswitched, every printed line (the calls' own, in order, and each result) is unchanged, and
+    /// after cleanup the function holds the call exactly once.
+    #[test]
+    fn a_call_confined_to_one_arm_is_unswitched_once() {
+        let mut it = Interner::new();
+        let mut f = call_loop(&mut it, CallAt::Arm);
+        let before = run3(&f, &mut it, &CALL_INPUTS);
+        assert!(LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        assert_eq!(run3(&f, &mut it, &CALL_INPUTS), before);
+        cleanup(&mut f);
+        let print = it.intern("print");
+        assert_eq!(
+            calls_and_vectors(&f, print).0,
+            1,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        assert_eq!(run3(&f, &mut it, &CALL_INPUTS), before);
+    }
+
+    /// A call every iteration makes would be duplicated by any copy: no rewrite.
+    #[test]
+    fn an_unguarded_call_still_blocks_cloning() {
+        let mut it = Interner::new();
+        let mut f = call_loop(&mut it, CallAt::Unguarded);
+        assert!(!LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
+    }
+
+    /// Calls on both arms of the branch: whichever way the copy decides, a call stays live in it.
+    #[test]
+    fn calls_on_both_arms_block_cloning() {
+        let mut it = Interner::new();
+        let mut f = call_loop(&mut it, CallAt::BothArms);
+        assert!(!LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
+    }
+
+    /// The branch tests `flag && odd`: unswitching on `flag` decides the branch only in one copy,
+    /// so the arm is not proved dead in either -- the condition must be exactly the decided value.
+    #[test]
+    fn a_call_under_an_and_operand_guard_is_not_cloned() {
+        let mut it = Interner::new();
+        let mut f = call_loop(&mut it, CallAt::AndOperand);
+        assert!(!LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
+        // The same loop branching on the flag alone is unswitched: the `and` is what blocks it.
+        let mut g = call_loop(&mut it, CallAt::Arm);
+        assert!(LoopUnswitch.run_function(&mut g, &mut CfgAnalyses::default()));
+    }
+
+    /// A barrier, unlike a call, is never cloned, even confined to one arm.
+    #[test]
+    fn a_barrier_still_blocks_cloning() {
+        let mut it = Interner::new();
+        let mut f = call_loop(&mut it, CallAt::Barrier);
+        assert!(f
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Barrier))));
+        assert!(!LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
     }
 }
