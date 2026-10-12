@@ -222,8 +222,9 @@ impl Sema<'_> {
                 span,
                 "E0411",
                 "a function type is only allowed as the type of a function parameter (bind it to a \
-                 named function at each call); it cannot be a local, field, element, return \
-                 value or `extern` parameter",
+                 named function or a closure at each call) or as the annotation of a `let` that \
+                 binds a closure; it cannot be another local, a field, element, return value or \
+                 `extern` parameter",
             );
         }
         let params: Vec<Ty> = params.iter().map(|p| self.lower_type(p)).collect();

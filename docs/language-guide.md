@@ -163,10 +163,12 @@ like a type-generic function is per type (`apply$square`), the function paramete
 and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
 type-generic higher-order function binds its type parameters from the function argument too
 (`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
-type is only a parameter's type (not a local, field, element, return type or `extern` parameter); a
-function cannot be bound to a `let` or passed to a non-function parameter; the argument must name a
-function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
-(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. A parameter whose type
+type is only a parameter's type, or the annotation of a `let` that binds a closure
+(`let f: fn(f32) -> f32 = |x| x * k;`, see [Closures](#closures-)) — not another local's, a field's,
+an element's, a return type or an `extern` parameter's; a named function cannot be bound to a `let`
+(a closure can) or passed to a non-function parameter; the argument must name a function, not
+compute one; and a function-typed parameter is neither `mut` nor named after a builtin (`gelu`,
+`print`, …). A wrong signature is the ordinary `E0401` type mismatch. A parameter whose type
 names a dimension generic of the callee (`fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])`)
 accepts a function of the extent the call binds: from the function itself (`fn head(t: Tensor[f32, 4])`
 binds `N = 4`) or from another argument, the first binding winning and every other argument checked

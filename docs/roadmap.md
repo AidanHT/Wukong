@@ -83,7 +83,8 @@ line table built from them is not emitted yet.
   reference) lower to the plain function `Type.method`; `trait` + `impl Trait for Type` are checked
   for conformance (`E0410`), and a bounded type parameter (`<T: Shape>` / `where T: Shape`) calls
   trait methods through monomorphization; a `fn(A) -> R` parameter is specialized per bound
-  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
+  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter
+  or a closure `let`'s annotation).
   Calls such a specialization makes are invisible to the alias analysis, so every function they can
   reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
 - **Closures** (2026-10-12, `gap5/closures`). `|x| x * k`, `|| 0`, `|x: f32| -> f32 { .. }` passed to
@@ -92,7 +93,10 @@ line table built from them is not emitted yet.
   specialized per closure (`apply$main$closure$0`), so a call through the parameter stays a direct
   call with no function pointer (interp and native, every `-O`; `tests/run/closures.wk`). `E0418`
   for an uncopyable capture, `E0419` for a parameter type a callee generic leaves open, `E0411`
-  outside a call argument, `E0304` for assigning a capture. See the guide's "Closures".
+  outside a call argument (a `let` initializer too since `gap6/closures-escaping`, below), and
+  `E0304` for writing a capture of an immutable binding — a write to a mutable one is a
+  by-reference capture since `gap6/closures-escaping`, where `gap5` rejected every capture write.
+  See the guide's "Closures".
 - **Closures beyond the call argument** (2026-10-13, `gap6/closures-escaping`). A closure bound by
   `let` (`let f = |x: f32| x * k;`) is called (`f(2.0)`) and passed (`apply(f, 3.0)`) with its
   captures copied once, at the `let`, and every use resolved statically (`E0421` for any other use,
@@ -1535,9 +1539,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   type is not a field, element or return type. A closure argument of a call through a trait bound
   is not supported (a trait method cannot declare a function-typed parameter). A slice, `str`,
   tensor or vector cannot be captured (`E0418`; capture a pointer), nor the enclosing function's
-  function-typed parameter. Inference of an unannotated parameter from the call's other arguments
-  never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2, 3)` binds `T = i32` from the
-  literals, whatever the result is assigned to.
+  function-typed parameter, nor a `for` counter whose bound is of a generic type (its storage width
+  is per instance; copy it to a local first). Inference of an unannotated parameter from the call's
+  other arguments never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2, 3)` binds
+  `T = i32` from the literals, whatever the result is assigned to.
 
 - **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
   only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an
