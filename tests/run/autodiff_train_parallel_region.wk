@@ -1,0 +1,59 @@
+// RUN: --train --grad-wrt=0 --train-steps=3 --train-lr=0.25 --train-seed=17
+// EXPECT-EXIT: 0
+// EXPECT-OUT: train: 3 step(s), lr=0.25, optimizer=sgd
+// EXPECT-OUT: step    0: loss 0.230797
+// EXPECT-OUT: step    1: loss 0.057699
+// EXPECT-OUT: step    2: loss 0.014425
+// EXPECT-OUT: step    3: loss 0.003606
+// EXPECT-OUT: loss 0.230797 -> 0.003606  (64.00x reduction)
+module tests.run.autodiff_train_parallel_region
+
+// `--train` end to end through a `@parallel` loop REGION (N87). The loop over `i` outlines into a
+// `wukong_parallel_for` region (each iteration writes its own `h[i]`; `w[2i]` is strided, so no
+// elementwise kernel takes it first), and its backward is a region too: one iteration recomputed
+// and differentiated per index, with the adjoint of `w` -- which EVERY iteration reads through
+// `w[8]` -- accumulated in a private copy per chunk and added back in chunk order. Every expected
+// line is derived from scalar semantics, not recorded from the compiler:
+//
+// * The 9 initial weights come from `--train`'s documented deterministic init with seed 17 -- the
+//   LCG `s = s*6364136223846793005 + 1442695040888963407` (wrapping u64), each weight
+//   `(((s >> 40) as f32) * 2^-24 - 0.5) * 0.8` in f32 -- computed independently in Python with f32
+//   rounding after every operation: w[0], w[2], w[4], w[6], w[8] = 0.35457394, -0.13045077,
+//   -0.09232082, -0.2790916, 0.04051757 (the odd lanes are never read).
+// * h[i] = w[2i]^2 + c[i] * w[8]^2 with c = (1/8, 1/8, 1/4, 1/2), so the loss is
+//   L = w[0]^2 + w[2]^2 + w[4]^2 + w[6]^2 + w[8]^2, 0.230797 or 0.23079701 in f32 depending on
+//   how the four h[i] and the products are grouped (with or without a fused multiply-add); every
+//   grouping prints the same six decimals, and the seed was chosen so every printed value sits
+//   >= 30 ULPs from a six-decimal boundary.
+// * dL/dw[2i] = 2 w[2i] and dL/dw[8] = 2 w[8]. The w[8] adjoint arrives in four per-chunk pieces
+//   2 c[i] w[8] = (1/4, 1/4, 1/2, 1) w[8], whose running sums (1/4, 1/2, 1, 2) w[8] are all exact,
+//   so the gradient is exactly 2w. SGD with lr = 1/4 then gives w - w/2 = w/2 EXACTLY, each step
+//   divides the loss by exactly 4 -- 0.230797 / 4^k for k = 0..3 -- and the reduction is 64x.
+//
+// A wrong VJP anywhere -- a dropped private copy, a chunk added twice, a lane routed to the wrong
+// element -- changes every line after step 0. `main` runs the same loss for the differential gates.
+
+@parallel
+fn loss(w: [f32; 9], mut out: [f32; 1]) -> f32 {
+    let c: [f32; 4] = [0.125, 0.125, 0.25, 0.5];
+    let mut h: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        h[i] = w[2 * i] * w[2 * i] + c[i] * w[8] * w[8];
+    }
+    let mut l: f32 = 0.0;
+    for i in 0..4 {
+        l = l + h[i];
+    }
+    out[0] = l;
+    return l;
+}
+
+fn main() -> i32 {
+    let w: [f32; 9] = [1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 4.0, 9.0, 8.0];
+    let mut out: [f32; 1] = [0.0];
+    let l: f32 = loss(w, out);
+    // 1 + 4 + 9 + 16 + (1/8 + 1/8 + 1/4 + 1/2) * 64 = 94, exact in f32 under any order.
+    print(l as i32);
+    print(out[0] as i32);
+    return 0;
+}

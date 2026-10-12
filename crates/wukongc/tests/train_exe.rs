@@ -10,9 +10,10 @@
 //! runtime, and only running the linked executable can see a difference.
 //!
 //! Covered: the two hand-derived `tests/run/autodiff_train_*.wk` trajectories, the 2-layer MLP
-//! fixture, the GEMM + bias model of `autodiff_cli.rs` and a loss that prints, at `-O0` and `-O2`,
-//! under SGD and under AdamW with every update-policy field the spec carries (weight decay, clip,
-//! warmup, cosine).
+//! fixture, the `@parallel` region fixture (whose backward runs `wukong_parallel_for` from inside
+//! the artifact), the GEMM + bias model of `autodiff_cli.rs` and a loss that prints, at `-O0` and
+//! `-O2`, under SGD and under AdamW with every update-policy field the spec carries (weight decay,
+//! clip, warmup, cosine).
 //!
 //! **A skip must be earned**, exactly as in `exe.rs` (whose link probe this repeats): only a box
 //! with no rustc + `wukong_runtime` rlib may skip, and the test panics if it linked nothing.
@@ -131,6 +132,7 @@ fn cases(scratch: &Path) -> Vec<Case> {
         "autodiff_train_sumsq.wk",
         "autodiff_train_helper.wk",
         "autodiff_train_mlp.wk",
+        "autodiff_train_parallel_region.wk",
     ]
     .iter()
     .map(|file| {

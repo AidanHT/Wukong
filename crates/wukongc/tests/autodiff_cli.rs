@@ -10,7 +10,10 @@
 //! * `--emit=obj --grad-of` exports the gradient as a linkable symbol;
 //! * a loss whose four straight-line stores into a kernel-read buffer are an SLP bundle in an
 //!   ordinary `-O2` compile still differentiates and trains at every level (gradient compiles
-//!   optimize the forward without SLP).
+//!   optimize the forward without SLP);
+//! * a loss running a `@parallel` loop region differentiates into a parallel backward, and training
+//!   through it is byte-identical on the interpreter and on the native pool at every thread count
+//!   (N87).
 //!
 //! The training loop ahead of time (`--train --emit=exe`, byte-identical to `--train` on both
 //! backends, this file's GEMM + bias model among its cases) is `train_exe.rs`.
@@ -423,4 +426,110 @@ fn slp_shaped_lane_stores_differentiate_at_every_level() {
         bytes.windows(b"loss_grad".len()).any(|w| w == b"loss_grad"),
         "the object must export loss_grad"
     );
+}
+
+/// N87: a row reduction against a SHARED weight vector inside a `@parallel` loop region, over 40
+/// rows — more than the 16 private adjoint copies the region backward keeps, so its chunks run
+/// several rows each. `s[r] = Σ_j x[4r+j]·w[j]`, `L = Σ s[r]²`; `w` comes first so `--train`
+/// trains it and draws `x` as data.
+const REGION_ROWS: &str = "@parallel
+fn loss(w: [f32; 4], x: [f32; 160], mut out: [f32; 1]) -> f32 {
+    let mut s: [f32; 40] = [0.0; 40];
+    for r in 0..40 {
+        s[r] = x[r * 4] * w[0] + x[r * 4 + 1] * w[1] + x[r * 4 + 2] * w[2] + x[r * 4 + 3] * w[3];
+    }
+    let mut l: f32 = 0.0;
+    for r in 0..40 {
+        l = l + s[r] * s[r];
+    }
+    out[0] = l;
+    return l;
+}
+fn main() -> i32 { return 0; }
+";
+
+/// N87: a loss running a `@parallel` region differentiates at every level, and its backward is a
+/// region too — the gradient hands `{loss}_grad$par0` to `wukong_parallel_for`, which runs one
+/// iteration's backward (`{loss}_grad$par0$it`) per index.
+#[test]
+fn a_parallel_region_differentiates_into_a_parallel_backward() {
+    let scratch = Scratch::new("region-grad");
+    let path = scratch.source("region_rows.wk", REGION_ROWS);
+    for level in ["-O0", "-O1", "-O2", "-O3"] {
+        let out = wukongc(&["--emit=grad", "--grad-wrt=0,1", level], &path);
+        assert_ok(&out, &format!("--emit=grad {level}"));
+        let mir = stdout(&out);
+        let grad = backward(&mir);
+        let body = &grad[..grad.find("\n}\n").expect("the backward ends")];
+        assert!(
+            body.matches("call wukong_parallel_for(").count() == 2,
+            "{level}: the backward must replay the forward region and run the region backward:\n{body}"
+        );
+        assert!(
+            body.contains("func_addr loss_grad$par0"),
+            "{level}: the backward must hand the chunk driver to wukong_parallel_for:\n{body}"
+        );
+        for f in [
+            "fn loss_grad$par0(",
+            "fn loss_grad$par0$it(",
+            "fn wukong$par$0(",
+        ] {
+            assert!(mir.contains(f), "{level}: `{f}` missing from:\n{mir}");
+        }
+    }
+}
+
+/// N87: the region backward accumulates the shared weight's adjoint in private per-chunk copies and
+/// adds them in chunk order, with chunks that depend on the trip count alone — so `--train` gives
+/// the same trajectory AND the same final weights, byte for byte, on the interpreter (one sequential
+/// pass) and on the native pool at every thread count, at every level.
+#[test]
+fn training_through_a_region_is_bit_identical_across_backends_and_thread_counts() {
+    let scratch = Scratch::new("region-train");
+    let path = scratch.source("region_rows.wk", REGION_ROWS);
+    let mut baseline: Option<(String, Vec<u8>)> = None;
+    let mut runs = 0;
+    for level in ["-O0", "-O2"] {
+        for (backend, threads) in [
+            ("--backend=interp", "--threads=1"),
+            ("--backend=native", "--threads=1"),
+            ("--backend=native", "--threads=2"),
+            ("--backend=native", "--threads=7"),
+            ("--backend=native", "--threads=16"),
+        ] {
+            let save = scratch.0.join(format!("w-{runs}.bin"));
+            runs += 1;
+            let save_arg = format!("--train-save=0={}", save.display());
+            let args = [
+                "--train",
+                "--grad-wrt=0",
+                "--train-steps=4",
+                "--train-lr=0.01",
+                "--train-seed=5",
+                save_arg.as_str(),
+                level,
+                backend,
+                threads,
+            ];
+            let out = wukongc(&args, &path);
+            let what = format!("{level} {backend} {threads}");
+            assert_ok(&out, &what);
+            let text = stdout(&out);
+            let losses = trajectory(&text);
+            assert_eq!(losses.len(), 5, "{what}: {text}");
+            assert!(
+                losses.windows(2).all(|p| p[1] < p[0]),
+                "{what}: least squares must descend: {text}"
+            );
+            let weights = std::fs::read(&save).expect("--train-save wrote the weights");
+            assert_eq!(weights.len(), 16, "{what}: four f32 weights");
+            match &baseline {
+                Some((t, w)) => {
+                    assert_eq!(&text, t, "{what}: trajectory differs");
+                    assert_eq!(&weights, w, "{what}: trained weights differ");
+                }
+                None => baseline = Some((text, weights)),
+            }
+        }
+    }
 }

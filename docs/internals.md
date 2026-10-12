@@ -126,7 +126,7 @@ source
   → sema         (wukong_sema::check)                  name res, types, SHAPE check
   → mir_build    (wukong_mir_build::lower_program)     -> MIR (scalar SSA; always MirLevel::Low)
   → opt          (wukong_opt::optimize)                fixpoint passes
-  → autodiff     (wukong_autodiff::grad)               --emit=grad / --train / --emit=obj --grad-of;
+  → autodiff     (wukong_autodiff::grad_program)       --emit=grad / --train / --emit=obj --grad-of;
                                                         forces >= -O1
   → verify       (wukong_mir::verify, via wukong_driver::verify_or_ice)
                  gate on --run and on every AOT exit
@@ -2230,6 +2230,50 @@ Without the budget, a body declaring `let t: [f32; 5000000]` aborted natively wi
 on a worker while the interpreter, whose slots are heap-backed, printed the right answer — a defect
 no differential gate could see; `crates/wukongc/tests/parallel_frame_budget.rs` runs both shapes
 natively.
+
+### Autodiff through a region (N87)
+
+`wukong_autodiff::grad_program` (`src/region.rs`) differentiates a loss that runs a region. It
+locates each `wukong_parallel_for(n, func_addr P, env)` call in the (flattened) loss, reads the env
+slots off the `alloca [k x ptr]` stores before it, and takes `P` apart: it must be the canonical
+`-O1` counted loop — a pure entry (env loads, the grain mapping, body-local allocas), a header
+`cmp.slt|ult hh, bound`, ONE straight-line body block and a `ret`. Because `-O2` unrolls that loop,
+the driver keeps a pre-optimization copy of every outlined body of a gradient compile and swaps in
+its `-O1` form after the whole-program optimization (`RegionSnapshot` in `wukong_driver`); the
+forward then runs that form, which computes the same bits (optimization is observably invariant).
+The body block becomes `F(hh, env)`, one iteration; `slot_uses` classifies each env slot as read,
+written (store, kernel output, atomic add) or both — both is an in-place region and declines.
+
+The backward of the call is three pieces. `{grad}$par<i>$it(hh, env, gc)` is the single-block
+transform run on `F` in **region mode** (`Vjp::region`): the env slot pointers are buffer bases
+(`resolve_access`), their gradients are the pointers in `gc`, every contribution to them accumulates
+(they are pre-marked `contributed`), a kernel writing a captured slice zeroes the adjoint of what it
+overwrote (`kill_overwritten`), and the replay skips every write into a captured buffer (the forward
+already made it, and a region never reads what it writes). `{grad}$par<i>(cs, ce, benv)` is the
+chunk driver the loss hands to `wukong_parallel_for`: virtual chunk `c` runs iterations
+`lo + [c·q + min(c, r), (c+1)·q + min(c+1, r))` in order (`q = N / K`, `r = N mod K`). In the loss, a written slot's gradient is the live adjoint (none
+if nothing downstream reads it), a read slot's is the loss's gradient buffer for it — directly when
+`IterBody::partitioned` proves every read of it is a float load at `C·hh + c` in one band (an
+affine walk over the index), otherwise `K = min(N, 16)` private zeroed copies (`wukong_rt_alloc`,
+sized from the local array or the parameter's `ParamExtent`), which the loss adds back with a
+synthesized loop in chunk order after the call. `K` and the chunk boundaries depend on `N` only, so
+the interpreter (which runs the chunks in order) and the native pool at any width sum every float
+in one order. Recompute is sound only if what the iteration reads is unchanged at the end of the
+forward and is not what it writes. `check_aliasing` resolves every pointer of the loss to the
+memories it may address (`Mem`: a buffer of its own — parameter, `alloca`, global, `wukong_rt_alloc`
+block — the caller's memory behind a parameter's pointers, or the scratch arena). A pointer loaded
+out of a local that never escapes addresses exactly what the loss stored into it, which is how a
+slice's data pointer resolves to its array. It then declines a region in which one slot writes what
+another reads (a slice and its array included), and a region whose read slots (or kernel-written
+ones, whose rules read the output back) the loss writes again after the call: by a store, a kernel
+output, a later region, or any other call handed the buffer (all of its pointer arguments, and the
+pointers they hold, count as written, except the read-only effect calls). A pointer it cannot place
+is refused on either side. `diff_region` also refuses a written slot whose base is not a parameter
+or an `alloca` of its own: the loss keys gradients by whole buffers, so a view's output adjoint would
+read as dead. `build_grad_full` in the driver
+optimizes the generated functions with the backward, verifies them in the whole program, and hands
+`--emit=grad`, the exported gradient and the training program every function the backward needs
+(the support functions and the outlined bodies the forward names).
 
 ## CPU training execution
 

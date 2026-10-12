@@ -9,9 +9,10 @@
 | `tape_attn.rs` | The fused scaled-dot-product attention (`wukong_attention_f32`): the FlashAttention recompute of the weights, then the four adjoint GEMMs and the fused softmax backward |
 | `coverage.rs` | `NOT_DIFFERENTIABLE`: every emitted runtime symbol the tape declines, with the reason a user sees; effect-only calls (`print`, `assert`, ...) |
 | `inline.rs` | Call flattening: splice straight-line helper functions into the loss before differentiation |
+| `region.rs` | `@parallel` regions (`grad_program`): take the outlined body apart, the alias check the recompute rests on (`check_aliasing`: no in-place update by another name, nothing after the region writes what it read, a slice resolved to its array), the iteration backward in region mode, the chunk driver, privatized shared adjoints added back in chunk order |
 | `writes.rs` | `written_params`: which buffer parameters a function may write (a kernel's output operand, stores, unknown calls, escapes) — what lets `--train` run in place |
 | `optim.rs` | `build_adamw_step`, `adamw_step_name`, `hp` index module for AdamW hyperparameters |
-| `tests.rs` + `tests/` | Finite-difference + closed-form gate: per-rule tests, `kernels.rs` (new families), `attention.rs` (the fused attention), `writes.rs` (`written_params`), `memory.rs` (accumulation, in-place, stores), `calls.rs` (helpers, Hessian-vector products), `mirror.rs` (recognizer ↔ autodiff coupling) |
+| `tests.rs` + `tests/` | Finite-difference + closed-form gate: per-rule tests, `kernels.rs` (new families), `attention.rs` (the fused attention), `writes.rs` (`written_params`), `memory.rs` (accumulation, in-place, stores), `calls.rs` (helpers, Hessian-vector products), `mirror.rs` (recognizer ↔ autodiff coupling), `regions.rs` (`@parallel` regions, f64 finite differences) |
 
 ## Adding a kernel rule
 

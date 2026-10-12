@@ -963,6 +963,15 @@ pub fn compile(opts: &Options) -> i32 {
         opts.opt_level
     };
     let opt_options = optimize_options_for(opts, &lower_opts);
+    // The backward of a `@parallel` region recomputes one iteration of its outlined body, which it
+    // finds in the canonical `-O1` counted loop (`wukong_autodiff::grad_program`). `-O2` unrolls and
+    // versions that loop, so a gradient compile keeps a pre-optimization copy of every outlined
+    // body and optimizes it at `-O1` below.
+    let region_snapshot = if feeds_autodiff && opt_level >= 2 {
+        RegionSnapshot::take(&program, &interner)
+    } else {
+        RegionSnapshot::default()
+    };
     timer.begin("optimize");
     if opts.passes.is_some() || opts.print_after.is_some() {
         // A chosen pass list, or the level's own list run through the same replica so a pass can
@@ -1027,6 +1036,17 @@ pub fn compile(opts: &Options) -> i32 {
         timer.optimizer_passes(&timings);
     } else {
         wukong_opt::optimize_preserving_with(&mut program, opt_level, &roots, opt_options);
+    }
+    if !region_snapshot.bodies.is_empty() {
+        if let Err(failure) = region_snapshot.restore_at_o1(&mut program, opts.verify_each) {
+            emit_diag(
+                &optimization_failure_diag(&failure, &interner),
+                opts.error_format,
+                &renderer,
+                &SourceMap::new(),
+            );
+            return exit::COMPILE_ERROR;
+        }
     }
     timer.mir_summary(&program, &interner);
 
@@ -2769,15 +2789,17 @@ fn link_rustc() -> PathBuf {
 /// kernels as the forward. A differentiable value with no VJP rule is a hard error, never a
 /// silently-zero gradient (see `wukong_autodiff`).
 fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Options) -> i32 {
-    let (fwd, gradfn) = match build_grad(program, interner, opts) {
-        Ok(pair) => pair,
+    let built = match build_grad_full(program, interner, opts) {
+        Ok(built) => built,
         Err(e) => {
             emit_driver_error(opts, format!("--emit=grad: {e}"));
             return exit::COMPILE_ERROR;
         }
     };
+    // The forward and its backward, then what they call: each `@parallel` region's backward and
+    // the outlined forward bodies.
     let out = wukong_mir::Program {
-        funcs: vec![fwd, gradfn],
+        funcs: built.into_funcs(),
         level: program.level,
         statics: program.statics.clone(),
         externs: program.externs.clone(),
@@ -2826,14 +2848,18 @@ fn append_gradient(
     interner: &mut Interner,
     opts: &Options,
 ) -> Result<(), String> {
-    let (_, gradfn) = build_grad(program, interner, opts)?;
-    if program.function(gradfn.name).is_some() {
-        return Err(format!(
-            "the program already defines `{}`; rename it or differentiate another function",
-            interner.resolve(gradfn.name)
-        ));
+    let built = build_grad_full(program, interner, opts)?;
+    for f in std::iter::once(&built.grad).chain(&built.support) {
+        if program.function(f.name).is_some() {
+            return Err(format!(
+                "the program already defines `{}`; rename it or differentiate another function",
+                interner.resolve(f.name)
+            ));
+        }
     }
-    program.funcs.push(gradfn);
+    // The outlined forward bodies the backward names are already in the program.
+    program.funcs.push(built.grad);
+    program.funcs.extend(built.support);
     Ok(())
 }
 
@@ -2844,13 +2870,176 @@ fn missing_grad_target(name: &str) -> String {
     )
 }
 
-/// Shared core of `--emit=grad` and `--train`: resolve the target loss function and its `wrt` list
-/// from `opts`, differentiate and optimize the backward, and return `(forward_clone, gradient_function)`.
+/// `(forward_clone, gradient_function)` of [`build_grad_full`], for a loss with no `@parallel`
+/// region (whose gradient calls nothing generated).
+#[cfg(test)]
 fn build_grad(
     program: &wukong_mir::Program,
     interner: &mut Interner,
     opts: &Options,
 ) -> Result<(wukong_mir::Function, wukong_mir::Function), String> {
+    build_grad_full(program, interner, opts).map(|b| (b.fwd, b.grad))
+}
+
+/// A differentiated loss and every function its gradient run needs.
+struct GradBuild {
+    /// The call-flattened forward.
+    fwd: wukong_mir::Function,
+    /// `{loss}_grad`.
+    grad: wukong_mir::Function,
+    /// Generated functions the gradient calls: each `@parallel` region's backward.
+    support: Vec<wukong_mir::Function>,
+    /// Functions of the program the forward or the backward name (a region's outlined body),
+    /// which a program holding only the two would lack.
+    callees: Vec<wukong_mir::Function>,
+}
+
+impl GradBuild {
+    /// Forward, backward, the generated support, then the program's callees: a self-contained
+    /// program's function list.
+    fn into_funcs(self) -> Vec<wukong_mir::Function> {
+        let mut funcs = vec![self.fwd, self.grad];
+        funcs.extend(self.support);
+        funcs.extend(self.callees);
+        funcs
+    }
+}
+
+/// The program functions `roots` name by call or by address, transitively (the roots excluded), in
+/// program order.
+fn program_callees(
+    program: &wukong_mir::Program,
+    roots: &[&wukong_mir::Function],
+) -> Vec<wukong_mir::Function> {
+    use std::collections::HashSet;
+    use wukong_mir::Op;
+    let own: HashSet<wukong_span::Symbol> = roots.iter().map(|f| f.name).collect();
+    let mut seen: HashSet<wukong_span::Symbol> = HashSet::new();
+    let mut work: Vec<&wukong_mir::Function> = roots.to_vec();
+    while let Some(f) = work.pop() {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            let named = match &inst.op {
+                Op::Call { func, .. } | Op::FuncAddr(func) => *func,
+                _ => continue,
+            };
+            if own.contains(&named) || !seen.insert(named) {
+                continue;
+            }
+            if let Some(g) = program.function(named) {
+                work.push(g);
+            }
+        }
+    }
+    program
+        .funcs
+        .iter()
+        .filter(|f| seen.contains(&f.name) && !own.contains(&f.name))
+        .cloned()
+        .collect()
+}
+
+/// The pre-optimization outlined body of every `@parallel` region of a gradient compile (each
+/// function a `wukong_parallel_for` call names by address), and the names the program defined then.
+///
+/// The backward of a region recomputes one iteration of its body, which
+/// `wukong_autodiff::grad_program` finds in the canonical `-O1` counted loop; `-O2` unrolls and
+/// versions that loop. So a gradient compile optimizes these copies at `-O1` and puts them in place
+/// of the fully optimized bodies ([`RegionSnapshot::restore_at_o1`]). Optimization is observably
+/// invariant, so the forward computes the same bits through either form.
+#[derive(Default)]
+struct RegionSnapshot {
+    bodies: Vec<wukong_mir::Function>,
+    defined: std::collections::HashSet<wukong_span::Symbol>,
+}
+
+impl RegionSnapshot {
+    fn take(program: &wukong_mir::Program, interner: &Interner) -> RegionSnapshot {
+        use std::collections::{HashMap, HashSet};
+        use wukong_mir::Op;
+        let mut named: HashSet<wukong_span::Symbol> = HashSet::new();
+        for f in &program.funcs {
+            let addr: HashMap<wukong_mir::ValueId, wukong_span::Symbol> = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| match (&i.op, i.result) {
+                    (Op::FuncAddr(s), Some(r)) => Some((r, *s)),
+                    _ => None,
+                })
+                .collect();
+            for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+                if let Op::Call { func, args } = &inst.op {
+                    if interner.resolve(*func) == "wukong_parallel_for" {
+                        if let Some(s) = args.get(1).and_then(|a| addr.get(a)) {
+                            named.insert(*s);
+                        }
+                    }
+                }
+            }
+        }
+        RegionSnapshot {
+            bodies: program
+                .funcs
+                .iter()
+                .filter(|f| named.contains(&f.name))
+                .cloned()
+                .collect(),
+            defined: program.funcs.iter().map(|f| f.name).collect(),
+        }
+    }
+
+    /// Optimize the copies at `-O1` and swap each in for its optimized self. A copy that still
+    /// calls a function the full optimizer removed (inlined everywhere) is dropped, keeping the
+    /// optimized body.
+    fn restore_at_o1(
+        self,
+        program: &mut wukong_mir::Program,
+        verify: bool,
+    ) -> Result<(), wukong_opt::VerificationFailure> {
+        use wukong_mir::Op;
+        let names: Vec<wukong_span::Symbol> = self.bodies.iter().map(|f| f.name).collect();
+        let mut side = wukong_mir::Program {
+            funcs: self.bodies,
+            level: program.level,
+            statics: program.statics.clone(),
+            externs: program.externs.clone(),
+        };
+        let autodiff = wukong_opt::OptimizeOptions::AUTODIFF_INPUT;
+        if verify {
+            wukong_opt::optimize_verified_preserving_with(&mut side, 1, &names, autodiff)?;
+        } else {
+            wukong_opt::optimize_preserving_with(&mut side, 1, &names, autodiff);
+        }
+        for f in side.funcs {
+            let callees_kept = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .all(|inst| match &inst.op {
+                    Op::Call { func, .. } | Op::FuncAddr(func) => {
+                        !self.defined.contains(func) || program.function(*func).is_some()
+                    }
+                    _ => true,
+                });
+            if !callees_kept {
+                continue;
+            }
+            if let Some(slot) = program.funcs.iter_mut().find(|g| g.name == f.name) {
+                *slot = f;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shared core of `--emit=grad`, `--train` and the exported gradient: resolve the target loss
+/// function and its `wrt` list from `opts`, differentiate it (every `@parallel` region it runs
+/// included) and optimize the backward.
+fn build_grad_full(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+) -> Result<GradBuild, String> {
     let name = opts.grad.of.clone().unwrap_or_else(|| "loss".to_string());
     let sym = interner.intern(&name);
     let func = program
@@ -2862,12 +3051,16 @@ fn build_grad(
     // The flattened forward is the one returned and run, so `--train` never calls a helper the
     // training program does not contain.
     let func = wukong_autodiff::inline_calls(program, func);
-    let gradfn = wukong_autodiff::grad(&func, &wrt, interner)?;
+    let wukong_autodiff::Gradient {
+        func: gradfn,
+        support,
+    } = wukong_autodiff::grad_program(program, &func, &wrt, interner)?;
     // Autodiff synthesizes MIR after optimization, so its output needs a verifier boundary even
     // without --verify-each. Keep every callee definition available for signature checks before
     // this function can hand generated MIR to emission or training.
     let mut checked = program.clone();
     checked.funcs.push(gradfn.clone());
+    checked.funcs.extend(support.iter().cloned());
     wukong_opt::verify_program_stage(&checked, "autodiff")
         .map_err(|failure| failure.to_string())?;
     // Optimize only newly generated MIR: rerunning the pipeline over the input program could
@@ -2875,10 +3068,14 @@ fn build_grad(
     // backward still gets the requested local passes and unrolling, with the same O1 floor used
     // to prepare the forward for autodiff, and SLP too: nothing differentiates the backward. The
     // 256-bit kernels follow the invocation (`backward_optimize_options`).
-    // Preserve its externally invoked entry point explicitly.
+    // Preserve its externally invoked entry point explicitly, and every region backward it hands
+    // to `wukong_parallel_for` by address.
     let grad_name = gradfn.name;
+    let roots: Vec<wukong_span::Symbol> = std::iter::once(grad_name)
+        .chain(support.iter().map(|f| f.name))
+        .collect();
     let mut generated = wukong_mir::Program {
-        funcs: vec![gradfn],
+        funcs: std::iter::once(gradfn).chain(support).collect(),
         level: program.level,
         statics: program.statics.clone(),
         externs: program.externs.clone(),
@@ -2886,22 +3083,36 @@ fn build_grad(
     let level = opts.opt_level.max(1);
     let options = backward_optimize_options(opts);
     if opts.verify_each {
-        wukong_opt::optimize_verified_preserving_with(&mut generated, level, &[grad_name], options)
+        wukong_opt::optimize_verified_preserving_with(&mut generated, level, &roots, options)
             .map_err(|failure| failure.to_string())?;
     } else {
-        wukong_opt::optimize_preserving_with(&mut generated, level, &[grad_name], options);
+        wukong_opt::optimize_preserving_with(&mut generated, level, &roots, options);
     }
-    let gradfn = generated
-        .funcs
-        .pop()
+    let mut funcs = generated.funcs;
+    let at = funcs
+        .iter()
+        .position(|f| f.name == grad_name)
         .ok_or_else(|| "internal: optimization removed the gradient entry point".to_string())?;
-    checked.funcs.pop();
+    let gradfn = funcs.remove(at);
+    let support = funcs;
+    checked.funcs.truncate(program.funcs.len());
     checked.funcs.push(gradfn.clone());
+    checked.funcs.extend(support.iter().cloned());
     // The isolated optimizer cannot check calls against the original callee definitions. Restore
     // that complete context at the output boundary, even when per-pass verification is disabled.
     wukong_opt::verify_program_stage(&checked, "autodiff optimization")
         .map_err(|failure| failure.to_string())?;
-    Ok((func, gradfn))
+    let roots: Vec<&wukong_mir::Function> = std::iter::once(&func)
+        .chain(std::iter::once(&gradfn))
+        .chain(&support)
+        .collect();
+    let callees = program_callees(program, &roots);
+    Ok(GradBuild {
+        fwd: func,
+        grad: gradfn,
+        support,
+        callees,
+    })
 }
 
 /// The parameter indices to differentiate w.r.t.: the explicit `--grad-wrt` list (validated to be
@@ -3256,7 +3467,12 @@ fn build_training(
 ) -> Result<TrainingBuild, String> {
     use wukong_runtime::train::{Optimizer, TrainSpec};
 
-    let (fwd, gradfn) = build_grad(program, interner, opts)?;
+    let GradBuild {
+        fwd,
+        grad: gradfn,
+        support,
+        callees,
+    } = build_grad_full(program, interner, opts)?;
     // The buffers the forward may write, beside the loss output: restored after every gradient run.
     let written = wukong_autodiff::written_params(&fwd, interner);
     let loss_out = lens.len() - 1;
@@ -3288,6 +3504,10 @@ fn build_training(
         funcs.push(f);
     }
     let entries = names.into_iter().zip(spec.kernel_buffers()).collect();
+    // What the kernels call but no kernel entry names: each `@parallel` region's backward and the
+    // outlined forward bodies.
+    funcs.extend(support);
+    funcs.extend(callees);
     let train_prog = wukong_mir::Program {
         funcs,
         level: program.level,
@@ -4856,6 +5076,9 @@ mod generated_verify_tests;
 
 #[cfg(test)]
 mod grad_model_tests;
+
+#[cfg(test)]
+mod region_grad_tests;
 
 #[cfg(test)]
 mod cc_print_tests;

@@ -26,7 +26,9 @@
 //!
 //! Calls to user functions are differentiated by [`inline_calls`] (straight-line callees are
 //! spliced in before differentiation, at every `-O` level); second-order derivatives of scalar-path
-//! losses come from [`grad_dot`] / [`hvp`].
+//! losses come from [`grad_dot`] / [`hvp`]. A loss containing `@parallel` loop regions (a
+//! `wukong_parallel_for` call of an outlined body) is differentiated by [`grad_program`], whose
+//! backward is itself a parallel region over the same iterations (`region.rs`).
 //!
 //! # Correctness gate
 //!
@@ -48,6 +50,7 @@ use wukong_span::{Interner, Symbol};
 mod coverage;
 mod inline;
 pub mod optim;
+mod region;
 mod tape;
 mod tape_attn;
 mod tape_linalg;
@@ -79,7 +82,39 @@ enum Mode {
 /// pointer parameter, or if the reverse pass meets a differentiable value whose defining op has no
 /// VJP rule yet (so a missing rule is a loud failure, never a silently-zero gradient).
 pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<Function, String> {
-    build(func, wrt, interner, Mode::Grad)
+    build(func, wrt, interner, Mode::Grad, None).map(|(g, _)| g)
+}
+
+/// A gradient function plus the functions it calls that the program does not define yet.
+#[derive(Clone, Debug)]
+pub struct Gradient {
+    /// `{name}_grad`, exactly as [`grad`] returns it.
+    pub func: Function,
+    /// The backward of each `@parallel` region the loss runs: per region, the iteration backward
+    /// `{name}_grad$par<i>$it(hh, env, gc)` and its chunk driver `{name}_grad$par<i>(cs, ce, benv)`,
+    /// which `func` hands to `wukong_parallel_for`. Empty for a loss with no region.
+    pub support: Vec<Function>,
+}
+
+/// [`grad`] for a loss that may run `@parallel` loop regions: `program` supplies each region's
+/// outlined body (the function a `wukong_parallel_for(n, &body, env)` call names), which `grad`
+/// alone cannot see.
+///
+/// The backward of a region is itself a region over the same iterations: each iteration is
+/// recomputed from the buffers the forward left behind and differentiated by the single-block rules,
+/// and the adjoint of a buffer several iterations read (a broadcast weight, a captured scalar) is
+/// accumulated in private per-chunk copies added back in a fixed chunk order — the chunks depend on
+/// the trip count only, so the gradient's bits do not depend on the thread count, and the
+/// interpreter and the native pool agree exactly. The body must be the canonical `-O1` counted loop
+/// with a straight-line iteration; see `region.rs` for every refusal.
+pub fn grad_program(
+    program: &Program,
+    func: &Function,
+    wrt: &[usize],
+    interner: &mut Interner,
+) -> Result<Gradient, String> {
+    build(func, wrt, interner, Mode::Grad, Some(program))
+        .map(|(func, support)| Gradient { func, support })
 }
 
 /// The **directional derivative** of a scalar-path loss: `{func.name}_gdot(params..., v_1..v_k)
@@ -97,7 +132,7 @@ pub fn grad_dot(
     wrt: &[usize],
     interner: &mut Interner,
 ) -> Result<Function, String> {
-    build(func, wrt, interner, Mode::GradDot)
+    build(func, wrt, interner, Mode::GradDot, None).map(|(g, _)| g)
 }
 
 /// The **Hessian-vector product**: returns `(gdot, hvp)` where `gdot = grad_dot(func, wrt)` and
@@ -129,7 +164,8 @@ fn build(
     wrt: &[usize],
     interner: &mut Interner,
     mode: Mode,
-) -> Result<Function, String> {
+    program: Option<&Program>,
+) -> Result<(Function, Vec<Function>), String> {
     let fname = interner.resolve(func.name).to_string();
     // Second-order (grad-of-grad) through the emitted backward is a capability boundary, and one a
     // reader would otherwise have to infer: the function this transform EMITS returns `Void` and is
@@ -180,8 +216,37 @@ fn build(
         Mode::GradDot => "gdot",
     };
     let gname = interner.intern(&format!("{fname}_{suffix}"));
+    // `@parallel` regions: each needs its outlined body and two generated function names.
+    let calls = region::locate(func, syms.pfor);
+    if mode == Mode::GradDot && !calls.is_empty() {
+        return Err(format!(
+            "autodiff: second-order differentiation (grad_dot / hvp) supports scalar-path losses \
+             only; `{fname}` runs a @parallel region"
+        ));
+    }
+    let names: Vec<(Symbol, Symbol)> = (0..calls.len())
+        .map(|i| {
+            (
+                interner.intern(&format!("{fname}_{suffix}$par{i}")),
+                interner.intern(&format!("{fname}_{suffix}$par{i}$it")),
+            )
+        })
+        .collect();
+    let no_program = Program {
+        funcs: Vec::new(),
+        statics: Vec::new(),
+        externs: Vec::new(),
+        level: wukong_mir::MirLevel::Low,
+    };
+    let regions = region::scan(
+        func,
+        program.unwrap_or(&no_program),
+        &calls,
+        &names,
+        interner,
+    )?;
 
-    let mut vjp = Vjp::new(func, gname, wrt, syms, interner, mode, ret_ty);
+    let mut vjp = Vjp::new(func, gname, wrt, syms, interner, mode, ret_ty, &regions);
     vjp.scan_kernel_outputs();
     vjp.replay();
     vjp.seed()?;
@@ -237,9 +302,19 @@ struct Vjp<'a> {
     /// Read-only interner, so a decline can *name* the construct that blocked the gradient (a bare
     /// "unrecognized call" leaves the user with no way to find the offending source line).
     it: &'a Interner,
+    /// The `@parallel` region calls of the forward, taken apart (`region.rs`).
+    regions: &'a [region::RegionCall<'a>],
+    /// Parameters a region writes: like `kernel_out`, a written parameter outside `wrt` still needs
+    /// a gradient when something downstream reads it.
+    region_out: HashSet<ValueId>,
+    /// Region mode: this `Vjp` differentiates ONE iteration of a region (`region.rs`).
+    region: Option<region::RegionCtx>,
+    /// Generated functions the gradient calls (each region's backward).
+    support: Vec<Function>,
 }
 
 impl<'a> Vjp<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         fwd: &'a Function,
         gname: Symbol,
@@ -248,6 +323,7 @@ impl<'a> Vjp<'a> {
         it: &'a Interner,
         mode: Mode,
         ret_ty: MirType,
+        regions: &'a [region::RegionCall<'a>],
     ) -> Vjp<'a> {
         let mut b = wukong_mir::Builder::new(gname, ret_ty.clone());
         let mut fwd_to_new = HashMap::new();
@@ -271,16 +347,25 @@ impl<'a> Vjp<'a> {
             if let Some(r) = inst.result {
                 def_op.insert(r, &inst.op);
                 // The element count of each local f32 array (its gradient is an f32 buffer of the
-                // same size). Other aggregates (byte blobs, pointer tables) carry no gradient.
-                if let Op::Alloca {
-                    ty: MirType::Array(elem, count),
-                    space: wukong_mir::AddrSpace::Local,
-                    ..
-                } = &inst.op
-                {
-                    if **elem == MirType::F32 {
+                // same size). Other aggregates (byte blobs, pointer tables) carry no gradient. A
+                // scalar `f32` slot left in memory after mem2reg has had its address taken (a
+                // `@parallel` region captures it): it is a one-element buffer.
+                match &inst.op {
+                    Op::Alloca {
+                        ty: MirType::Array(elem, count),
+                        space: wukong_mir::AddrSpace::Local,
+                        ..
+                    } if **elem == MirType::F32 => {
                         buf_count.insert(r, *count);
                     }
+                    Op::Alloca {
+                        ty: MirType::F32,
+                        space: wukong_mir::AddrSpace::Local,
+                        ..
+                    } => {
+                        buf_count.insert(r, 1);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -303,6 +388,10 @@ impl<'a> Vjp<'a> {
             store_written: HashSet::new(),
             scratch: Vec::new(),
             it,
+            regions,
+            region_out: HashSet::new(),
+            region: None,
+            support: Vec::new(),
         }
     }
 
@@ -316,6 +405,10 @@ impl<'a> Vjp<'a> {
         // The source block belongs to the borrowed forward function, independently of the new
         // builder. Remap directly from it without a temporary clone of every op and operand list.
         for inst in &self.entry_block().insts {
+            // Region mode: an iteration's writes into captured buffers already happened.
+            if inst.result.is_none() && self.region_skips(&inst.op) {
+                continue;
+            }
             let new_op = self.remap_op(&inst.op);
             match inst.result {
                 Some(old_r) => {
@@ -328,7 +421,8 @@ impl<'a> Vjp<'a> {
         }
     }
 
-    /// Seed the loss adjoint to 1.0 from the `ret <loss>` terminator.
+    /// Seed the loss adjoint to 1.0 from the `ret <loss>` terminator. (Region mode never seeds: an
+    /// iteration's adjoints arrive through the captured buffers it writes.)
     fn seed(&mut self) -> Result<(), String> {
         let loss = match self.entry_block().term {
             Terminator::Ret(Some(v)) => v,
@@ -371,13 +465,29 @@ impl<'a> Vjp<'a> {
         Ok(())
     }
 
-    fn finish(self) -> Function {
-        self.b.finish()
+    fn finish(self) -> (Function, Vec<Function>) {
+        (self.b.finish(), self.support)
     }
 
     // --- the per-instruction VJP dispatch -------------------------------------------------
 
     fn diff_inst(&mut self, inst: &Inst) -> Result<(), String> {
+        // A `@parallel` region: its backward is a region too (`region.rs`).
+        if let Op::Call { func, args } = &inst.op {
+            if *func == self.syms.pfor {
+                let found = args
+                    .get(2)
+                    .and_then(|env| self.regions.iter().position(|r| r.env == *env));
+                return match found {
+                    Some(i) => self.diff_region(i),
+                    None => Err(
+                        "autodiff: no VJP rule for a `wukong_parallel_for` call outside a \
+                         differentiable @parallel region"
+                            .into(),
+                    ),
+                };
+            }
+        }
         // A recognized tensor-kernel call differentiates through the buffer-adjoint model (tape.rs).
         // Its gradient flows through buffers (memory), not the scalar `adj` map.
         if let Op::Call { func, args } = &inst.op {
@@ -888,6 +998,14 @@ impl<'a> Vjp<'a> {
         let mut cur = ptr;
         loop {
             if self.fwd.params.contains(&cur) {
+                break;
+            }
+            // Region mode: an env slot's pointer is a captured buffer's base.
+            if self
+                .region
+                .as_ref()
+                .is_some_and(|rc| rc.cap_of.contains_key(&cur))
+            {
                 break;
             }
             if self.buf_count.contains_key(&cur) {

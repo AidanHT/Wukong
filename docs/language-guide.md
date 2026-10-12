@@ -2898,6 +2898,37 @@ static form applies — fixed-array operands with every input proved apart from 
 through the fused attention VJP (`tests/run/sdpa_loss_train.wk`). `s` and `d` need not be
 constants: their checks are straight-line `assert`s, which the tape passes through.
 
+**✅ `@parallel` regions in a loss.** A loss may run a `@parallel` loop region — a loop of a
+`@parallel` loss the outliner threads, or a whole-function `@parallel` helper the loss calls — and
+its backward is a region too: each iteration is recomputed and differentiated on its own, over the
+same iterations, in parallel. A buffer every iteration reads (a weight vector, a scalar computed
+before the loop) has its gradient summed through private per-chunk copies in a fixed order, so the
+gradient is bit-identical on the interpreter and the native backend at every `--threads` count.
+What a region's iteration may do to stay differentiable: scalar arithmetic, element reads and writes
+of captured arrays, and kernel builtins on whole arrays or body-local arrays — straight-line code.
+Refused by name: an iteration with control flow (an inner loop no recognizer takes, a slice index's
+bounds check), a store through a slice in the iteration (straight-line under `@unchecked`, but
+refused: write into the array itself), a region that reads an array it also writes, under one name
+or two (`h[i] = h[i] * x[i]`, or through a slice of `h`: write the result into a separate array),
+and an array the region reads that the loss changes after the loop under any name, whether through
+a slice view or by a call such as `rand_fill_f32` or `read_f32` redrawing it. A region may read an
+integer mask through a slice.
+Fixture: `tests/run/autodiff_train_parallel_region.wk`.
+
+```wukong
+@parallel
+fn loss(x: [f32; 16], w: [f32; 4], mut out: [f32; 1]) -> f32 {
+    let mut s: [f32; 4] = [0.0; 4];
+    for r in 0..4 {    // a region: rows across cores, forward AND backward
+        s[r] = x[r * 4] * w[0] + x[r * 4 + 1] * w[1] + x[r * 4 + 2] * w[2] + x[r * 4 + 3] * w[3];
+    }
+    let mut l: f32 = 0.0;
+    for r in 0..4 { l = l + s[r] * s[r]; }
+    out[0] = l;
+    return l;
+}
+```
+
 **✅ AOT gradient:** `wukongc --emit=obj --grad-of=loss -o model.o model.wk` exports `loss_grad`
 next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
 `--grad-wrt` entry), for a host training loop to link. Without `--grad-of`, `--emit=obj` is unchanged.

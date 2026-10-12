@@ -342,8 +342,10 @@ autodiff**
 (`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
 pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop on the interpreter or native Cranelift JIT.
 Every recognized tensor kernel has a VJP (riding the runtime's tuned backward kernels) or a named
-refusal, losses may call helper functions, `--emit=obj --grad-of=<fn>` exports the gradient ahead
-of time, and scalar-path losses have Hessian-vector products. Training accepts concrete f32 arrays
+refusal, losses may call helper functions, a loss that runs a `@parallel` loop region gets a
+parallel backward whose gradient is bit-identical at every thread count, `--emit=obj
+--grad-of=<fn>` exports the gradient ahead of time, and scalar-path losses have Hessian-vector
+products. Training accepts concrete f32 arrays
 and dense tensors, loads weights and streams data batches from raw f32 files (`--train-init`,
 `--train-data`), writes the trained weights (`--train-save`), and clips and schedules the update
 (`--train-clip`, `--train-warmup`, `--train-schedule=cosine`). `--train --emit=exe` builds the

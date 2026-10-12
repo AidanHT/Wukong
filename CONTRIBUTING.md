@@ -463,6 +463,9 @@ call to a hand-written `extern "C"` kernel in `wukong_runtime`. Six layers, all 
 If the kernel is differentiable, mirror it in `crates/wukong_autodiff/src/tape.rs` (`Syms`,
 `is_kernel`, `diff_kernel_call`) — **including the `_parallel` spelling**: a `_parallel` recognizer
 arm added without its tape counterpart breaks every `@parallel` backward, so run the full suite.
+The serial spelling matters on its own too: inside a `@parallel` loop region the outlined body
+dispatches the serial kernel, and the region backward (`crates/wukong_autodiff/src/region.rs`)
+differentiates exactly that call.
 
 LANDMINE: kernel dispatch is **gate-blind**. The interpreter calls the same function, so a kernel
 bug is identical on both backends and the differential gate stays green — the in-crate
