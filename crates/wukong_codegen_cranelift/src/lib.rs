@@ -910,10 +910,11 @@ struct FnTranslator<'a> {
     /// (instead of panicking, or silently dropping the instruction) so `populate_module` can abort
     /// with a clean error before the half-built function is finalized/defined.
     layout_err: Option<String>,
-    /// The located MIR value whose code is being emitted — the last instruction result or
-    /// terminator operand [`FnTranslator::mark`]ed. Its `ValueId` is also the Cranelift `SourceLoc`
-    /// of every instruction emitted since, so a machine-code range maps back to a span through
-    /// [`Function::value_loc`] (what a DWARF line table consumes). Locations never change code:
+    /// The located MIR value whose code is being emitted, or `None` when that code has no known
+    /// location (see [`FnTranslator::translate`] for which instructions carry which). Its `ValueId`
+    /// is also the Cranelift `SourceLoc` of every instruction emitted since, so a machine-code range
+    /// maps back to a span through [`Function::value_loc`] (what a DWARF line table consumes); code
+    /// with no location carries the default `SourceLoc`. Locations never change code:
     /// `srcloc_tests` pins the object bytes with and without them.
     cur_loc: Option<ValueId>,
     /// Where `layout_err` was raised: the span of `cur_loc` at that moment, else the function's
@@ -930,6 +931,26 @@ fn term_operand(term: &Terminator) -> Option<ValueId> {
         Terminator::Ret(v) => *v,
         Terminator::Br { .. } | Terminator::Unreachable => None,
     }
+}
+
+/// Does the result-less instruction `op` read `v`? Lists the ops that produce no value; any other
+/// op answers `false`, which drops a location rather than borrowing one.
+fn void_op_reads(op: &Op, v: ValueId) -> bool {
+    match op {
+        Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => *ptr == v || *value == v,
+        Op::Call { args, .. } => args.contains(&v),
+        Op::VecKernelCall {
+            ptrs, scalars, n, ..
+        } => [*ptrs, *scalars, *n].contains(&v),
+        _ => false,
+    }
+}
+
+/// Does `term` read `v` — as its condition, scrutinee or return value, or as an edge argument?
+fn term_reads(term: &Terminator, v: ValueId) -> bool {
+    let mut reads = term_operand(term) == Some(v);
+    term.for_each_edge(|_, args| reads |= args.contains(&v));
+    reads
 }
 
 impl<'a> FnTranslator<'a> {
@@ -1051,6 +1072,21 @@ impl<'a> FnTranslator<'a> {
         self.builder.set_srcloc(SourceLoc::new(v.0));
     }
 
+    /// Attribute the instructions emitted from here on to nothing (the default `SourceLoc`).
+    fn unmark(&mut self) {
+        if self.cur_loc.take().is_some() {
+            self.builder.set_srcloc(SourceLoc::default());
+        }
+    }
+
+    /// Keep the current mark only when `reads` says the code about to be emitted reads the marked
+    /// value; otherwise drop it.
+    fn keep_mark_if(&mut self, reads: impl FnOnce(ValueId) -> bool) {
+        if !self.cur_loc.is_some_and(reads) {
+            self.unmark();
+        }
+    }
+
     /// `v` when it has a recorded source location.
     fn located(&self, v: Option<ValueId>) -> Option<ValueId> {
         v.filter(|&v| self.func.value_loc(v).is_some())
@@ -1064,6 +1100,16 @@ impl<'a> FnTranslator<'a> {
             .or(self.func.decl_span())
     }
 
+    /// Lower the whole function, attributing each Cranelift instruction to a MIR value
+    /// ([`FnTranslator::mark`]) — or to nothing. A location is dropped rather than borrowed, since a
+    /// wrong one would point a failure (and a debugger) at code that did not produce it:
+    /// - a block starts with no location, never the last one of the block RPO lowered before it;
+    /// - an instruction with a result carries that result's location, or none when it is unknown;
+    /// - an instruction without a result (a store, a void call) has no table entry of its own: it
+    ///   keeps the mark only while it reads the marked value (`store p, v` or `f(.., v)` right after
+    ///   `v`), and otherwise carries none;
+    /// - a terminator carries its condition's, scrutinee's or return value's location, else keeps the
+    ///   mark only while it reads the marked value (an edge argument).
     fn translate(&mut self) {
         // Give each Cranelift block its params (the entry block's are the function params).
         for (i, mb) in self.func.blocks.iter().enumerate() {
@@ -1089,19 +1135,12 @@ impl<'a> FnTranslator<'a> {
             let cb = self.blocks[bi as usize];
             self.builder.switch_to_block(cb);
             let mb = &func.blocks[bi as usize];
-            // A block's leading code (before its first located result) belongs to that result's
-            // construct rather than to whatever block RPO lowered last.
-            let first = mb
-                .insts
-                .iter()
-                .find_map(|inst| self.located(inst.result))
-                .or_else(|| self.located(term_operand(&mb.term)));
-            if let Some(v) = first {
-                self.mark(v);
-            }
+            self.unmark();
             for inst in &mb.insts {
-                if let Some(v) = self.located(inst.result) {
-                    self.mark(v);
+                match (inst.result, self.located(inst.result)) {
+                    (_, Some(v)) => self.mark(v),
+                    (Some(_), None) => self.unmark(),
+                    (None, None) => self.keep_mark_if(|m| void_op_reads(&inst.op, m)),
                 }
                 self.lower_inst(inst);
                 if self.layout_err.is_some() {
@@ -1111,8 +1150,9 @@ impl<'a> FnTranslator<'a> {
                     return;
                 }
             }
-            if let Some(v) = self.located(term_operand(&mb.term)) {
-                self.mark(v);
+            match self.located(term_operand(&mb.term)) {
+                Some(v) => self.mark(v),
+                None => self.keep_mark_if(|m| term_reads(&mb.term, m)),
             }
             self.lower_term(&mb.term);
         }

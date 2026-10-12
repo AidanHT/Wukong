@@ -101,7 +101,8 @@ fn span(lo: u32) -> wukong_span::Span {
 }
 
 /// `main` with a >4 GiB slot. `alloca_at` locates the alloca; `decl` declares the function after
-/// every value is built, so it locates nothing but the function itself.
+/// every value is built, so it locates nothing but the function itself. The `return 0` after the
+/// slot is located either way: it is not what failed, so an unlocated slot must not borrow its span.
 fn oversized(i: &mut Interner, alloca_at: Option<u32>, decl: Option<u32>) -> Program {
     let mut b = Builder::new(i.intern("main"), MirType::I32);
     if let Some(lo) = alloca_at {
@@ -112,14 +113,86 @@ fn oversized(i: &mut Interner, alloca_at: Option<u32>, decl: Option<u32>) -> Pro
     let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
     b.ret(Some(zero));
     let mut f = b.finish();
-    if alloca_at.is_none() {
-        // The trailing constant is not what failed; keep only the slot's own location (none).
-        f.locs = wukong_mir::SourceLocs::default();
-    }
     if let Some(lo) = decl {
         f.locs.decl = span(lo);
     }
     program_with(f)
+}
+
+/// The site `emit_object_kind_for_with` reports for `f`, declared at `span(1)` after it was built
+/// (so the declaration locates no value).
+fn site_of(i: &Interner, mut f: Function) -> Option<wukong_span::Span> {
+    f.locs.decl = span(1);
+    emit_object_kind_for_with(
+        &program_with(f),
+        i,
+        TargetCpu::Native,
+        BackendOpt::default(),
+        ObjectKind::Library,
+    )
+    .expect_err("the program cannot be compiled")
+    .site
+}
+
+/// An oversized slot that is not located, after a located value of the same block: the failure is
+/// the slot's, so it falls back to the declaration instead of naming the value before it.
+#[test]
+fn an_unlocated_failure_does_not_borrow_the_value_before_it() {
+    let mut i = Interner::new();
+    let mut b = Builder::new(i.intern("main"), MirType::I32);
+    b.set_loc(span(20));
+    let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+    b.restore_loc(wukong_span::Span::dummy());
+    b.alloca(MirType::Array(Box::new(MirType::F64), 600_000_000));
+    b.ret(Some(one));
+    assert_eq!(site_of(&i, b.finish()), Some(span(1)));
+}
+
+/// A block with no located value of its own does not inherit the location of the block lowered
+/// before it, nor take one from a value after the failure.
+#[test]
+fn an_unlocated_failure_does_not_borrow_across_blocks_or_from_later_values() {
+    for later in [false, true] {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("main"), MirType::I32);
+        b.set_loc(span(20));
+        let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let next = b.new_block();
+        b.br(next, vec![]);
+        b.switch_to(next);
+        b.build_void(Op::Call {
+            func: i.intern("mystery_symbol"),
+            args: vec![],
+        });
+        let ret = if later {
+            b.set_loc(span(60));
+            b.build(MirType::I32, Op::ConstInt(0, MirType::I32))
+        } else {
+            one
+        };
+        b.ret(Some(ret));
+        assert_eq!(
+            site_of(&i, b.finish()),
+            Some(span(1)),
+            "later value: {later}"
+        );
+    }
+}
+
+/// A result-less call that does not read the value lowered just before it (`bar();` after
+/// `let a = 1;`) is not that value's statement: it falls back to the declaration.
+#[test]
+fn a_call_that_reads_nothing_does_not_borrow_the_value_before_it() {
+    let mut i = Interner::new();
+    let mut b = Builder::new(i.intern("main"), MirType::I32);
+    b.set_loc(span(20));
+    let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+    b.build_void(Op::Call {
+        func: i.intern("mystery_symbol"),
+        args: vec![],
+    });
+    b.ret(Some(one));
+    assert_eq!(site_of(&i, b.finish()), Some(span(1)));
 }
 
 /// (a) A layout failure points at the slot that could not be laid out — on the object path and
@@ -172,10 +245,10 @@ fn an_unlocated_failure_falls_back_to_the_declaration_or_nothing() {
     assert_eq!(decl.site, Some(span(7)));
 }
 
-/// (c) An unsupported call has no result of its own, so it is reported at the last located value
-/// lowered before it — never at one after it.
+/// (c) An unsupported call has no result of its own, so it is reported at the located value it
+/// reads that was lowered just before it (its argument) — never at one after it.
 #[test]
-fn an_unsupported_call_points_at_the_last_located_value() {
+fn an_unsupported_call_points_at_the_value_it_reads() {
     let mut i = Interner::new();
     let mut b = Builder::new(i.intern("main"), MirType::I32);
     b.set_decl(span(1));

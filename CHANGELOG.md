@@ -22,11 +22,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   result-bearing instructions located (the census in `crates/wukong_opt/tests/source_locations.rs`
   pins at least 74%). The table is dropped-entry-safe, verifier-bounded and invisible to
   `--emit=mir`, which is byte-identical.
-- **Cranelift instructions carry their MIR value as a source location.** Each instruction's
-  `SourceLoc` is the `ValueId` it was lowered for, so a machine-code range maps back to a span: the
-  input a DWARF line table needs. Emitting that table is what remains of N70. The locations never
-  change code; a test pins the object bytes with and without them, at `-O0` and `-O2`, serial and
-  parallel.
+- **Cranelift instructions carry their MIR value as a source location.** An instruction's
+  `SourceLoc` is the located `ValueId` it was lowered for (a store or void call: the value it reads
+  that was lowered just before it), so a machine-code range maps back to a span: the input a DWARF
+  line table needs. Code with no known location — an optimizer-created value's, a block's head —
+  carries the default `SourceLoc` instead of borrowing a neighbour's, so a failure there falls back
+  to the function's declaration rather than naming a statement that did not produce it. Emitting
+  that table is what remains of N70. The locations never change code; a test pins the object bytes
+  with and without them, at `-O0` and `-O2`, serial and parallel.
 
 ### Optimizer pass lists and typed textual MIR (`gap5/mir-text-passes`)
 

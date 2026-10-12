@@ -629,12 +629,17 @@ lowering every value of a source function is located (`crates/wukong_opt/tests/s
 pins 100% over `tests/run`). Of the optimizer's passes only inlining (the callee's values keep the
 callee's spans) and loop unrolling (each copy keeps its original's) carry locations onto the values
 they create; every other new value stays unknown, and the same census pins the share that survives
-`-O2` from below. The Cranelift backend tags every instruction with the `ValueId` of the located
-value it is lowering as its `SourceLoc`, so a machine-code range maps back to a span through
-`Function::value_loc` — the input a DWARF line table needs (not emitted yet) — and a backend failure
-is reported at that value's span. Locations never change code: the object bytes with and without the
-table are pinned equal. The interpreter and the printer ignore the table, so `--emit=mir` is
-unchanged by it.
+`-O2` from below. The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
+`ValueId` (`FnTranslator::translate`): an instruction with a result carries that value when it is
+located; a store or void call, which has no table entry of its own, carries the value it reads when
+that value was lowered just before it; a terminator carries its condition, scrutinee or return
+value. Everything else — an unlocated value's code, the head of a block, a call that reads nothing
+just lowered — carries the default (unknown) `SourceLoc`: a location is dropped, never borrowed from
+a neighbour. A machine-code range therefore maps back to a span through `Function::value_loc` — the
+input a DWARF line table needs (not emitted yet) — and a backend failure is reported at the span of
+the value being lowered, else at the function's declaration. Locations never change code: the
+object bytes with and without the table are pinned equal. The interpreter and the printer ignore
+the table, so `--emit=mir` is unchanged by it.
 
 `wukong_mir::print` renders MIR deterministically — the text behind `--emit=mir` and
 `--emit=mir-high`, and stable enough for snapshot tests. It is also the grep surface for checking what

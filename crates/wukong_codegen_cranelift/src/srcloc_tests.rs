@@ -1,6 +1,7 @@
-//! Per-instruction source locations (`FnTranslator::mark`): every Cranelift instruction carries
-//! the `ValueId` of the located MIR value it was lowered for as its `SourceLoc`, so a machine-code
-//! range maps back to a span through `Function::value_loc` — what a DWARF line table consumes.
+//! Per-instruction source locations (`FnTranslator::mark`): a Cranelift instruction carries the
+//! `ValueId` of the located MIR value it was lowered for as its `SourceLoc` (or the default one when
+//! that value is unknown — see `FnTranslator::translate`), so a machine-code range maps back to a
+//! span through `Function::value_loc` — what a DWARF line table consumes.
 //!
 //! The invariant that matters most is that locations never change code: an object built from a
 //! program with its location table is byte-identical to the one built without it.
