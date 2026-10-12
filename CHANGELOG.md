@@ -37,10 +37,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
     per exact symbol, the operand written, its extent, and the operand values under which the
     overwrite holds (`beta` the constant 0, `K >= 1` for a GEMM, a norm's op code one it
     implements — an unknown one writes nothing). Its test runs every entry against its kernel over
-    an output pre-filled with two different patterns and requires bit-identical results (4,954
-    calls, every integer operand an entry leaves free also probed at 0 and -1); an entry that
-    overstates its extent fails it. A kernel that accumulates or reads its output in place kills
-    nothing, and so does a call whose output is also reachable through another operand.
+    an output pre-filled four ways (a NaN, -3e30, +3e30 and a per-element pattern) and requires
+    bit-identical results (5,181 calls, every integer operand an entry leaves free also probed at 0
+    and -1, every `_parallel` entry with a size gate of its own run past it); an entry that
+    overstates its extent fails it, and so does a kernel that seeds a sum, product, max, min or
+    magnitude fold from its output (a running max passes a NaN and -3e30 alike, hence +3e30). A
+    kernel that accumulates or reads its output in place kills nothing, and so does a call whose
+    output is also reachable through another operand.
 - **Liveness is driven by reads.** A store is a use but not a read, so a slot whose stored values
   are all overwritten before any read occupies its storage only at the stores themselves: arrays
   zeroed together in one fused loop and rewritten before they are read no longer interfere.

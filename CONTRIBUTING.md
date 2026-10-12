@@ -498,11 +498,16 @@ If the kernel writes every element of its output before reading any of it, add i
 `wukong_runtime::OVERWRITES` (`crates/wukong_runtime/src/overwrite.rs`) with the operand values
 that guarantee it — and its test operands in that module's `calls`/`invoke` — so the native backend's
 stack coloring can end a scratch array's lifetime at the call. The entry is a promise the coloring
-trusts: `every_contract_holds_on_the_kernel` runs it against the kernel over two different output
-fills, and probes every integer operand the entry leaves free at 0 and -1, so an early exit on a
-value the entry admits (an unknown op code, a zero flag) fails it; an extent or `positive` operand
-must be listed (a GEMM's `K <= 0` writes nothing). A kernel left out of the table is merely assumed
-to read its output.
+trusts: `every_contract_holds_on_the_kernel` runs it against the kernel over four output fills (a
+NaN, `-3.0e30`, `+3.0e30` and a per-element pattern, chosen so a sum, product, max, min or magnitude
+fold seeded from the output is caught), and probes every integer operand the entry leaves free at
+0 and -1, so an early exit on a value the entry admits (an unknown op code, a zero flag) fails it;
+an extent or `positive` operand must be listed (a GEMM's `K <= 0` writes nothing). A `_parallel`
+entry with a size gate of its own needs a test shape past that gate (`past_size_gate`), or the test
+only ever runs its serial fallback. The fills are a test, not a proof: a read of the old value
+through a computation every fill is an identity of still passes, so read the kernel too — a fold
+must seed from its input (as the column max seeds from row 0), never from `out`. A kernel left out
+of the table is merely assumed to read its output.
 
 If the kernel is differentiable, mirror it in `crates/wukong_autodiff/src/tape.rs` (`Syms`,
 `is_kernel`, `diff_kernel_call`) — **including the `_parallel` spelling**: a `_parallel` recognizer
