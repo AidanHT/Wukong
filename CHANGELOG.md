@@ -41,7 +41,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
   sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
   then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was
-  inlined and deleted. Both mention tests now count a turbofish name.
+  inlined and deleted. Both mention tests now count a turbofish name. A module `const` named in a
+  turbofish is not such a read (it is its value there, and is never deleted), so it still folds
+  into the rest of the function, whose loops keep a literal trip count.
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
