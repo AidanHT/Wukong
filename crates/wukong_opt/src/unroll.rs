@@ -174,6 +174,7 @@ use wukong_mir::{
     BasicBlock, BinOp, BlockId, CmpOp, Function, Inst, MirType, Op, Program, Terminator, ValueId,
 };
 
+use crate::parallel::{self, Parallelism};
 use crate::{cfg, map_op_uses, map_term_uses};
 
 /// Bodies up to this many instructions unroll 4x. Anything larger is left alone: a big body already
@@ -207,16 +208,27 @@ fn disabled() -> bool {
 /// of a nest whose inner loop carries a serial chain side by side; the jammed inner loop is then an
 /// ordinary counted loop this pass may still unroll. The two have separate switches
 /// (`WUKONG_NO_UNROLL_JAM`, `WUKONG_NO_UNROLL`), and a function either changed is cleaned up.
+///
+/// One function at a time, on the calling thread; [`crate::optimize`] runs the same stage over
+/// several functions at once (`unroll_program_with`), with the same result.
 pub fn unroll_program(program: &mut Program) -> Vec<usize> {
-    let mut changed = Vec::new();
-    for (i, f) in program.funcs.iter_mut().enumerate() {
+    unroll_program_with(program, Parallelism::SEQUENTIAL)
+}
+
+/// [`unroll_program`] on up to `par`'s threads. Each function is unrolled from its own body alone,
+/// so the functions are independent tasks ([`crate::parallel`]).
+pub(crate) fn unroll_program_with(program: &mut Program, par: Parallelism) -> Vec<usize> {
+    let all: Vec<usize> = (0..program.funcs.len()).collect();
+    let changed = parallel::map(par, parallel::select_mut(&mut program.funcs, &all), |f| {
         let jammed = crate::unroll_jam::jam_function(f);
         let unrolled = !disabled() && unroll_function(f);
-        if jammed || unrolled {
-            changed.push(i);
-        }
-    }
+        jammed || unrolled
+    });
     changed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, changed)| changed.then_some(i))
+        .collect()
 }
 
 /// Unroll the counted loops of one function. Returns whether anything changed.

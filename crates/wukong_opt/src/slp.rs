@@ -94,6 +94,7 @@ use wukong_mir::{BinOp, Function, Inst, MirType, Op, Program, RoundMode, ValueId
 
 use crate::alias::{type_bytes, AliasInfo};
 use crate::fxhash::{FxHashMap, FxHashSet};
+use crate::parallel::{self, Parallelism};
 
 /// The vector register width this pass packs into, as the loop vectorizer's: Cranelift's x64 ISA
 /// legalizes 128-bit vectors only.
@@ -110,18 +111,30 @@ const MAX_NODES: usize = 32;
 
 /// Pack the straight-line store bundles of every function. Returns the indices of the functions it
 /// changed, for the caller's cleanup sweep. Empty when `WUKONG_NO_SLP` is set.
+///
+/// One function at a time, on the calling thread; [`crate::optimize`] packs several functions at
+/// once (`slp_program_with`), with the same result.
 pub fn slp_program(program: &mut Program) -> Vec<usize> {
+    slp_program_with(program, Parallelism::SEQUENTIAL)
+}
+
+/// [`slp_program`] on up to `par`'s threads: each function is packed from its own body alone.
+/// `WUKONG_SLP_TRACE` resolves every `par` to the sequential schedule, so the trace keeps program
+/// order.
+pub(crate) fn slp_program_with(program: &mut Program, par: Parallelism) -> Vec<usize> {
     if std::env::var_os("WUKONG_NO_SLP").is_some() {
         return Vec::new();
     }
     let trace = std::env::var_os("WUKONG_SLP_TRACE").is_some();
-    let mut changed = Vec::new();
-    for (i, f) in program.funcs.iter_mut().enumerate() {
-        if slp_function(f, trace) {
-            changed.push(i);
-        }
-    }
+    let all: Vec<usize> = (0..program.funcs.len()).collect();
+    let changed = parallel::map(par, parallel::select_mut(&mut program.funcs, &all), |f| {
+        slp_function(f, trace)
+    });
     changed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, changed)| changed.then_some(i))
+        .collect()
 }
 
 /// The lane types this pass packs, and their width in bytes.

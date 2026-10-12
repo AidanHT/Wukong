@@ -15,6 +15,9 @@ workspace = true
 [dependencies]
 wukong_mir = { workspace = true }
 wukong_span = { workspace = true }
+# The per-function phases run on a private pool (`src/parallel.rs`); the version the Cranelift
+# backend and the runtime already lock.
+rayon = "1"
 
 [dev-dependencies]
 wukong_parser = { workspace = true }

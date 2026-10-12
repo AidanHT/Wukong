@@ -49,6 +49,13 @@
 //! bodies, so a caller sees its callees at their most analyzable. A function's semantics — and so
 //! its summary — is preserved by every later transform, which is what makes it sound to use the
 //! table while other functions are still being optimized.
+//!
+//! Every consumer asks the table about one symbol at a time, and only about a symbol an `Op::Call`
+//! of the function being optimized names — never "what is in the table". That is what lets the
+//! parallel schedule ([`crate::parallel`]) optimize a whole call-graph *level* at once against the
+//! table as it stands after the levels below: each function's callees sit in lower levels, so their
+//! entries are exactly the ones the one-SCC-at-a-time order would have shown it, and an entry for
+//! anything else is never read.
 
 use wukong_mir::{AddrSpace, BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId};
 use wukong_span::Symbol;
@@ -108,6 +115,11 @@ impl CallEffects {
 pub(crate) struct CallGraph {
     /// Function indices per SCC; every SCC appears after every SCC it calls.
     pub(crate) sccs: Vec<Vec<u32>>,
+    /// Per SCC, the length of the longest chain of calls out of it into other SCCs: 0 for an SCC
+    /// that calls none, otherwise one more than the deepest SCC it calls. Two SCCs of one level
+    /// never call each other, directly or not, so once every lower level is summarized their
+    /// members can be optimized in any order — or at once ([`CallGraph::levels`]).
+    level: Vec<u32>,
     /// Whether a function outside the SCC calls one of its members — the only case in which its
     /// summary is ever consulted, so the only case worth computing it.
     called: Vec<bool>,
@@ -157,11 +169,35 @@ impl CallGraph {
                 }
             }
         }
+        // Callees first, so every SCC a component calls already has its level.
+        let mut level = vec![0u32; sccs.len()];
+        for (c, members) in sccs.iter().enumerate() {
+            for &m in members {
+                for &callee in &adj[m as usize] {
+                    let d = comp[callee as usize];
+                    if d != c {
+                        level[c] = level[c].max(level[d] + 1);
+                    }
+                }
+            }
+        }
         CallGraph {
             sccs,
+            level,
             called,
             duplicated,
         }
+    }
+
+    /// The SCC indices grouped by [`CallGraph::level`], lowest level first, each group in SCC
+    /// order. Every SCC an SCC calls is in an earlier group.
+    pub(crate) fn levels(&self) -> Vec<Vec<usize>> {
+        let depth = self.level.iter().max().map_or(0, |&l| l as usize + 1);
+        let mut groups = vec![Vec::new(); depth];
+        for (scc, &l) in self.level.iter().enumerate() {
+            groups[l as usize].push(scc);
+        }
+        groups
     }
 
     /// Summarize SCC `scc` from its members' current bodies and record the result in `table`. A
