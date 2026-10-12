@@ -223,3 +223,32 @@ fn f16_loops_take_f16c_kernels_and_follow_every_switch() {
         assert_eq!(kernels_in(&path, args, env), 0, "{what}");
     }
 }
+
+/// The 128-bit form of the same loops through the real binary: `tests/run/vec_f16_lanes.wk`'s five
+/// f16 loops print as `<4 x f16>` at `-O2` — with the 256-bit kernels off (`x86-64-v2`), where the
+/// vector loop is all there is, and with them on, where it is the kernel's remainder — and as no
+/// vector at all before optimization.
+#[test]
+fn f16_loops_print_as_four_f16_lanes() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/run/vec_f16_lanes.wk");
+    let mir = |args: &[&str]| -> String {
+        let out = wukongc(args, &path);
+        assert!(
+            out.status.success(),
+            "wukongc {args:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(!mir(&["--emit=mir-high"]).contains("x f16>"));
+    for args in [
+        &["--emit=mir", "-O2", "--target-cpu=x86-64-v2"][..],
+        &["--emit=mir", "-O2"][..],
+    ] {
+        let text = mir(args);
+        assert!(
+            text.contains("load <4 x f16>") && text.contains("fptrunc"),
+            "{args:?}: no <4 x f16> loop"
+        );
+    }
+}
