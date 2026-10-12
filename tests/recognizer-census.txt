@@ -48,6 +48,7 @@ atomic_add_histogram.wk: wukong_parallel_for wukong_parallel_for*4 wukong_rt_all
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
 autodiff_train_helper.wk:
 autodiff_train_mlp.wk: wukong_sgemm_nt_epi_parallel wukong_sgemm_nt_epi_parallel*2 wukong_sreduce_f32_parallel
+autodiff_train_parallel_region.wk: wukong_parallel_for wukong_sreduce_f32_parallel
 autodiff_train_sumsq.wk: wukong_sreduce_f32_parallel
 avgpool.wk: wukong_avgpool2d_f32
 axpby_f16.wk: wukong_axpby_f16

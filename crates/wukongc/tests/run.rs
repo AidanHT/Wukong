@@ -33,7 +33,9 @@ mod common;
 ///
 /// 517: the measured top-level count once the eighteen `cov4_*` coverage fixtures joined the 499
 /// on main (the floor had been left at 390 while the tree grew past it, 109 fixtures of slack).
-const MIN_FIXTURES: usize = 517;
+/// 571: the measured count once `autodiff_train_parallel_region.wk` joined (gap6/autodiff-parallel;
+/// the floor had again been left behind, at 517 under 570).
+const MIN_FIXTURES: usize = 571;
 
 /// Monotonic counter handing every spawned `wukongc` a distinct scratch directory.
 static WORK_SEQ: AtomicU64 = AtomicU64::new(0);
