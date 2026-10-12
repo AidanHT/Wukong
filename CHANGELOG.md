@@ -85,6 +85,51 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `N` from the function too (first binding wins, every other argument checked against it), and a
   dimension named only by the function parameter is passed to the instance as a hidden dimension
   argument (`tests/run/closure_infer.wk`).
+### `@parallel` regions over slices, run-time trip counts and kernel builtins (`gap6/outliner-slices-kernels`)
+
+- **A `@parallel` loop region may capture `[]T` slices (N85).** The mid-function region outliner used
+  to refuse any loop that indexed a slice, so a `@parallel` function over `[]f32` parameters ran its
+  compound loops serially — `examples/gpt2_forward_bench_par.wk`'s 12-head attention loop among them.
+  A slice of scalars is now a capture (`(data, len)` behind its fat pointer, which nothing in a region
+  can re-point) whose accesses take the same mixed-radix disjointness proof as an array's. Because two
+  slices of one element type can view one buffer at any offset, such a pair is settled at run time:
+  the threaded `wukong_parallel_for` call runs only when their element ranges are disjoint (or start
+  at one address and the union of their accesses passed the proof, the in-place `f(x, x)`), and
+  otherwise the same outlined body runs once over every chunk on the calling thread — the serial
+  loop. `tests/run/parallel_region_slices.wk` calls one region with overlapping views
+  (`shift(w[0..64], w[8..72], 8)`, a loop-carried chain through memory): with the run-time test
+  removed it printed a wrong answer natively in 9 of 10 runs, with it 0 of 11.
+- **Run-time trip counts.** A region's trip count may be a pure bound of a signed counter known only
+  at run time (`0..rows`, `0..s.len()`), evaluated once; the proof then erases no index term modulo
+  `C·N`. A `const` trip count is now a constant like a literal.
+- **Kernel builtins inside a region.** `softmax`, `matmul`, `rmsnorm`, the activations, `sum`, `sdpa`
+  and the other named builtins are admitted as exactly the reads and writes of their operands, so a
+  row kernel on the iteration's own range view (`softmax(x[r*8..r*8 + 8], out[r*8..r*8 + 8])`)
+  threads the rows; the outlined body calls the serial kernel. A view of another row, a run-time
+  length, `out[lo..]` or a whole captured output keeps the loop serial.
+  `tests/run/parallel_region_kernels.wk` prints every lane of a `sum`, a per-head `matmul` and two
+  `relu` regions, one of them over overlapping views.
+- **One band per buffer.** The single-digit proof accepts an index whose non-digit terms lie in any
+  one band `[k·C, k·C + C)` common to the buffer's accesses (`out[(h + 1)*8 + j]`), not only
+  `[0, C)`; a buffer read at one band and written at another still declines.
+- **A loop body with more scratch than a worker's stack holds stays serial.** Outlined, a body's
+  locals live in the outlined function's frame, which runs on a runtime pool worker with a 16 MiB
+  stack, not in the enclosing frame on the calling thread (256 MiB under `--run`). A slice-based
+  `@parallel` function the region outliner used to decline, `rows(x: []f32, mut out: []f32, n: i64)`
+  whose loop body declares `let mut t: [f32; 5000000]` (20 MB), therefore aborted with a stack
+  overflow under `--backend=native` once it threaded, while the interpreter, which runs a region in
+  order on heap-backed slots, printed the right answer; the whole-function outliner already did the
+  same to an array-only loop of that shape. Both outliners now keep a loop serial when the outlined
+  body's static frame (its `alloca` slots) exceeds half a worker stack, 8 MiB
+  (`par_grain::OUTLINED_FRAME_BUDGET`). No corpus loop comes near it: the largest region scratch,
+  `examples/gpt2_forward_bench_par.wk`'s per head, is about 1.6 MB. Tests:
+  `crates/wukongc/tests/parallel_frame_budget.rs` (both shapes, native at `-O0`/`-O2`) and the
+  budget tests in `par_region_tests.rs`.
+- No `_parallel` recognizer arm was added, so `wukong_autodiff/src/tape.rs` and
+  `wukong_interp::intrinsic` need no mirror. No existing fixture gained or lost a dispatch in the
+  recognizer census; it gains only the two new fixtures' lines. Unit tests:
+  `crates/wukong_mir_build/src/par_region_tests.rs` (every accept with its reject, and the corpus
+  decline census by reason).
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 

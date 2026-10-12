@@ -33,6 +33,7 @@ cargo test -p wukongc --test run
 | `diag_json.rs` | `--error-format=json` schema v1 against the real binary: the v0 prefix is unchanged and the v1 fields (end positions, byte range, `suggestions`, `children`, `rendered`, `version`) are present |
 | `explain.rs` | `--explain` lists every code, prints each entry, and every catalogue `bad:`/`good:` example is compiled under `--emit=check` (bad yields exactly its code first, good checks clean) |
 | `gpt2_config.rs` | GPT-2 config fixture |
+| `parallel_frame_budget.rs` | a `@parallel` loop whose body declares 20 MB of scratch (a slice region and an array-only whole-function loop) runs serially on native at `-O0`/`-O2` and prints the hand-derived lanes; outlined, its frame overflowed a 16 MiB runtime worker stack (native-only: the interpreter takes over ten seconds per run at that size) |
 | `tensor_parity.rs` | vector-kernel recipe parity (host-gated) |
 | `training_data.rs` | `--train-init` / `--train-data` / `--train-save` / `--train-clip` / `--train-warmup` / `--train-schedule` through the binary: hand-derived trajectories and saved weights, interp == native, and the file-shape refusals |
 | `train_lm.rs` | `tests/run/train_tiny_lm.wk` (embedding + tanh layer + projection + cross-entropy) trains on both backends at `-O0`/`-O2`, matching an f64 reference trajectory and decreasing strictly |

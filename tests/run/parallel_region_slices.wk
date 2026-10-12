@@ -1,0 +1,109 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 0 1 2 3 4 5 6 7
+// EXPECT-OUT-VALUES: 28 29 30 31 32 33 34 35
+// EXPECT-OUT-VALUES: 280 281 282 283 284 285 286 287
+// EXPECT-OUT-VALUES: 2548 2549 2550 2551 2552 2553 2554 2555
+// EXPECT-OUT-VALUES: 22960 22961 22962 22963 22964 22965 22966 22967
+// EXPECT-OUT-VALUES: 206668 206669 206670 206671 206672 206673 206674 206675
+// EXPECT-OUT-VALUES: 1860040 1860041 1860042 1860043 1860044 1860045 1860046 1860047
+// EXPECT-OUT-VALUES: 16740388 16740389 16740390 16740391 16740392 16740393 16740394 16740395
+// EXPECT-OUT-VALUES: 150663520 150663521 150663522 150663523 150663524 150663525 150663526 150663527
+// EXPECT-OUT-VALUES: 28 29 30 31 32 33 34 35
+// EXPECT-OUT-VALUES: 100 101 102 103 104 105 106 107
+// EXPECT-OUT-VALUES: 172 173 174 175 176 177 178 179
+// EXPECT-OUT-VALUES: 244 245 246 247 248 249 250 251
+// EXPECT-OUT-VALUES: 28 29 30 31 32 33 34 35
+// EXPECT-OUT-VALUES: 100 101 102 103 104 105 106 107
+// EXPECT-OUT-VALUES: 172 173 174 175 176 177 178 179
+// EXPECT-OUT-VALUES: 244 245 246 247 248 249 250 251
+module tests.run.parallel_region_slices
+
+// `@parallel` loop regions over `[]T` slices (N85). `shift` and `shift4` take their buffers as
+// slices, so the region outliner captures each as `(data, len)` behind its fat pointer. Two slices
+// of one element type may view one buffer at ANY offset, which no name can tell, so the threaded
+// call is versioned on a run-time test of their element ranges: `--emit=mir -O0` shows one
+// `wukong_parallel_for` behind four `ptrtoint`s (two per slice) and, on the may-overlap arm, a
+// direct call of the same outlined body over every chunk, in order, on the calling thread.
+//
+// Every head h reads row h of `src` (lanes 8h..8h+7) and writes the same row of `dst`:
+//     s = src[8h] + ... + src[8h + 7];   dst[8h + j] = src[8h + j] + s
+// Expected values are that scalar loop, evaluated by hand; every lane is printed.
+//
+// (1) Overlapping views at an offset: shift(w[0..64], w[8..72], 8) with w[i] = i. Head h reads row
+//     h of w and writes row h + 1, which head h + 1 reads next -- a loop-carried chain through
+//     memory, so the ranges [0, 64) and [8, 72) of one buffer must take the serial arm. Writing
+//     row k of w as j + c_k (j the lane): row k + 1 = row k + sum(row k) = j + c_k + 8 c_k + 28,
+//     so c_0 = 0, c_(k+1) = 9 c_k + 28, and c = 0, 28, 280, 2548, 22960, 206668, 1860040,
+//     16740388, 150663520 (all well inside i32). Threaded, head h + 1 could read row h + 1 before
+//     head h rewrote it and print a different answer from run to run.
+// (2) Disjoint buffers, constant trip count: shift4(a, b) with a[i] = i. Row h of a sums to
+//     64h + 28, so b[8h + j] = 8h + j + 64h + 28 = 72h + j + 28: 28..35, 100..107, 172..179,
+//     244..251. The ranges are apart, so this runs threaded.
+// (3) In place, run-time trip count: shift(c, c, 4) with c[i] = i. Both slices start at one
+//     address and every access of either lies in head h's own row, so this runs threaded too; each
+//     head sums its row before rewriting it, so the values are those of (2).
+
+@parallel
+fn shift(src: []i32, mut dst: []i32, n: i32) {
+    for h in 0..n {
+        let mut s: i32 = 0;
+        for j in 0..8 {
+            s = s + src[h * 8 + j];
+        }
+        for j in 0..8 {
+            dst[h * 8 + j] = src[h * 8 + j] + s;
+        }
+    }
+}
+
+@parallel
+fn shift4(src: []i32, mut dst: []i32) {
+    for h in 0..4 {
+        let mut s: i32 = 0;
+        for j in 0..8 {
+            s = s + src[h * 8 + j];
+        }
+        for j in 0..8 {
+            dst[h * 8 + j] = src[h * 8 + j] + s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // (1)
+    let mut w: []i32 = alloc_i32(72);
+    for i in 0..72 {
+        w[i] = i;
+    }
+    shift(w[0..64], w[8..72], 8);
+    for i in 0..72 {
+        print(w[i]);
+    }
+    free(w);
+
+    // (2)
+    let mut a: []i32 = alloc_i32(32);
+    let mut b: []i32 = alloc_i32(32);
+    for i in 0..32 {
+        a[i] = i;
+    }
+    shift4(a, b);
+    for i in 0..32 {
+        print(b[i]);
+    }
+
+    // (3)
+    let mut c: []i32 = alloc_i32(32);
+    for i in 0..32 {
+        c[i] = i;
+    }
+    shift(c, c, 4);
+    for i in 0..32 {
+        print(c[i]);
+    }
+    free(a);
+    free(b);
+    free(c);
+    return 0;
+}

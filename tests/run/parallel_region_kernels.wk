@@ -1,0 +1,130 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 0 1 2 3 4 5 6 7
+// EXPECT-OUT-VALUES: 28 29 30 31 32 33 34 35
+// EXPECT-OUT-VALUES: 280 281 282 283 284 285 286 287
+// EXPECT-OUT-VALUES: 2548 2549 2550 2551 2552 2553 2554 2555
+// EXPECT-OUT-VALUES: 22960 22961 22962 22963 22964 22965 22966 22967
+// EXPECT-OUT-VALUES: 206668 206669 206670 206671 206672 206673 206674 206675
+// EXPECT-OUT-VALUES: 1860040 1860041 1860042 1860043 1860044 1860045 1860046 1860047
+// EXPECT-OUT-VALUES: 16740388 16740389 16740390 16740391 16740392 16740393 16740394 16740395
+// EXPECT-OUT-VALUES: 1 3 3 7
+// EXPECT-OUT-VALUES: 5 11 7 15
+// EXPECT-OUT-VALUES: 9 19 11 23
+// EXPECT-OUT-VALUES: -13 -12 -11 -10 -9 -8 -7 -6
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 0 0
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 0 0
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 0 0
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 0 0
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 0 0
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 1 2
+// EXPECT-OUT-VALUES: 3 4 5 6 7 8 9 10
+// EXPECT-OUT-VALUES: 11 12 13 14 15 16 17 18
+module tests.run.parallel_region_kernels
+
+// Kernel builtins inside `@parallel` loop regions (N85). A builtin call is admitted in a region as
+// exactly the accesses of its operands: sema's shape record and the lowering's run-time extent
+// checks pin each buffer operand to the elements its shape names, so a range view
+// `s[r*8..r*8 + 8]` with a constant length is the iteration's own row, and the outlined body calls
+// the SERIAL kernel (`--emit=mir -O2`: `wukong_parallel_for` in each function, and
+// `wukong_sreduce_f32` / `wukong_sgemm` / `wukong_vmath_f32` -- never a `_parallel` twin -- in the
+// outlined bodies). The slices are captured behind the run-time range test of
+// `parallel_region_slices.wk`. Expected values are the scalar definitions evaluated by hand over
+// small integers, exact in f32 in any summation order; every lane is printed.
+//
+// (1) `sum` of each row, overlapping views at an offset: prefix_rows(w[0..56], w[8..64], 7) with
+//     w[i] = i. Head h reads row h of w and writes row h + 1 = row h + sum(row h): row k is
+//     j + c_k with c_0 = 0, c_(k+1) = 9 c_k + 28, so c = 0, 28, 280, 2548, 22960, 206668, 1860040,
+//     16740388 (the largest sum, 8 * 1860040 + 28 = 14880348, is below 2^24, so every partial sum
+//     is exact). The ranges overlap, so the region takes the serial arm; threaded, a head could
+//     sum a row its predecessor had not rewritten yet.
+// (2) `matmul` per head on disjoint buffers: c_h = a_h * b_h for 2x2 blocks h = 0, 1, 2 with
+//     a_h = [[4h+1, 4h+2], [4h+3, 4h+4]] and b_h = [[1, 1], [0, 1]], so c_h = [[p, p+q], [r, r+s]]:
+//     1 3 3 7 / 5 11 7 15 / 9 19 11 23.
+// (3) `relu` of each row, overlapping views: row_relu(v[0..32], v[8..40], 4) with v[i] = i - 13.
+//     Serially row 1 = relu(row 0) = 0 (row 0 is -13..-6) and every later row is relu(0) = 0, so
+//     lanes 0..7 keep -13..-6 and lanes 8..39 are 0; threaded, row 2 could be relu of the
+//     unrewritten -5..2 and print 1 and 2.
+// (4) `relu` in place: row_relu(u, u, 4) with u[i] = i - 13. One start address and each head in
+//     its own row, so this runs threaded: lanes 0..13 are 0 and lanes 14..31 are 1..18.
+
+@parallel
+fn prefix_rows(src: []f32, mut dst: []f32, n: i32) {
+    for h in 0..n {
+        let s: f32 = sum(src[h * 8..h * 8 + 8]);
+        for j in 0..8 {
+            dst[h * 8 + j] = src[h * 8 + j] + s;
+        }
+    }
+}
+
+@parallel
+fn heads_mm(a: []f32, b: []f32, mut c: []f32) {
+    for h in 0..3 {
+        matmul::<2, 2, 2>(a[h * 4..h * 4 + 4], b[h * 4..h * 4 + 4], c[h * 4..h * 4 + 4]);
+    }
+}
+
+@parallel
+fn row_relu(x: []f32, mut out: []f32, n: i32) {
+    for r in 0..n {
+        relu(x[r * 8..r * 8 + 8], out[r * 8..r * 8 + 8]);
+    }
+}
+
+fn main() -> i32 {
+    // (1)
+    let mut w: []f32 = alloc_f32(64);
+    for i in 0..64 {
+        w[i] = i as f32;
+    }
+    prefix_rows(w[0..56], w[8..64], 7);
+    for i in 0..64 {
+        print(w[i]);
+    }
+    free(w);
+
+    // (2)
+    let mut a: []f32 = alloc_f32(12);
+    let mut b: []f32 = alloc_f32(12);
+    let mut c: []f32 = alloc_f32(12);
+    for i in 0..12 {
+        a[i] = (i + 1) as f32;
+    }
+    for h in 0..3 {
+        b[h * 4] = 1.0;
+        b[h * 4 + 1] = 1.0;
+        b[h * 4 + 2] = 0.0;
+        b[h * 4 + 3] = 1.0;
+    }
+    heads_mm(a, b, c);
+    for i in 0..12 {
+        print(c[i]);
+    }
+    free(a);
+    free(b);
+    free(c);
+
+    // (3)
+    let mut v: []f32 = alloc_f32(40);
+    for i in 0..40 {
+        v[i] = (i - 13) as f32;
+    }
+    row_relu(v[0..32], v[8..40], 4);
+    for i in 0..40 {
+        print(v[i]);
+    }
+    free(v);
+
+    // (4)
+    let mut u: []f32 = alloc_f32(32);
+    for i in 0..32 {
+        u[i] = (i - 13) as f32;
+    }
+    row_relu(u, u, 4);
+    for i in 0..32 {
+        print(u[i]);
+    }
+    free(u);
+    return 0;
+}

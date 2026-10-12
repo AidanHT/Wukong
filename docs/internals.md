@@ -1898,6 +1898,65 @@ loop (elementwise); an outlined `@parallel` chunk has no versioning context and 
 versions; and the `@parallel` region outliner, the generic vectorizer's loop fusion (`try_fuse_run`)
 and the half-output runtime kernels' own shifted-overlap handling are outside this classifier.
 
+### The `@parallel` region proof: slices, run-time trip counts, kernel builtins
+
+The mid-function region outliner (`FnLowerer::try_emit_parallel_region` in `wukong_mir_build/src/lib.rs`,
+with `par_region.rs` beside it) threads a loop only when no two iterations touch one element: every
+escaping write, and every read of a buffer that is written, must carry the loop variable as a
+mixed-radix digit (`hh*C + …`, or the tiled `hh/C`, `hh%C` pair), with every other index term either
+**outer** (a stride that is a multiple of `C·N`, erased mod the modulus) or bounded inside one band
+`[k·C, k·C + C)` common to all accesses of the buffer. N85 widened what the proof can see in three ways,
+none of which weakens it:
+
+- **`[]T` slices.** A slice capture is `(data, len)` behind a fat pointer that no region statement can
+  re-point (a capture is never assigned whole, and no admitted call receives one by name), so its
+  accesses take the per-buffer proof like an array's. The cross-name question cannot be settled by a
+  name: two arrays the caller may bind to one buffer are one buffer at one OFFSET (the union proof),
+  but a slice may view any part of any buffer of its element scalar. `par_region::region_relation`
+  therefore classifies each pair of captured buffers as `Distinct` (different element scalars, two
+  allocas, an alloca and a parameter, a `@noalias`-separated array pair), `Union` (the same binding,
+  or array parameters that may alias) or `Runtime` (a slice is involved). A `Runtime` pair becomes a
+  `RegionGuard`: the call site tests `[ptrtoint(base), ptrtoint(gep(base, len)))` of both — measured
+  by `Gep`, so the interpreter counts slots and Cranelift bytes and both reach one verdict, the
+  `kernel_guard.rs` argument — and threads only when every pair is disjoint, or starts at one address
+  when the pair's union passed the proof (`same_base_ok`). The may-overlap arm calls the outlined
+  body directly, `body(0, chunks, env)`: every chunk in order on the calling thread, which is the
+  serial loop and exactly what the interpreter does for `wukong_parallel_for`. A region with no
+  `Runtime` pair emits the unguarded call it always did.
+- **Run-time trip counts.** `0..n` with `n` a pure bound (`ucount::is_reevaluable_bound`: names,
+  literals, their arithmetic, a slice's `.len()`) of a signed counter is evaluated once at the call
+  site; with a grain it reaches the body through one more env slot, as in the whole-function
+  `lower_parallel`. No modulus exists, so nothing is outer (`region_reach` / `region_extent` with
+  `m = None`), and the two-digit form keeps only `hh / C` as its high digit.
+- **Kernel builtins.** A `softmax`/`matmul`/`rmsnorm`/`sum`/… call is the reads of its input operands
+  and the write of its output operand (`builtin_output`), each covering the operand's whole extent —
+  the builtin lowering's run-time extent checks pin a slice to its shape. A range view `s[lo..hi]`
+  (`$slice`) with `hi - lo` a constant `L` is recorded as the range access `[lo, lo + L)`
+  (`RegionAccess::hi`, the bounded term `RegionRest::Span(L)`); a whole captured buffer is an opaque
+  access; a body-local array is private; a dimension held by a binding is captured. Inside the
+  outlined body `parallel_fn` is false, so each call is the serial kernel.
+
+`#[cfg(test)]` builds record every region verdict with its reason (`RegionScan::decline` keeps the
+first refusal); `par_region_tests::corpus_region_declines` prints the corpus table and pins that no
+region declines for one of the slice / kernel-builtin corners left unmodeled.
+
+**The frame budget.** Legality is not the only reason to stay serial. An outlined body's locals are
+`alloca` slots in the outlined function, and that function runs on a `wukong_runtime` pool worker,
+whose stack is 16 MiB (`stack_size(16 * 1024 * 1024)` on every pool `wukong_parallel_for` forks
+onto); serial, the same scratch sits in the enclosing frame on the calling thread (256 MiB under
+`--run`). So after building the body, both outliners measure its static frame
+(`par_grain::frame_bytes`: every `Alloca`'s size plus its explicit alignment, saturating) and keep the
+loop serial above `par_grain::OUTLINED_FRAME_BUDGET`, half a worker stack. The region outliner
+(`emit_parallel_region`) hands its pool symbol back, so region numbering does not depend on a decline,
+and records the decline by name in the `cfg(test)` trace; the whole-function `lower_parallel` returns
+`None` and the function is lowered normally (where the region outliner then declines the same loop).
+The other half of the stack is headroom for spills and the runtime kernels and math intrinsics the
+body calls; the shared proof admits no call to a user function, whose frame could be any size.
+Without the budget, a body declaring `let t: [f32; 5000000]` aborted natively with a stack overflow
+on a worker while the interpreter, whose slots are heap-backed, printed the right answer — a defect
+no differential gate could see; `crates/wukongc/tests/parallel_frame_budget.rs` runs both shapes
+natively.
+
 ## CPU training execution
 
 `--train` validates concrete dense f32 buffer types and checked byte extents before allocating

@@ -813,7 +813,18 @@ line table built from them is not emitted yet.
   interpreter error, a native SIGILL), so declining is the fix. The mid-function region outliner adds
   one more decline: a modelled body-local that is reassigned inside an inner loop, whose snapshot is
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
-  `wukong$par$` region.
+  `wukong$par$` region. The region outliner (N85) also takes `[]T` slice captures — a pair that may
+  view one buffer at an unknown offset is versioned on a run-time range test whose may-overlap arm
+  runs the outlined body serially — a run-time trip count of a signed counter (`0..n`, `0..s.len()`),
+  and kernel builtin calls whose operands are the iteration's own range views (`softmax(x[r*C..r*C +
+  C], out[r*C..r*C + C])`); `examples/gpt2_forward_bench_par.wk`'s 12-head attention loop now runs
+  heads across cores. Still serial: a `Tensor[..]` capture, a call to a user function, a slice of
+  aggregates, an unsigned run-time trip count (a symbolic-generic dimension is `usize`), a kernel
+  operand `s[lo..]` or of run-time length, and a run-time trip count with an index term only a
+  constant `N` erases. `crates/wukong_mir_build/src/par_region_tests.rs::corpus_region_declines`
+  prints every corpus region's verdict by reason. Either outliner also keeps a loop serial when the
+  outlined body's own locals exceed 8 MiB (half the runtime's 16 MiB worker stack), since outlined
+  they would sit on a worker's stack instead of the calling thread's.
   `@parallel(grain = G)` is consumed (each worker claims runs of at least `G` iterations; any other
   `@parallel` argument is `E0306`), a loop with no `grain` gets an implicit one on the CPU backends
   (`ceil(2^14 / body MIR size)` for a straight-line body, 1 for a body with an inner loop or a call;

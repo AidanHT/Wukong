@@ -310,7 +310,8 @@ vec-kernel emitter remains x86-64 Windows only, as described above.
 Early development — built incrementally and openly. The full front-end, optimizer, interpreter, and
 **native Cranelift backend** work today, including **matmul → tuned AVX2/FMA GEMM dispatch** (serial
 and `@parallel`, incl. `nn.Linear` `A·Bᵀ`), SIMD auto-vectorization (elementwise + reductions), FMA
-contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels. An
+contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array and `[]T` slice
+loops (a slice region is versioned on a run-time overlap test). An
 **optional GPU backend** (`--features gpu`; recognizer offload via `--backend=gpu`, MIR→PTX via
 `--backend=gpu-native`) runs a growing subset of `.wk` programs on NVIDIA hardware. **Reverse-mode
 autodiff**
