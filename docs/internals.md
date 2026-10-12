@@ -871,7 +871,9 @@ Laws 4 and 5 are what make a dump a reproducer: the rest of the pipeline does to
 exactly what it did to the original. `wukong_mir`'s own tests round-trip a program with every `Op`
 variant (built through an exhaustive match, so a new variant does not compile there until it is
 covered), every operator kind and terminator, NaN payloads, `-0.0`, `i64::MIN`, statics, signed
-externs and parameter promises.
+externs and parameter promises. A checked-in `.mir` file is also the input format of the
+optimizer's filetests (`tests/filetests/opt/`, see "Testing strategy"): one pass, a hand-written
+function, and `CHECK:` lines for what the pass must produce.
 
 ## Optimizer
 
@@ -3106,6 +3108,25 @@ measurement reports retain the corpus sizes used for those runs.
 - **Emit stages** (`crates/wukongc/tests/emit.rs`): `--emit=tokens|ast` over the examples and the run
   suite, and `--emit=mir-high|mir|llvm-ir` over the run suite at -O0 and -O2 — which is also what keeps
   the MIR verifier and the pretty-printers honest.
+- **Filetests** (`tests/filetests/**`, `crates/wukongc/tests/filetests.rs`): what the optimizer
+  *does*, which no differential gate can see — a pass that silently stops firing changes no
+  program's output. Each `.mir` or `.wk` file carries LLVM-`lit`-style `RUN:` lines (`wukongc
+  --emit=mir --passes=licm %s | filecheck %s`, `not`, `diff`, `%t` scratch files, `REQUIRES:
+  vec-kernels`) and FileCheck directives, matched by an in-tree FileCheck
+  (`crates/wukongc/tests/filecheck/`: `CHECK`, `-NEXT`, `-SAME`, `-NOT`, `-DAG`, `-LABEL`,
+  `-EMPTY`, `-COUNT-n`, `{{regex}}`, `[[VAR:regex]]`/`[[VAR]]`, `[[@LINE]]`, with LLVM's semantics;
+  the workspace locks no `regex` crate, so a small backtracking engine compiles the POSIX-ERE
+  subset patterns use). `opt/` pins one pass per file, mostly on a hand-written `.mir` input run
+  through that pass alone so the front end cannot drift under it (the invariant load is in the
+  preheader and not in the body; the four stores are one `<4 x f32>` store; the may-alias twin is
+  left alone), and every one fails with its pass removed from its `RUN:` line; `mir-text/` holds
+  the typed dump's round trip and reproducer laws and its parse errors, `verify/` the verifier's
+  rejections of invalid `.mir` input and a `--verify-each -O2` run that must equal plain `-O2`,
+  `cli/` `--print-after` and the pass-list errors. A failure prints the directive's
+  `file:line:col`, where the search began, the input line most like the pattern, and the whole
+  input. Directives are written from the pass's semantics and confirmed, never pasted from output,
+  and a comment directive for a prefix no `RUN:` line checks fails the file
+  (`CONTRIBUTING.md`, "Writing a filetest").
 
 - **GPU corpus coverage** (`--features gpu`, device required): `lower.rs` and `megakernel.rs` each
   sweep the whole `tests/run` corpus against the interpreter oracle at two `-O` levels and assert a

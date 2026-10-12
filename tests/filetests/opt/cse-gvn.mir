@@ -3,7 +3,9 @@
 ; `cse` is global value numbering over the dominator tree: a pure computation is reused by every
 ; block it dominates, an expression every arm of a join computed becomes a block parameter of the
 ; join, and a load is forwarded from the store that wrote its location, through a join too.
-; `dce` removes what was replaced.
+; `dce` removes what was replaced. (The pair runs together as in the standard pipeline: on its
+; own, `cse` keeps forwarding the dead load at a join and gives the join one more parameter on
+; every fixpoint sweep.)
 
 ; The add in bb0 dominates both arms, so neither arm keeps its own.
 ; CHECK-LABEL: fn dominated(

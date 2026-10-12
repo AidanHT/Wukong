@@ -5,6 +5,39 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### FileCheck-style filetests for the optimizer (`gap7/filetests`, N71)
+
+- **Added: `tests/filetests/`, a lit-style suite that pins what each pass does to the MIR.** Each
+  `.mir` or `.wk` file carries its own `RUN:` lines (`wukongc ... %s | filecheck %s`, `not`,
+  `diff`, `> %t.mir`, `2>&1`, `REQUIRES: vec-kernels`) and `CHECK:` lines, run by
+  `cargo test -p wukongc --test filetests` (`WUKONG_FILETESTS=<substring>` runs a subset). The
+  differential gates prove an optimization changes no output; nothing proved one still *fires*.
+  A filetest does: the invariant load sits in the preheader and not in the loop body, the tail
+  call became a branch, the four stores became one `<4 x f32>` store.
+- **Added: an in-tree FileCheck** (`crates/wukongc/tests/filecheck/`, no new dependency: the
+  workspace locks no `regex` crate, so a small backtracking engine handles the POSIX-ERE subset
+  patterns use). LLVM FileCheck's semantics for `CHECK`, `-NEXT`, `-SAME`, `-NOT` (between the
+  neighbouring matches), `-DAG` (any order, no overlap, `-NOT`s between runs), `-LABEL` (labels
+  found first, partitioning the input), `-EMPTY` and `-COUNT-<n>`; `{{regex}}`, `[[NAME:regex]]`
+  bindings with `[[NAME]]` uses (a backreference within one pattern), `[[@LINE+k]]`, blank-run
+  canonicalization, `--check-prefix(es)`, `--implicit-check-not`. A failure names the directive's
+  `file:line:col`, where the scan started, the input line most like the pattern ("possible
+  intended match"), the variables it used, and the whole input, numbered. A misspelled directive
+  (`CHECK-NXT:`, `CHECK-NEXT` without its colon) and a comment directive for a prefix no `RUN:`
+  line checks are errors, not silently ignored lines. 40 unit tests pin the matcher and the
+  harness, including a wrong `CHECK` that must fail with its location.
+- **Seeded with 37 files.** 24 under `opt/`, each a pass's essential property (most with a
+  hand-written `.mir` input run through that one pass, so the lowering cannot drift under it):
+  constant folding, GVN and load forwarding through joins, alias-based forwarding, LICM (an
+  invariant load through its zero-trip guard), DSE, mem2reg, SROA, DCE, simplify-cfg,
+  simplify-phis, jump threading, loop deletion, switch formation, scalar promotion, both forms of
+  unswitching, loop fusion (and the read-ahead it refuses), the 128-bit vectorizer (with its
+  run-time alias guard), the 256-bit `veckernel` path, SLP, complete and partial unrolling with
+  the wrap guard, unroll-and-jam, bounds-check elimination, inlining and tail-recursion
+  elimination. Disabling each test's pass list fails all 24. Plus `--emit=mir-text` round trips
+  and reproducer laws, `.mir` parse errors, six verifier rejections of invalid `.mir` input, a
+  `--verify-each -O2` run that must equal plain `-O2`, `--print-after` and the pass-list errors.
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a
