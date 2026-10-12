@@ -19,6 +19,13 @@ pub use wukong_codegen_cranelift::TargetCpu;
 pub use wukong_diag::{all_explanations, explain, Explanation};
 pub use wukong_sema::lints::{LintLevel, LintLevels, LINTS};
 
+/// The `--emit=exe` runtime cache: the program-independent half of a link (the runtime shim, and
+/// for a release-profile runtime its fat-LTO static library), built once per runtime and toolchain.
+mod aot_cache;
+pub use aot_cache::{
+    clear_runtime_cache, runtime_cache_dir, ClearReport, CACHE_DIR_ENV, CACHE_TRACE_ENV,
+};
+
 /// The GPU offloading bridge (`--backend=gpu`), compiled only with the `gpu` feature.
 #[cfg(feature = "gpu")]
 mod gpu_accel;
@@ -1970,7 +1977,9 @@ fn object_path(
 /// ran and the link itself failed — is a real error and exits [`exit::COMPILE_ERROR`] without falling
 /// back. If the `cc` fallback cannot even be spawned, the object is copied out of the scratch
 /// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
-/// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
+/// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2). On both paths the
+/// runtime half (the compiled shim, or the compiled C runtime) comes from the runtime cache
+/// ([`aot_cache`]), so only the first link after a runtime or toolchain change builds it.
 fn emit_native(
     program: &wukong_mir::Program,
     interner: &Interner,
@@ -2072,8 +2081,19 @@ fn emit_native(
     // `cc` path below can neither (it crashes on the MSVC object's data relocations and can't consume
     // the Rust runtime staticlib). Output is bit-identical to `--run`. Falls back to `cc` only when
     // rustc or the runtime rlib is unavailable (a scalar, no-data, no-kernel program still links).
-    timer.begin("link");
-    match rustc_link(scratch.as_ref(), &stem, &obj_path, &out, debug.is_some()) {
+    // Either way the program-independent runtime half comes from the runtime cache
+    // ([`aot_cache`]): built on the first link, reused by every later one.
+    timer.begin("runtime-cache");
+    let cache = aot_cache::RuntimeCache::from_env();
+    match rustc_link(
+        &cache,
+        scratch.as_ref(),
+        &stem,
+        &obj_path,
+        &out,
+        debug.is_some(),
+        timer,
+    ) {
         LinkOutcome::Linked => {
             eprintln!("wrote {}", out.display());
             return exit::OK;
@@ -2104,7 +2124,7 @@ fn emit_native(
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
-    cc_link(opts, scratch.as_ref(), &stem, &obj_path, &out)
+    cc_link(&cache, opts, &stem, &obj_path, &out, timer)
 }
 
 /// A native-backend (Cranelift) failure as a diagnostic, so it reaches `--error-format=json` and
@@ -2165,31 +2185,94 @@ fn native_failure_diag(
 /// so the fallback produces the same output as `--run` for every program it can link. What it
 /// cannot provide — the `wukong_*` runtime kernels — is a link error, never a different answer; the
 /// note below says which link path is being taken so that error is legible.
+///
+/// The C runtime is compiled once into the runtime cache ([`aot_cache::Flavor::Cc`], keyed by the
+/// C source, `$CC` and its `--version` text, and the compile flags); every later link only links
+/// the cached object.
 fn cc_link(
+    cache: &aot_cache::RuntimeCache,
     opts: &Options,
-    scratch: Option<&ScratchDir>,
     stem: &str,
     obj_path: &Path,
     out: &Path,
+    timer: &mut report::PassTimer,
 ) -> i32 {
     use std::process::Command;
 
-    // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
-    let rt_path = scratch_path(scratch, format!("{stem}_rt.c"));
-    if let Err(e) = std::fs::write(&rt_path, c_runtime_source()) {
-        emit_driver_error(
-            opts,
-            format!("could not write `{}`: {e}", rt_path.display()),
-        );
-        return exit::IO_ERROR;
-    }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     eprint_line(&format!(
         "note: no usable `rustc` + `wukong_runtime` rlib beside wukongc; linking with `{cc}` and the \
          C runtime, which has no `wukong_*` kernels (a program that calls one will not link)"
     ));
+    // The compiler's identity is part of the entry's key, and a `cc` that cannot be started at
+    // all is the "no linker" case.
+    let version = match Command::new(&cc).arg("--version").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return cc_unavailable(&cc, stem, obj_path),
+    };
+    let source = c_runtime_source();
+    let recipe =
+        cc_runtime_compile_args(Path::new(CC_RUNTIME_SOURCE), Path::new(CC_RUNTIME_OBJECT))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+    let mut material = aot_cache::Material::new(aot_cache::Flavor::Cc);
+    material
+        .line("cc", &cc)
+        .line("cc-version", &version)
+        .line("source", &aot_cache::hash_bytes(source.as_bytes()))
+        .line("recipe", &recipe);
+    let material = material.finish();
+    let mut build = |dir: &Path, _cached: bool| -> std::io::Result<aot_cache::Built> {
+        let src = dir.join(CC_RUNTIME_SOURCE);
+        if let Err(e) = std::fs::write(&src, &source) {
+            return Ok(aot_cache::Built::Io(format!(
+                "could not write `{}`: {e}",
+                src.display()
+            )));
+        }
+        let compiled = Command::new(&cc)
+            .current_dir(dir)
+            .args(cc_runtime_compile_args(
+                Path::new(CC_RUNTIME_SOURCE),
+                Path::new(CC_RUNTIME_OBJECT),
+            ))
+            .output()?;
+        if !compiled.status.success() {
+            return Ok(aot_cache::Built::Failed(compiled));
+        }
+        Ok(aot_cache::Built::Ok {
+            files: vec![CC_RUNTIME_SOURCE.into(), CC_RUNTIME_OBJECT.into()],
+            link_args: Vec::new(),
+        })
+    };
+    let entry = match cache.obtain(
+        aot_cache::Flavor::Cc,
+        &material,
+        &[CC_RUNTIME_OBJECT],
+        &mut build,
+    ) {
+        aot_cache::Obtained::Ready(entry) => entry,
+        aot_cache::Obtained::BuildFailed(compiled) => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&compiled.stdout);
+            let _ = std::io::stderr().write_all(&compiled.stderr);
+            eprintln!(
+                "error: `{cc}` failed to compile the C runtime for `{}` (its diagnostics are above)",
+                opts.input.display()
+            );
+            return exit::COMPILE_ERROR;
+        }
+        aot_cache::Obtained::Spawn(_) => return cc_unavailable(&cc, stem, obj_path),
+        aot_cache::Obtained::Io(msg) => {
+            emit_driver_error(opts, msg);
+            return exit::IO_ERROR;
+        }
+    };
+    timer.begin("link");
     let status = Command::new(&cc)
-        .args(cc_link_args(obj_path, &rt_path, out))
+        .args(cc_link_args(obj_path, &entry.file(CC_RUNTIME_OBJECT), out))
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -2206,39 +2289,64 @@ fn cc_link(
             );
             exit::COMPILE_ERROR
         }
-        Err(_) => {
-            // This branch exists to hand the user the object when no linker can be run, so the
-            // object must survive `scratch`'s `Drop`: copy it out under the historical `<stem>.o`
-            // name in the invocation directory and report whichever path is actually there
-            // afterwards. When `ScratchDir::new` failed, `obj_path` IS that path already, and
-            // `fs::copy` of a file onto itself is not a guaranteed no-op - std documents the
-            // same-file case as likely to truncate - so the equality check is load-bearing.
-            let kept = PathBuf::from(format!("{stem}.o"));
-            let kept = if obj_path == kept {
-                Some(kept)
-            } else {
-                std::fs::copy(obj_path, &kept).ok().map(|_| kept)
-            };
-            match kept {
-                Some(p) => eprintln!(
-                    "error: could not run `{cc}` to link.\n\
-                     note: the native object was written to `{}`.\n\
-                     help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to execute.",
-                    p.display()
-                ),
-                None => eprintln!(
-                    "error: could not run `{cc}` to link.\n\
-                     note: the native object could not be kept (`{}` is not writable).\n\
-                     help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to \
-                     execute; `--emit=obj -o <path>` writes the object wherever you choose.",
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .display()
-                ),
-            }
-            exit::UNIMPLEMENTED
-        }
+        Err(_) => cc_unavailable(&cc, stem, obj_path),
     }
+}
+
+/// The C runtime's file names inside its cache entry.
+const CC_RUNTIME_SOURCE: &str = "wukong_rt.c";
+const CC_RUNTIME_OBJECT: &str = "wukong_rt.o";
+
+/// How the cached C runtime object is compiled (in the entry's directory). The flags are the ones
+/// the one-step `cc <object> <runtime.c>` link compiled it with — `-O2`, `-ffp-contract=off` (no
+/// FMA contraction, so the C runtime rounds like the oracle) and, off Windows, `-pthread` — so the
+/// cached object is the code that link produced.
+fn cc_runtime_compile_args(src: &Path, object: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-c".into(),
+        src.into(),
+        "-o".into(),
+        object.into(),
+        "-O2".into(),
+        "-ffp-contract=off".into(),
+    ];
+    if !cfg!(windows) {
+        args.push("-pthread".into());
+    }
+    args
+}
+
+/// No C compiler could be started. This branch exists to hand the user the object, so the object
+/// must survive `scratch`'s `Drop`: copy it out under the historical `<stem>.o` name in the
+/// invocation directory and report whichever path is actually there afterwards. When
+/// `ScratchDir::new` failed, `obj_path` IS that path already, and `fs::copy` of a file onto itself
+/// is not a guaranteed no-op - std documents the same-file case as likely to truncate - so the
+/// equality check is load-bearing.
+fn cc_unavailable(cc: &str, stem: &str, obj_path: &Path) -> i32 {
+    let kept = PathBuf::from(format!("{stem}.o"));
+    let kept = if obj_path == kept {
+        Some(kept)
+    } else {
+        std::fs::copy(obj_path, &kept).ok().map(|_| kept)
+    };
+    match kept {
+        Some(p) => eprintln!(
+            "error: could not run `{cc}` to link.\n\
+             note: the native object was written to `{}`.\n\
+             help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to execute.",
+            p.display()
+        ),
+        None => eprintln!(
+            "error: could not run `{cc}` to link.\n\
+             note: the native object could not be kept (`{}` is not writable).\n\
+             help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to \
+             execute; `--emit=obj -o <path>` writes the object wherever you choose.",
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .display()
+        ),
+    }
+    exit::UNIMPLEMENTED
 }
 
 /// The `cc` fallback's command line, factored out of [`emit_native`] so it can be pinned by a test.
@@ -2284,9 +2392,14 @@ enum LinkOutcome {
 /// to the interpreter/JIT oracle — raw LF on Windows, and floats via `Display` like the interp's
 /// `format!("{f}")`; the C fallback reproduces that formatting in C), and `extern crate
 /// wukong_runtime` pulls the AVX2 microkernels into the link so a recognized-kernel program resolves
-/// its `wukong_*` symbols. `#![no_main]` leaves the Cranelift object's own `main` as the CRT entry.
-const WUKONG_RT_SHIM: &str = r##"#![no_main]
-//! Auto-generated by `wukongc --emit=exe`. Do not edit; it is rewritten on every link.
+/// its `wukong_*` symbols.
+///
+/// It is a **library** crate: [`rustc_link`] compiles it once per runtime into the runtime cache
+/// ([`aot_cache`]) - as an rlib against a dev-profile runtime, or into a fat-LTO static library
+/// with a release-profile one - and each link compiles only an empty `#![no_main]` driver crate
+/// ([`aot_driver_source`]), which leaves the Cranelift object's own `main` as the CRT entry.
+const WUKONG_RT_SHIM: &str = r##"//! Auto-generated by `wukongc --emit=exe`. Do not edit; wukongc writes it into each AOT runtime
+//! cache entry it builds (`wukongc --print=runtime-cache`).
 extern crate wukong_runtime;
 use std::io::Write;
 #[no_mangle]
@@ -2615,95 +2728,369 @@ fn rlib_holds_bitcode_members(path: &Path) -> bool {
 /// own dependencies. Returns [`LinkOutcome::Unavailable`] when rustc or the rlib is absent so the
 /// caller can try the `cc` fallback. `debug` (`-g`) keeps the object's DWARF in the executable (see
 /// [`debug_link_args`]).
+///
+/// **The runtime half comes from the runtime cache** ([`aot_cache`]); see [`rustc_link_in`].
 fn rustc_link(
+    cache: &aot_cache::RuntimeCache,
     scratch: Option<&ScratchDir>,
     stem: &str,
     obj_path: &Path,
     out: &Path,
     debug: bool,
+    timer: &mut report::PassTimer,
+) -> LinkOutcome {
+    let Ok(exe) = std::env::current_exe() else {
+        return LinkOutcome::Unavailable;
+    };
+    let Some(dir) = exe.parent() else {
+        return LinkOutcome::Unavailable;
+    };
+    rustc_link_in(dir, cache, scratch, stem, obj_path, out, debug, timer)
+}
+
+/// The runtime cache entry file names of the two rustc flavours.
+const AOT_SHIM_SOURCE: &str = "wukong_aot_rt.rs";
+const AOT_SHIM_RLIB: &str = "libwukong_aot_shim.rlib";
+const AOT_RUNTIME_STATICLIB: &str = if cfg!(target_env = "msvc") {
+    "wukong_aot_rt.lib"
+} else {
+    "libwukong_aot_rt.a"
+};
+const AOT_NATIVE_LIBS: &str = "native-static-libs.txt";
+
+/// The fixed `rustc` arguments that build a runtime cache entry from [`WUKONG_RT_SHIM`] (the
+/// source, the runtime `--extern`, `-L` and `-o` are added per build). Part of the entry's key.
+///
+/// * [`aot_cache::Flavor::RustNative`] (a dev-profile runtime: native objects): the shim as an
+///   rlib, at rustc's default opt-level, exactly as the shim was compiled when it was a per-link
+///   binary crate.
+/// * [`aot_cache::Flavor::RustLto`] (a release-profile runtime: LLVM bitcode members, see
+///   [`rlib_holds_bitcode_members`]): one **fat-LTO static library** of the shim, the runtime and
+///   `std`, at `opt-level=3` like the workspace `[profile.release]` the rlib was compiled under
+///   (the LTO backend re-codegens every module at the *linking* crate's level; at rustc's default
+///   `-C opt-level=0` the AVX2 kernels come out as `vfmadd213ps` fed from stack reloads instead of
+///   the release `vfmadd231ps (%rdx,%r11,1)` form). Fat, not thin: fat LTO internalizes every Rust
+///   symbol, so the archive exports only the `#[no_mangle]` C entry points (and
+///   `compiler_builtins`) and cannot collide with the link's own `core`; a thin-LTO archive keeps
+///   cross-module `core` symbols global and the link fails with `LNK2005 ... already defined in
+///   libcore`. A debug-build indication on the development host (rustc 1.97.1, a release runtime
+///   rlib, not a measurement): the old per-link thin-LTO link took 35-40 s; building this archive
+///   takes 23-48 s once, and each link against it 0.2-0.3 s.
+///
+/// `panic=abort` matches the workspace `[profile.release]` (`panic = "abort"`): rustc defaults a
+/// crate to `unwind`, and the strategy mismatch is a hard metadata error ("the crate
+/// `wukong_runtime` requires panic strategy `abort` which is incompatible with this crate's strategy
+/// of `unwind`"). An abort-strategy crate may link unwind-built dependencies, so this is equally
+/// correct against a dev-profile rlib. `--cap-lints allow`: the shim is generated code, and a lint
+/// in it would be noise in the user's link.
+fn aot_runtime_recipe(flavor: aot_cache::Flavor) -> Vec<&'static str> {
+    let mut args = vec![
+        "--edition",
+        "2021",
+        "-C",
+        "panic=abort",
+        "--cap-lints",
+        "allow",
+    ];
+    match flavor {
+        aot_cache::Flavor::RustLto => args.extend([
+            "--crate-type",
+            "staticlib",
+            "--crate-name",
+            "wukong_aot_rt",
+            "-C",
+            "lto=fat",
+            "-C",
+            "opt-level=3",
+        ]),
+        _ => args.extend(["--crate-type", "rlib", "--crate-name", "wukong_aot_shim"]),
+    }
+    args
+}
+
+/// The file a link needs from an entry of `flavor`.
+fn aot_runtime_artifact(flavor: aot_cache::Flavor) -> &'static str {
+    match flavor {
+        aot_cache::Flavor::RustLto => AOT_RUNTIME_STATICLIB,
+        _ => AOT_SHIM_RLIB,
+    }
+}
+
+/// The driver crate each link compiles: it contributes no code, only a crate for `rustc` to drive
+/// the platform linker with, and `#![no_main]` leaves the Cranelift object's `main` as the entry.
+///
+/// Against the cached shim **rlib** it names the shim, so rustc links the shim, the runtime rlib and
+/// `std` exactly as the old per-link shim binary did. Against the fat-LTO **static library** it is
+/// `#![no_std]`: the archive already carries its own (internalized) `std`, and a second `std` would
+/// collide with the two symbols fat LTO leaves global (`rust_eh_personality` and
+/// `std::panicking::EMPTY_PANIC`). A `no_std` binary must name a panic handler; nothing calls this
+/// one (the archive's code panics through its own internalized `std`).
+fn aot_driver_source(flavor: aot_cache::Flavor) -> &'static str {
+    match flavor {
+        aot_cache::Flavor::RustLto => {
+            "#![no_std]\n#![no_main]\n\
+             // Generated by wukongc: links a Cranelift object against a cached fat-LTO runtime.\n\
+             #[panic_handler]\n\
+             fn wukong_aot_driver_panic(_: &core::panic::PanicInfo<'_>) -> ! {\n    loop {}\n}\n"
+        }
+        _ => {
+            "#![no_main]\n\
+             // Generated by wukongc: links a Cranelift object against the cached runtime shim.\n\
+             extern crate wukong_aot_shim;\n"
+        }
+    }
+}
+
+/// The key material of the rustc-built runtime entry for `rlib`: the toolchain (`rustc -vV`, which
+/// names the release, commit, host triple and LLVM version), the runtime rlib's identity
+/// ([`aot_cache::file_identity`]), the shim source and the build recipe.
+fn aot_runtime_material(
+    flavor: aot_cache::Flavor,
+    rustc_version: &str,
+    rlib: &Path,
+) -> std::io::Result<String> {
+    let mut material = aot_cache::Material::new(flavor);
+    material
+        .line("rustc", rustc_version)
+        .line("runtime", &aot_cache::file_identity(rlib)?)
+        .line("shim", &aot_cache::hash_bytes(WUKONG_RT_SHIM.as_bytes()))
+        .line("recipe", &aot_runtime_recipe(flavor).join(" "));
+    Ok(material.finish())
+}
+
+/// Build the runtime cache entry for `rlib` into `dir` (see [`aot_runtime_recipe`]). `Err` means
+/// rustc could not be started.
+fn build_aot_runtime(
+    flavor: aot_cache::Flavor,
+    rustc: &Path,
+    rlib: &Path,
+    deps: &Path,
+    dir: &Path,
+    cached: bool,
+) -> std::io::Result<aot_cache::Built> {
+    let source = dir.join(AOT_SHIM_SOURCE);
+    if let Err(e) = std::fs::write(&source, WUKONG_RT_SHIM) {
+        return Ok(aot_cache::Built::Io(format!(
+            "could not write `{}`: {e}",
+            source.display()
+        )));
+    }
+    let artifact = aot_runtime_artifact(flavor);
+    let libs = dir.join(AOT_NATIVE_LIBS);
+    let mut cmd = std::process::Command::new(rustc);
+    cmd.arg(&source)
+        .args(aot_runtime_recipe(flavor))
+        .arg("--extern")
+        .arg(format!("wukong_runtime={}", rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()));
+    if flavor == aot_cache::Flavor::RustLto {
+        // The static library's own native dependencies (the platform's system libraries), which
+        // every link against it must name after it.
+        cmd.arg("--print")
+            .arg(format!("native-static-libs={}", libs.display()));
+        eprint_line(if cached {
+            "note: building the release AOT runtime with fat LTO; this takes about a minute, once \
+             per runtime build (later links reuse it: `wukongc --print=runtime-cache`)"
+        } else {
+            "note: building the release AOT runtime with fat LTO for this link only (the runtime \
+             cache is unavailable; `WUKONG_CACHE_TRACE=1` says why)"
+        });
+    }
+    let output = cmd.arg("-o").arg(dir.join(artifact)).output()?;
+    if !output.status.success() {
+        return Ok(aot_cache::Built::Failed(output));
+    }
+    let mut files = vec![AOT_SHIM_SOURCE.to_string(), artifact.to_string()];
+    let mut link_args = Vec::new();
+    if flavor == aot_cache::Flavor::RustLto {
+        // `--print native-static-libs=<path>` writes the list to a file; a rustc that predates
+        // the `=<path>` form prints it as a `note:` on stderr instead.
+        let listed = std::fs::read_to_string(&libs).ok().or_else(|| {
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .find_map(|l| {
+                    l.split_once("native-static-libs:")
+                        .map(|(_, v)| v.to_string())
+                })
+        });
+        let Some(listed) = listed else {
+            return Ok(aot_cache::Built::Io(format!(
+                "`{}` built the runtime static library but did not report its native libraries",
+                rustc.display()
+            )));
+        };
+        link_args = listed.split_whitespace().map(str::to_string).collect();
+        if libs.is_file() {
+            files.push(AOT_NATIVE_LIBS.to_string());
+        }
+    }
+    Ok(aot_cache::Built::Ok { files, link_args })
+}
+
+/// Which step of [`rustc_link_in`] produced the output it reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AotLinkStep {
+    /// Building the runtime cache entry.
+    Runtime,
+    /// The link itself.
+    Link,
+}
+
+/// [`rustc_link`] with the directory holding the compiler binary (`target/<profile>/`) given, so a
+/// test can link against the build's own runtime from a test binary in `deps/`.
+///
+/// For each runtime rlib candidate (newest first, see [`try_runtime_rlibs`]): obtain the runtime
+/// cache entry for it — validated and reused, or built once by [`build_aot_runtime`] — and then let
+/// `rustc` compile the empty [`aot_driver_source`] crate and link the object against the entry. No
+/// link compiles the shim and none runs LTO: the cost a release-profile runtime used to put on
+/// every link (a whole-runtime thin LTO) is paid when its entry is built, once.
+#[allow(clippy::too_many_arguments)]
+fn rustc_link_in(
+    dir: &Path,
+    cache: &aot_cache::RuntimeCache,
+    scratch: Option<&ScratchDir>,
+    stem: &str,
+    obj_path: &Path,
+    out: &Path,
+    debug: bool,
+    timer: &mut report::PassTimer,
 ) -> LinkOutcome {
     use std::process::Command;
 
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return LinkOutcome::Unavailable,
-    };
-    let dir = match exe.parent() {
-        Some(d) => d.to_path_buf(),
-        None => return LinkOutcome::Unavailable,
-    };
     let deps = dir.join("deps");
-    let candidates = runtime_rlib_candidates(&dir);
+    let candidates = runtime_rlib_candidates(dir);
     if candidates.is_empty() {
         // Not a cargo target layout (e.g. an installed binary without the rlib) — use the cc path.
         return LinkOutcome::Unavailable;
     }
+    let rustc = link_rustc();
+    // The toolchain's identity is part of every entry's key; a rustc that cannot be started is the
+    // "unavailable" case, exactly as it was when the link itself was the first spawn.
+    let rustc_version = match Command::new(&rustc).arg("-vV").output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(&o.stderr);
+            return LinkOutcome::Failed(format!(
+                "`{} -vV` failed, so it cannot link the native object for `{stem}`",
+                rustc.display()
+            ));
+        }
+        Err(_) => return LinkOutcome::Unavailable,
+    };
 
-    let shim_path = scratch_path(scratch, format!("{stem}_shim.rs"));
-    if let Err(e) = std::fs::write(&shim_path, WUKONG_RT_SHIM) {
-        return LinkOutcome::Failed(format!("could not write `{}`: {e}", shim_path.display()));
-    }
-
-    // **The output path handed to rustc must be absolute.** With `-C lto=thin`, rustc names its
-    // per-module LTO objects after the *output file's* stem and then passes them to the linker by a
-    // path that is only valid relative to its own temp directory — so `-o hello.exe` links with
-    // `LNK1181: cannot open input file 'hello.<crate>....rcgu.o.rcgu.o'` while `-o C:\..\hello.exe`
-    // links fine (rustc 1.97.1). Absolutizing costs nothing on the non-LTO path and is what makes
-    // the LTO path below usable from a bare `wukongc --emit=exe prog.wk`. `std::path::absolute` is
-    // pure path arithmetic against the CWD — it does not touch the filesystem, and the *user-facing*
+    // **The output path handed to rustc must be absolute.** With `-C lto=thin`, rustc named its
+    // per-module LTO objects after the *output file's* stem and then passed them to the linker by a
+    // path only valid relative to its own temp directory (`LNK1181: cannot open input file
+    // 'hello.<crate>....rcgu.o.rcgu.o'`, rustc 1.97.1). No link runs LTO any more, but an absolute
+    // path costs nothing and keeps every intermediate rustc names after it unambiguous.
+    // `std::path::absolute` is pure path arithmetic against the CWD, and the *user-facing*
     // `wrote <path>` note in `emit_native` still prints the path the user asked for.
     let out_arg = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
-
-    // Consume a bitcode-only rlib the only way it can be consumed: make rustc do the LTO. See
-    // [`rlib_holds_bitcode_members`] — this is the release profile (`lto = "thin"`), where cargo
-    // compiles the runtime with `-C linker-plugin-lto` and `link.exe` answers `LNK1136`. `opt-level`
-    // is not cosmetic here: the LTO backend re-codegens every imported module at the *linking*
-    // crate's level, and at the rustc default (`-C opt-level=0`) the AVX2 kernels come out as
-    // `vfmadd213ps %ymm2,%ymm1,%ymm0` fed from stack reloads instead of the release form
-    // `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0` — a correct but deoptimized runtime in every AOT
-    // binary. `lto=thin` + `opt-level=3` mirrors the workspace `[profile.release]` the rlib was
-    // built under, so the kernels land in the exe exactly as that profile compiled them.
-    let rustc = link_rustc();
     let debug_args = if debug {
         debug_link_args(&rustc)
     } else {
         Vec::new()
     };
+    let driver = scratch_path(scratch, format!("{stem}_main.rs"));
+    let mut step = AotLinkStep::Link;
+    let mut io_failure: Option<String> = None;
+    let mut cached_entry = true;
     let run = try_runtime_rlibs(candidates, |rlib| {
-        let bitcode_rlib = rlib_holds_bitcode_members(rlib);
-        let mut cmd = Command::new(&rustc);
-        cmd.arg(&shim_path)
-            .arg("--edition")
-            .arg("2021")
-            // The rlib we link against is built by this workspace, whose `[profile.release]` sets
-            // `panic = "abort"`. rustc defaults the shim to `unwind`, and a strategy mismatch is a hard
-            // metadata error ("the crate `wukong_runtime` requires panic strategy `abort` which is
-            // incompatible with this crate's strategy of `unwind`") that rejected every release-profile
-            // link before it ever reached the linker. An abort-strategy crate may link unwind-built
-            // dependencies, so this is equally correct against a debug-profile rlib.
-            .arg("-C")
-            .arg("panic=abort");
-        if bitcode_rlib {
-            cmd.arg("-C").arg("lto=thin").arg("-C").arg("opt-level=3");
+        let flavor = if rlib_holds_bitcode_members(rlib) {
+            aot_cache::Flavor::RustLto
+        } else {
+            aot_cache::Flavor::RustNative
+        };
+        // `emit_native` opened the `runtime-cache` stage; the link below closes it.
+        let material = match aot_runtime_material(flavor, &rustc_version, rlib) {
+            Ok(m) => m,
+            Err(e) => {
+                io_failure = Some(format!("cannot read `{}`: {e}", rlib.display()));
+                return Err(e);
+            }
+        };
+        let entry = match cache.obtain(
+            flavor,
+            &material,
+            &[aot_runtime_artifact(flavor)],
+            &mut |entry_dir, cached| {
+                build_aot_runtime(flavor, &rustc, rlib, &deps, entry_dir, cached)
+            },
+        ) {
+            aot_cache::Obtained::Ready(entry) => entry,
+            aot_cache::Obtained::BuildFailed(output) => {
+                step = AotLinkStep::Runtime;
+                return Ok(output);
+            }
+            aot_cache::Obtained::Spawn(e) => return Err(e),
+            aot_cache::Obtained::Io(msg) => {
+                io_failure = Some(msg.clone());
+                return Err(std::io::Error::other(msg));
+            }
+        };
+        step = AotLinkStep::Link;
+        cached_entry = entry.cached;
+        timer.begin("link");
+        if let Err(e) = std::fs::write(&driver, aot_driver_source(flavor)) {
+            io_failure = Some(format!("could not write `{}`: {e}", driver.display()));
+            return Err(e);
         }
-        cmd.args(&debug_args);
+        let mut cmd = Command::new(&rustc);
+        cmd.arg(&driver)
+            .args([
+                "--crate-type",
+                "bin",
+                "--crate-name",
+                "wukong_aot_main",
+                "--edition",
+                "2021",
+                "-C",
+                "panic=abort",
+                "--cap-lints",
+                "allow",
+            ])
+            .args(&debug_args);
+        if flavor == aot_cache::Flavor::RustLto {
+            cmd.arg("-C")
+                .arg(format!("link-arg={}", obj_path.display()))
+                .arg("-C")
+                .arg(format!(
+                    "link-arg={}",
+                    entry.file(AOT_RUNTIME_STATICLIB).display()
+                ));
+            // After the archive: a positional linker (GNU ld) resolves left to right.
+            for arg in &entry.link_args {
+                cmd.arg("-C").arg(format!("link-arg={arg}"));
+            }
+        } else {
+            cmd.arg("--extern")
+                .arg(format!(
+                    "wukong_aot_shim={}",
+                    entry.file(AOT_SHIM_RLIB).display()
+                ))
+                .arg("--extern")
+                .arg(format!("wukong_runtime={}", rlib.display()))
+                .arg("-L")
+                .arg(format!("dependency={}", deps.display()))
+                .arg("-C")
+                .arg(format!("link-arg={}", obj_path.display()));
+        }
         // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ rustc's
-        // diagnostics to know whether to print itself. Everything rustc writes still reaches the same
-        // descriptor, forwarded immediately after it exits - but two things about the SHAPE change. It
-        // arrives as one block at the end rather than streaming, and rustc now sees a pipe instead of a
-        // terminal, so its diagnostics come through UNCOLOURED. The link is a single short-lived child
-        // at the end of compilation, so neither is something the user can act on.
-        cmd.arg("--extern")
-            .arg(format!("wukong_runtime={}", rlib.display()))
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()))
-            .arg("-C")
-            .arg(format!("link-arg={}", obj_path.display()))
-            .arg("-o")
-            .arg(&out_arg)
-            .output()
+        // diagnostics to know whether to print itself. Everything rustc writes still reaches the
+        // same descriptor, forwarded immediately after it exits - but it arrives as one block, and
+        // uncoloured (rustc sees a pipe). The link is a single short-lived child at the end of
+        // compilation, so neither is something the user can act on.
+        let linked = cmd.arg("-o").arg(&out_arg).output();
+        // `entry` (a private entry's directory) must outlive the link that reads it.
+        drop(entry);
+        linked
     });
-    let _ = std::fs::remove_file(&shim_path);
+    let _ = std::fs::remove_file(&driver);
+    if let Some(msg) = io_failure {
+        return LinkOutcome::Failed(msg);
+    }
 
     let (rlib, produced) = match run {
         Ok(Some(o)) => o,
@@ -2724,15 +3111,28 @@ fn rustc_link(
 
     // The object path is deliberately not named: it is a scratch intermediate that `emit_native`'s
     // `ScratchDir` deletes on the way out (see [`object_path`]).
-    let mut msg = format!(
-        "`rustc` failed to link the native object for `{stem}` (its diagnostics are above)"
-    );
+    let mut msg = match step {
+        AotLinkStep::Runtime => format!(
+            "`rustc` failed to build the AOT runtime for `{stem}` from `{}` (its diagnostics are \
+             above)",
+            rlib.display()
+        ),
+        AotLinkStep::Link => format!(
+            "`rustc` failed to link the native object for `{stem}` (its diagnostics are above)"
+        ),
+    };
     if bitcode_rlib {
         msg.push_str(&format!(
-            "\nnote: `{}` holds LLVM bitcode members (an LTO-profile rlib), so the link was run \
-             with `-C lto=thin -C opt-level=3`",
+            "\nnote: `{}` holds LLVM bitcode members (an LTO-profile rlib), so the runtime is a \
+             static library built with `-C lto=fat -C opt-level=3`",
             rlib.display()
         ));
+    }
+    if step == AotLinkStep::Link && cached_entry {
+        msg.push_str(
+            "\nnote: the runtime came from the runtime cache (`wukongc --print=runtime-cache`); \
+             `wukongc --clear-cache` rebuilds it on the next link",
+        );
     }
     // E0514 is "found crate `wukong_runtime` compiled by an incompatible version of rustc". It is
     // raised by the rustc invoked HERE about the rlib picked by [`runtime_rlib_in`], so naming both
@@ -2808,10 +3208,10 @@ fn debug_link_args(rustc: &Path) -> Vec<std::ffi::OsString> {
 /// `.../.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe`), so it is immune
 /// to directory-based resolution - and it is the compiler cargo used to build THIS binary. It is
 /// not guaranteed to be the one that built the rlib the link picks: a `target/` tree accumulates
-/// rlibs from every toolchain it has ever seen, which is why [`rustc_link`] tries candidates in
+/// rlibs from every toolchain it has ever seen, which is why [`rustc_link_in`] tries candidates in
 /// freshness order until one passes crate loading. The `PATH` fallback keeps a relocated or installed
 /// binary working; the
-/// E0514 note in [`rustc_link`] names the resolved path either way, so the failure is legible in
+/// E0514 note in [`rustc_link_in`] names the resolved path either way, so the failure is legible in
 /// both worlds.
 fn link_rustc() -> PathBuf {
     match option_env!("WUKONG_BUILD_RUSTC") {

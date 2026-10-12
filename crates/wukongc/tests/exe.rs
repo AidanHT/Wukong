@@ -27,6 +27,22 @@ fn run_dir() -> PathBuf {
         .join("run")
 }
 
+/// The runtime cache every link in this file goes through unless a test makes its own: under the
+/// target directory, so a test run never writes the user's real cache (`%LOCALAPPDATA%\wukong\cache`
+/// or `~/.cache/wukong`), and shared, so only the first link of a run builds the runtime entry.
+fn shared_cache() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("wukong-runtime-cache")
+}
+
+/// The compiler under test, linking through [`shared_cache`] with cache tracing off (a developer's
+/// own `WUKONG_CACHE_TRACE` would otherwise reach every stderr this file inspects).
+fn wukongc() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    cmd.env(wukong_driver::CACHE_DIR_ENV, shared_cache())
+        .env_remove(wukong_driver::CACHE_TRACE_ENV);
+    cmd
+}
+
 /// Which link path `wukongc --emit=exe` will take here. The rlib half of the decision is not
 /// mirrored but *shared*: it calls the driver's own `runtime_rlib_in`, so the probe cannot drift
 /// from `wukong_driver::rustc_link`. (It drifted once already — the probe hardcoded
@@ -92,7 +108,7 @@ fn build_and_run_exe(tmp: &Path, src: &Path, stem: &str) -> Result<(Option<i32>,
     // passing `-o`.
     let exe = tmp.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
     let _ = std::fs::remove_file(&exe);
-    let emit = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+    let emit = wukongc()
         .current_dir(tmp) // the `.o` / `_shim.rs` / `_rt.c` intermediates land here
         .arg("--emit=exe")
         .arg("-o")
@@ -114,7 +130,7 @@ fn build_and_run_exe(tmp: &Path, src: &Path, stem: &str) -> Result<(Option<i32>,
 
 /// Run `src` on the interpreter (the oracle) for the comparison baseline.
 fn run_interp(src: &Path) -> (Option<i32>, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+    let out = wukongc()
         .arg("--run")
         .arg(src)
         .output()
@@ -229,8 +245,9 @@ fn exe_matches_run() {
          EVERY `wukong_*` symbol unresolved, the rlib holds LLVM bitcode rather than native objects \
          (the workspace `[profile.release]` sets `lto = \"thin\"`, so cargo builds the runtime with \
          `-C linker-plugin-lto`) and `rlib_holds_bitcode_members` failed to classify it — that \
-         probe is what makes `rustc_link` add `-C lto=thin -C opt-level=3`, and without it no \
-         release-profile executable links at all. If instead exactly one or two `wukong_*` symbols \
+         probe is what makes `rustc_link` build the runtime cache entry as a fat-LTO static \
+         library (`-C lto=fat -C opt-level=3`), and without it no release-profile executable \
+         links at all. If instead exactly one or two `wukong_*` symbols \
          are unresolved, the rlib `runtime_rlib_in` picked is simply STALE — rebuild the workspace. \
          (This gate previously reported every one of these states as \"no linker toolchain to \
          produce an exe\" and passed green, which is why the break went unreported. Note it must be \
@@ -379,7 +396,7 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
     }
     let exe = emit_dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
     let emitted = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
+        wukongc()
             .current_dir(&emit_dir)
             .arg("--emit=exe")
             .arg("-o")
@@ -390,7 +407,7 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
         // The JIT is the same Cranelift codegen as the object: a program it cannot compile either
         // is a native-backend limitation (with its own diagnostic), not an AOT defect.
         let native = outcome(
-            Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            wukongc()
                 .current_dir(&native_dir)
                 .arg("--error-format=json")
                 .arg("--run")
@@ -423,12 +440,7 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
         ));
     }
     let ran = outcome(Command::new(&exe).current_dir(&exe_dir));
-    let oracle = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
-            .current_dir(&oracle_dir)
-            .arg("--run")
-            .arg(src),
-    );
+    let oracle = outcome(wukongc().current_dir(&oracle_dir).arg("--run").arg(src));
     // `--run` reports a failed assertion as its result and discards the stdout the program had
     // produced; the executable has already written it. Exit code, message and the prefix agree.
     if oracle.0 == Some(1) && oracle.2.contains("assertion failed") {
@@ -584,6 +596,7 @@ fn cc_fallback_discovered_from_the_cli_matches_run() {
     let exe = tmp.join(format!("cc_floats{}", std::env::consts::EXE_SUFFIX));
     let emitted = outcome(
         Command::new(&bin)
+            .env(wukong_driver::CACHE_DIR_ENV, shared_cache())
             .current_dir(&tmp)
             .arg("--emit=exe")
             .arg("-o")
@@ -607,12 +620,7 @@ fn cc_fallback_discovered_from_the_cli_matches_run() {
     // double whose shortest digits are 0.3333333333333333; u64::MAX prints unsigned.
     let expected = "1.25\n0.1\n0.3333333333333333\n-7\n18446744073709551615\n";
     assert_eq!((ran.0, ran.1.as_str()), (Some(3), expected), "{}", ran.2);
-    let oracle = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
-            .current_dir(&tmp)
-            .arg("--run")
-            .arg(&src),
-    );
+    let oracle = outcome(wukongc().current_dir(&tmp).arg("--run").arg(&src));
     assert_eq!((oracle.0, oracle.1.as_str()), (Some(3), expected));
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -659,7 +667,7 @@ fn main() -> i32 {
     for level in ["-O0", "-O2"] {
         let exe = tmp.join(format!("dbg_prog{level}{}", std::env::consts::EXE_SUFFIX));
         let built = outcome(
-            Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            wukongc()
                 .current_dir(&tmp)
                 .arg("--emit=exe")
                 .arg("-g")
@@ -734,7 +742,7 @@ fn main() -> i32 {
     .unwrap();
     let stem = tmp.join("pruned_multi");
     let emitted = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
+        wukongc()
             .current_dir(&tmp)
             .arg("--emit=mir,exe")
             .arg("-o")
@@ -748,11 +756,7 @@ fn main() -> i32 {
     assert_eq!((ran.0, ran.1.as_str()), (Some(0), "42\n"), "{}", ran.2);
     assert_eq!(run_interp(&src), (Some(0), "42\n".to_string()));
     let listed = std::fs::read_to_string(stem.with_extension("mir-low")).unwrap();
-    let alone = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
-            .arg("--emit=mir")
-            .arg(&src),
-    );
+    let alone = outcome(wukongc().arg("--emit=mir").arg(&src));
     assert_eq!(alone.0, Some(0), "{}", alone.2);
     assert!(
         listed.contains("used") && !listed.contains("never_called"),
