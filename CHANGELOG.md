@@ -38,6 +38,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`crates/wukongc/tests/mir_text.rs`; the default gate runs the last two on every second
   program, `WUKONG_MIR_TEXT_ALL=1` on all): an optimizer bug is now a `.mir` file and a pass list.
   A `veckernel` line has no textual form; dump with `--target-cpu=x86-64-v2`.
+
 ### Source formatter (`gap5/source-formatter`)
 
 - **Added `wukongc fmt` (N14).** `wukongc fmt [--check] [--stdout] <path|->...` reprints `.wk`
@@ -143,6 +144,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   passes after the parser.
 - **A binding inside an or-pattern** (`E::A(v) | E::B(v) => v`) is refused once at the pattern
   (`C0001`, "a binding inside an or-pattern") instead of at every use of the name.
+
 ### Atomic add and aligned stack locals (`gap5/mir-ops`)
 
 - **`Op::AtomicAdd` in MIR (P15.15).** `atomic.add vV, vP` is one indivisible, sequentially
