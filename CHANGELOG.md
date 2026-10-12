@@ -330,7 +330,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   reduction kernel, whose wrapping result is exact under any grouping (`tests/run/vec256_opt_int_sum.wk`,
   every trip from 2040 to 2064); a float sum keeps the in-order 128-bit fold. Over `tests/run` and
   `examples/` at `-O2`, 45 programs gain
-  kernels (the census's `veckernel*N` rows; no recognizer dispatch is lost). Bit-exact by
+  kernels (the census's `veckernel*N` rows; no recognizer dispatch is lost). Merged after
+  `gap6/outliner-slices-kernels`, `tests/run/parallel_region_kernels.wk` gains two more, one in
+  an outlined `@parallel` region body. Bit-exact by
   construction — every op is lane-wise, a contracted multiply-add stays one `fma`, `Fone` keeps
   Rust's unordered `!=` — and pinned by `tests/run/vec256_opt_lanes.wk` (f32/i32/f64, trips 2053
   and 2047, every lane), `tests/run/vec256_opt_specials.wk` (NaN payloads, both zeros, both
@@ -344,7 +346,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   generate is optimized by a separate call, and it takes the same switch. The tape's `fill` and
   ReLU-backward loops are kernel-shaped, so under the optimizer's default the backward of a
   4096-element sum carried a kernel at `--target-cpu=x86-64-v2`, and `--emit=obj --grad-of` failed
-  Cranelift's target check. `PassManager::standard_with`, `optimize_timed_with` and
+  Cranelift's target check. A `--repl` session's optimizer takes it as well; a hardwired
+  `OptimizeOptions::FULL` there gave a loop a kernel under `--target-cpu=x86-64-v2`, which the
+  native JIT refused. `PassManager::standard_with`, `optimize_timed_with` and
   `Vectorize::new(bool)` carry it; `--passes` lists honour it too. `WUKONG_P4_NO_256` and the host
   gate (`wukong_mir::host_supports_vec_kernels`) apply unchanged.
 - **The interpreter's kernel marshalling forwards a store across streams that share a base.** Two
