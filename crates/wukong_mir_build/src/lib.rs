@@ -14968,9 +14968,13 @@ impl FnLowerer<'_> {
     //    the serial loop.
     //
     // Autodiff note: a function containing a region tapes to an `Op::Call` of
-    // `wukong_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
-    // function fails loudly ("unrecognized buffer-writing call has no VJP rule") instead of
-    // miscompiling — the same behavior the whole-function `@parallel` wrapper already has.
+    // `wukong_parallel_for`, which `wukong_autodiff::grad_program` differentiates (N87,
+    // `region.rs`): it takes the outlined body apart at `-O1` (the driver re-optimizes outlined
+    // bodies at `-O1` for a gradient compile), recomputes and differentiates one iteration per
+    // index in a region of its own, and privatizes the adjoint of any buffer several iterations
+    // read. It relies on the proof above — every escaping write is in the iteration's own slice —
+    // and declines by name an iteration with control flow, a region that reads what it writes,
+    // and a captured buffer the function writes again after the region.
 
     /// Recognize + outline a mid-function `@parallel` independent-iteration loop. Returns `true`
     /// when the loop was outlined (the caller emits nothing further); `false` declines to the
