@@ -1,0 +1,162 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 58
+// EXPECT-OUT: -22
+// EXPECT-OUT: 41
+// EXPECT-OUT: 0
+// EXPECT-OUT: -15
+// EXPECT-OUT: 9
+// EXPECT-OUT: 7
+// EXPECT-OUT: -21
+// EXPECT-OUT: 16
+// EXPECT-OUT: 27
+// EXPECT-OUT: -14
+// EXPECT-OUT: 170
+// EXPECT-OUT: 493
+// EXPECT-OUT: 218
+// EXPECT-OUT: 216
+// EXPECT-OUT: 695
+// EXPECT-OUT: 56
+// EXPECT-OUT: 366
+// EXPECT-OUT: 117
+// EXPECT-OUT: 89
+// EXPECT-OUT: 620
+// EXPECT-OUT: -71
+// EXPECT-OUT: 16
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+module tests.run.vec7_outer_loops
+
+// Outer-loop vectorization (-O2). Each kernel is a two-deep nest whose inner loop carries a row's
+// own state - a float sum, a Horner recurrence, a float maximum - which the inner path cannot
+// widen in parallel (a float sum keeps one serial fold, a recurrence cannot be widened along its
+// own counter at all). The vectorizer now widens the nest ACROSS ITS ROWS: lane k runs the inner
+// loop for row r + k with its own accumulator, every step in the scalar loop's order, so each
+// row's result is bit-exact. The rows past the last whole group run in the original nest.
+//
+// The kernels are kept OUT of line (they and `again` call each other). rows = 11 is two groups of
+// four and three epilogue rows; cols = 7. Every expected line is the scalar loop's answer, derived
+// by hand from the loops below; every value is a small dyadic fraction, exact in f32 / f64 at
+// every step (so fma contraction cannot move it), printed scaled to an integer:
+//
+//   a[j] = (5j mod 13)/4 - 1 for j < 77, x[c] = c/2 - 5/4.
+//   mv:     y[r] = sum over c of a[r*7 + c] * x[c], in c order; printed y[r] * 16.
+//           r = 0: a = -1, 1/4, 3/2, -1/2, 3/4, 2, 0 against x = -5/4, -3/4, -1/4, 1/4, 3/4,
+//           5/4, 7/4 -> 5/4 - 3/16 - 3/8 - 1/8 + 9/16 + 5/2 + 0 = 29/8, printed 58.
+//   horner: h = h/2 + a[c*11 + r] over c (column-major: the rows of a group are contiguous);
+//           printed h * 256.
+//   rowmax: m starts at -1000; m = fmax(m, a[r*7 + c] * 2) in f64 (a select, not a branch: an
+//           if-converted inner body is not a shape the outer path takes); printed m * 4.
+
+@unchecked
+fn mv(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut r: i64 = 0;
+    while r < rows {
+        let mut s: f32 = 0.0;
+        let mut c: i64 = 0;
+        while c < cols {
+            s = s + a[r * cols + c] * x[c];
+            c = c + 1;
+        }
+        y[r] = s;
+        r = r + 1;
+    }
+}
+
+@unchecked
+fn horner(a: []f32, @noalias mut y: []f32, rows: i64, cols: i64, t: f32, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut r: i64 = 0;
+    while r < rows {
+        let mut h: f32 = 0.0;
+        let mut c: i64 = 0;
+        while c < cols {
+            h = h * t + a[c * rows + r];
+            c = c + 1;
+        }
+        y[r] = h;
+        r = r + 1;
+    }
+}
+
+@unchecked
+fn rowmax(a: []f32, @noalias mut y: []f64, rows: i64, cols: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut r: i64 = 0;
+    while r < rows {
+        let mut m: f64 = -1000.0;
+        let mut c: i64 = 0;
+        while c < cols {
+            let v: f64 = (a[r * cols + c] as f64) * 2.0;
+            m = fmax(m, v);
+            c = c + 1;
+        }
+        y[r] = m;
+        r = r + 1;
+    }
+}
+
+fn again(z: i64) {
+    let mut t: []f32 = alloc_f32(1);
+    let mut u: []f32 = alloc_f32(1);
+    let mut d: []f64 = alloc_f64(1);
+    mv(t, t, u, 1, 1, z);
+    horner(t, u, 1, 1, 1.0, z);
+    rowmax(t, d, 1, 1, z);
+}
+
+fn main() -> i32 {
+    let rows: i64 = 11;
+    let cols: i64 = 7;
+    let mut a: []f32 = alloc_f32(77);
+    let mut x: []f32 = alloc_f32(7);
+    let mut y: []f32 = alloc_f32(11);
+    let mut d: []f64 = alloc_f64(11);
+    let mut j: i64 = 0;
+    while j < 77 {
+        a[j] = (((j * 5) % 13) as f32) * 0.25 - 1.0;
+        j = j + 1;
+    }
+    j = 0;
+    while j < 7 {
+        x[j] = (j as f32) * 0.5 - 1.25;
+        j = j + 1;
+    }
+    mv(a, x, y, rows, cols, 0);
+    j = 0;
+    while j < 11 {
+        print((y[j] * 16.0) as i64);
+        j = j + 1;
+    }
+    horner(a, y, rows, cols, 0.5, 0);
+    j = 0;
+    while j < 11 {
+        print((y[j] * 256.0) as i64);
+        j = j + 1;
+    }
+    rowmax(a, d, rows, cols, 0);
+    j = 0;
+    while j < 11 {
+        print((d[j] * 4.0) as i64);
+        j = j + 1;
+    }
+    return 0;
+}

@@ -1,8 +1,9 @@
 //! The loop vectorizer's per-lane shapes through the real binary, at `--emit=mir -O2`: a call to a
 //! side-effect-free function replicated per lane beside widened work (`tests/run/vec7_call_lanes.wk`),
-//! a checked gather tested per group (`vec7_checked_gather.wk`), and the lane-serial regions of a
+//! a checked gather tested per group (`vec7_checked_gather.wk`), the lane-serial regions of a
 //! read-modify-write histogram, two scatters into one object, a scatter beside a store to its object
-//! and a gather beside a store it may read (`vec7_lane_serial.wk`). Each fixture prints every lane
+//! and a gather beside a store it may read (`vec7_lane_serial.wk`), and two-deep nests widened
+//! across their rows (`vec7_outer_loops.wk`). Each fixture prints every lane
 //! against hand-derived values, and the differential gates prove `-O0 == -O2` and interp ==
 //! native on them; what only this file proves is that the vector path is the one that ran — that
 //! each kernel holds `<4 x ..>` values at all, which those gates cannot see.
@@ -19,6 +20,7 @@ const COMPILER_ENV: &[&str] = &[
     "WUKONG_NO_IV_RAMP",
     "WUKONG_NO_SLP",
     "WUKONG_NO_LANE_SERIAL",
+    "WUKONG_NO_OUTER_VEC",
     "WUKONG_P4_NO_256",
     "WUKONG_VEC256_MIN_TRIP",
     "WUKONG_VEC_TRACE",
@@ -117,6 +119,40 @@ fn lane_serial_regions_widen_around_the_serial_accesses() {
         assert!(
             !function(&off, k).contains("<4 x"),
             "{k} widened with WUKONG_NO_LANE_SERIAL set"
+        );
+    }
+}
+
+/// The block parameters a function's loop headers carry as vectors, one string per parameter list.
+fn vector_params(f: &str) -> Vec<&str> {
+    f.lines()
+        .filter(|l| l.trim_start().starts_with("bb") && l.contains("(") && l.contains(" x "))
+        .collect()
+}
+
+#[test]
+fn nests_widen_across_their_rows() {
+    let m = mir("vec7_outer_loops.wk", &[]);
+    // Each row's accumulator is one lane of a vector the inner loop carries.
+    for (k, ty) in [
+        ("mv", "<4 x f32>"),
+        ("horner", "<4 x f32>"),
+        ("rowmax", "<2 x f64>"),
+    ] {
+        let f = function(&m, k);
+        assert!(
+            vector_params(f).iter().any(|l| l.contains(ty)),
+            "{k} carries no {ty} accumulator:\n{f}"
+        );
+    }
+    // The kill switch leaves every inner loop to the inner path, whose float accumulators stay
+    // scalar.
+    let off = mir("vec7_outer_loops.wk", &[("WUKONG_NO_OUTER_VEC", "1")]);
+    for k in ["mv", "horner", "rowmax"] {
+        let f = function(&off, k);
+        assert!(
+            vector_params(f).is_empty(),
+            "{k} carries a vector with WUKONG_NO_OUTER_VEC set:\n{f}"
         );
     }
 }
