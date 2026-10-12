@@ -1109,7 +1109,7 @@ stored) becomes a reduction recipe whose wrapping result `kc` adds to the accumu
 the resumed loop through a block parameter of `kj` — integer addition is associative, so the
 kernel's canonical grouping is the scalar loop's sum bit for bit (`tests/run/vec256_opt_int_sum.wk`,
 every trip from 2040 to 2064). Anything else — a float sum (the recipe would reassociate it), any
-other reduction kind, a cast, a gather or scatter, a shift or bitwise op, the counter read as a
+other reduction kind, a cast (but the f16 grid roundings below), a gather or scatter, a shift or bitwise op, the counter read as a
 value, a countdown, a search loop, an interleave group, an unsigned compare, an `i64` multiply —
 keeps the 128-bit loop. One rule is added: every object the
 loop stores is accessed **only at the stored element** (`o[i] = o[i] * 2` is fine), because the
@@ -1123,6 +1123,26 @@ buffer (`guard_allows_equal`) are two streams that may share a base: the interpr
 per base), so every load reads the lane's latest earlier store to *any* stream of its class, its
 own included, as the machine code does by re-reading memory (`tests/run/vec256_opt_aliased.wk`; a
 reload of a stored stream after a store to its twin, `tests/run/vec256_opt_aliased_reload.wk`).
+**f16 bodies** take the recipe as an `f32` one: an f16 element is an `f32` lane between its
+conversions, so a recipe gains three ops (`wukong_mir::VecOp`) — `LoadF16` (`vcvtph2ps`, eight
+halves widened exactly), `StoreF16` (`vcvtps2ph` with imm8 0, round to nearest even whatever
+`MXCSR` holds) and `RoundF16` (both, for an `fptrunc .. to f16` or an `fpext` out of f16) — and a
+stream is f16 or `f32` throughout (`validate`), its group 16 bytes or 32 wide. F16C is used because
+it is the scalar path: the runtime shims are the `half` crate, which is `vcvtps2ph`/`vcvtph2ps` on
+an F16C host and an integer routine that agrees with them on every input elsewhere. The reference
+evaluator rounds through the same crate (`VecValue::round_f16`): a `LoadF16` rounds whatever the
+slot or a forwarded store holds (the interpreter stores a scalar f16 as is and rounds on load), and
+a `StoreF16` writes and forwards the rounded lane. The kernel needs F16C as well as AVX2+FMA
+(`host_supports_f16c_kernels`, asked by the optimizer and refused by the assembler without it;
+x86-64-v3 includes it); a host without it keeps the 128-bit `<4 x f16>` loop. One rule is added: an
+f16 invariant reaches the kernel through its `f32` scalar table by an `fpext`, which rounds, so only
+an invariant known to lie on the f16 grid is splatted (a constant, an f16 load, a cast into f16) —
+an f16 parameter need not (`n as f16` converts to `f32` without rounding, and `-O2` forwards the
+register past the store that would round it), and keeps the 128-bit loop. Pinned by the AVX2 tests
+in `avx2_f16_tests` (all 65536 encodings widened, the dense `f32` cover narrowed and rounded, a
+mixed body at unrolled and single-group trips on unaligned buffers, each against the shims and the
+evaluator) and `tests/run/vec256_f16_lanes.wk` (five kernels over 2048 lanes each, every lane's
+bits, hand-derived).
 The rewrite: a guard block computes `n`, the trip rounded down to the recipe's lanes and
 zero below the gate or when the alias check fails, and `start + n`; a call block (entered only when
 `n != 0`) rebuilds each stream's address and each invariant from the body's own scalar steps with

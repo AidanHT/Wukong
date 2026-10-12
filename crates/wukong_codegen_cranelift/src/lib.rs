@@ -6908,6 +6908,9 @@ mod lane_op_tests;
 mod half_lane_tests;
 
 #[cfg(test)]
+mod avx2_f16_tests;
+
+#[cfg(test)]
 mod assertion_tests;
 
 #[cfg(test)]

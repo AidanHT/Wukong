@@ -65,7 +65,8 @@ load-bearing.
   (`src/vec256.rs`; `OptimizeOptions::vec_kernels`, `WUKONG_P4_NO_256`, `WUKONG_VEC256_MIN_TRIP`).
   A bf16 or f16 body widens as `<4 x bf16>` / `<4 x f16>` (four half lanes in an `f32x4`, rounded
   to the half grid at the load, the store and each half cast exactly as the scalar loop rounds; the
-  f16 conversions are SSE2 integer code in `codegen_cranelift::half_lanes`).
+  f16 conversions are SSE2 integer code in `codegen_cranelift::half_lanes`). An f16 body's
+  256-bit recipe is an `f32` one with F16C conversions (`VecOp::LoadF16`/`StoreF16`/`RoundF16`).
 
 **Whole-program stages at `-O2`+ (not `Pass` traits):**
 

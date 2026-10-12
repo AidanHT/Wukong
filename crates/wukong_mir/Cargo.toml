@@ -15,3 +15,8 @@ workspace = true
 [dependencies]
 wukong_span = { workspace = true }
 wukong_types = { workspace = true }
+# The f16 conversions of a vector-kernel recipe's reference evaluator (`vec_kernel`'s `LoadF16`,
+# `StoreF16`, `RoundF16`) are the `half` crate's, the same function the runtime shims
+# `wukong_f32_to_f16_bits` / `wukong_f16_bits_to_f32` call, so the oracle and the scalar path cannot
+# disagree. Already locked for `wukong_runtime`, at the same version and features.
+half = "2"

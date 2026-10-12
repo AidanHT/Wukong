@@ -26,7 +26,7 @@ use crate::half_lanes;
 use crate::target::TargetCpu;
 
 /// `half`'s `f32_to_f16_fallback`, transcribed.
-fn soft_f32_to_f16(value: f32) -> u16 {
+pub(crate) fn soft_f32_to_f16(value: f32) -> u16 {
     let x = value.to_bits();
     let sign = x & 0x8000_0000;
     let exp = x & 0x7f80_0000;
@@ -64,7 +64,7 @@ fn soft_f32_to_f16(value: f32) -> u16 {
 }
 
 /// `half`'s `f16_to_f32_fallback`, transcribed.
-fn soft_f16_to_f32(i: u16) -> f32 {
+pub(crate) fn soft_f16_to_f32(i: u16) -> f32 {
     if i & 0x7fff == 0 {
         return f32::from_bits((i as u32) << 16);
     }
@@ -249,7 +249,7 @@ fn every_f16_value_narrows_back_like_the_shim() {
 }
 
 /// The dense f32 inputs: see the module docs.
-fn dense_f32_inputs() -> Vec<u32> {
+pub(crate) fn dense_f32_inputs() -> Vec<u32> {
     let mut v: Vec<u32> = Vec::new();
     // Every sign and exponent, with mantissas that put a one, a run of ones and a tie at every
     // rounding position an f16 result can have (bit 13 for a normal, up to bit 23 below it).

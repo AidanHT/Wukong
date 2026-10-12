@@ -39,6 +39,14 @@
 //! (b + c)` differ, and the scalar loop's order is the program — so it keeps the 128-bit path's
 //! in-order fold, and so does every other reduction kind.
 //!
+//! An **f16 body** takes an `f32` recipe. An f16 element is an `f32` lane between its conversions
+//! (the module docs of `vectorize`), so its loads, stores and grid-rounding casts become the F16C
+//! operations `LoadF16`, `StoreF16` and `RoundF16` (`wukong_mir::vec_kernel`), which convert
+//! exactly as the scalar path's `half`-crate shims do, and every other step is the `f32` one. Such
+//! a kernel needs F16C beside the kernels' own gate (`wukong_mir::host_supports_f16c_kernels`), and
+//! an f16 invariant is splatted only when it provably lies on the f16 grid ([`Recipe::value`]):
+//! the scalar table holds `f32`s, and the `fpext` that fills it rounds.
+//!
 //! # The rewrite
 //!
 //! ```text
@@ -255,6 +263,14 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
             _ => None,
         })
         .ok_or("no contiguous access")?;
+    // An f16 element computes in an `f32` lane, as every backend computes f16: the recipe converts
+    // at its f16 loads, stores and grid-rounding casts (`LoadF16`, `StoreF16`, `RoundF16`), and
+    // every other step is the `f32` one.
+    let lane_ty = if lane_ty == MirType::F16 {
+        MirType::F32
+    } else {
+        lane_ty
+    };
     let lane = VecLane::of(&lane_ty).ok_or("a lane type the AVX2 recipe does not cover")?;
     if red.is_some_and(|r| r.ty != lane_ty) {
         return Err("a sum of another lane type than the loads");
@@ -363,11 +379,15 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
                 let (Op::Load(ptr, ty), Some(r)) = (&inst.op, inst.result) else {
                     return Err("a contiguous load that is not a load");
                 };
-                if ty != b.lane_ty {
+                if !b.lane_ok(ty) {
                     return Err("a load of another lane type");
                 }
                 let stream = b.stream(*ptr)?;
-                let v = b.push(VecOp::Load { stream });
+                let v = b.push(if *ty == MirType::F16 {
+                    VecOp::LoadF16 { stream }
+                } else {
+                    VecOp::Load { stream }
+                });
                 b.val.insert(r.0, v);
             }
             (Plan::VecStore, LinInst::Real { block, idx }) => {
@@ -378,6 +398,10 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
             }
             (Plan::Widen, LinInst::Real { block, idx }) => {
                 b.widen(&f.blocks[block.0 as usize].insts[*idx])?;
+            }
+            // A lane-wise cast: only the f16 grid roundings have a recipe form.
+            (Plan::Cast(_), LinInst::Real { block, idx }) => {
+                b.cast(&f.blocks[block.0 as usize].insts[*idx])?;
             }
             // `if c { o[i] = x } else { o[i] = y }`: one blend, one store.
             (
@@ -390,12 +414,18 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
                     ..
                 },
             ) => {
-                if f.value_type(*then_val) != b.lane_ty {
+                let ty = f.value_type(*then_val);
+                if !b.lane_ok(ty) {
                     return Err("a store of another lane type");
                 }
+                let f16 = *ty == MirType::F16;
                 let v = b.select(*cond, *then_val, *else_val)?;
                 let stream = b.stream(*ptr)?;
-                b.push(VecOp::Store { stream, val: v });
+                b.push(if f16 {
+                    VecOp::StoreF16 { stream, val: v }
+                } else {
+                    VecOp::Store { stream, val: v }
+                });
             }
             // A join parameter the arms merge into: one blend.
             (
@@ -410,7 +440,7 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
                 if !p.vector_ty.contains_key(&param.0) {
                     return Err("a merge of uniform values");
                 }
-                if f.value_type(*param) != b.lane_ty {
+                if !b.lane_ok(f.value_type(*param)) {
                     return Err("a merge of another lane type");
                 }
                 let v = b.select(*cond, *then_arg, *else_arg)?;
@@ -421,7 +451,7 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
             _ => return Err("a step the recipe has no form for"),
         }
     }
-    let stores = b.ops.iter().any(|o| matches!(o, VecOp::Store { .. }));
+    let stores = b.ops.iter().any(|o| o.stored_stream().is_some());
     let reduce = match red {
         // A reduction kernel writes no memory: it returns its fold.
         Some(_) if stores => return Err("a sum beside a store"),
@@ -456,6 +486,11 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
     };
     if !fits {
         return Err("outside the AVX2 emitter's coverage or register file");
+    }
+    // The f16 conversions are F16C instructions: a host without them keeps the 128-bit
+    // `<4 x f16>` loop, which computes the same bits.
+    if kernel.uses_f16() && !wukong_mir::host_supports_f16c_kernels() {
+        return Err("f16 lanes on a host without F16C");
     }
     Ok(KernelPlan {
         kernel,
@@ -514,6 +549,12 @@ struct Recipe<'a> {
 }
 
 impl Recipe<'_> {
+    /// Is `t` a lane-varying value's type in this recipe: the lane type, or f16 in an `f32`
+    /// recipe (an f16 value lives in an `f32` lane between its conversions)?
+    fn lane_ok(&self, t: &MirType) -> bool {
+        t == self.lane_ty || (self.lane == VecLane::F32 && *t == MirType::F16)
+    }
+
     fn push(&mut self, op: VecOp) -> u32 {
         self.ops.push(op);
         (self.ops.len() - 1) as u32
@@ -554,8 +595,15 @@ impl Recipe<'_> {
             }
             return Ok(k);
         }
-        if self.f.value_type(v) != self.lane_ty {
+        let ty = self.f.value_type(v);
+        if !self.lane_ok(ty) {
             return Err("an invariant of another lane type");
+        }
+        // An f16 invariant is passed to the kernel through its `f32` scalar table, widened by an
+        // `fpext` ([`apply`]), which rounds to the f16 grid. That is the scalar loop's value only
+        // when the invariant already lies on the grid, which its producer must show.
+        if *ty == MirType::F16 && !self.on_f16_grid(v) {
+            return Err("an f16 invariant that may lie off the f16 grid");
         }
         if !self.rebuildable(v, false, 0) {
             return Err("an operand that is neither lane-varying nor invariant");
@@ -591,12 +639,65 @@ impl Recipe<'_> {
     }
 
     fn store(&mut self, ptr: ValueId, value: ValueId) -> Result<(), &'static str> {
-        if self.f.value_type(value) != self.lane_ty {
+        let ty = self.f.value_type(value);
+        if !self.lane_ok(ty) {
             return Err("a store of another lane type");
         }
+        let f16 = *ty == MirType::F16;
         let val = self.value(value)?;
         let stream = self.stream(ptr)?;
-        self.push(VecOp::Store { stream, val });
+        self.push(if f16 {
+            VecOp::StoreF16 { stream, val }
+        } else {
+            VecOp::Store { stream, val }
+        });
+        Ok(())
+    }
+
+    /// Does `v` (an f16 value) certainly hold a value on the f16 grid — a constant (materialized
+    /// rounded), an f16 load, or a cast into f16 that rounds (`fptrunc`, or an `fpext` out of
+    /// f16)? An integer converted to f16, a parameter or a carried value need not be, and every
+    /// backend keeps such a value in its `f32` register unrounded until a store or a cast.
+    fn on_f16_grid(&self, v: ValueId) -> bool {
+        let inst = self
+            .f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.result == Some(v));
+        match inst.map(|i| &i.op) {
+            Some(Op::ConstFloat(_, MirType::F16) | Op::Load(_, MirType::F16)) => true,
+            Some(Op::Cast(CastKind::FpTrunc, _, MirType::F16)) => true,
+            Some(Op::Cast(CastKind::FpExt, x, MirType::F16)) => {
+                *self.f.value_type(*x) == MirType::F16
+            }
+            _ => false,
+        }
+    }
+
+    /// One lane-wise cast as a recipe op, or why it has none. In an `f32` recipe the casts that
+    /// only round to the f16 grid — an `fptrunc` into f16 from `f32` or f16, an `fpext` out of
+    /// f16 into `f32` or f16 — are one `RoundF16`: the backends round exactly there in the scalar
+    /// loop. No other cast has a recipe form.
+    fn cast(&mut self, inst: &Inst) -> Result<(), &'static str> {
+        let r = inst.result.ok_or("a cast with no result")?;
+        let Op::Cast(kind, x, to) = &inst.op else {
+            return Err("a cast plan on a non-cast");
+        };
+        let from = self.f.value_type(*x);
+        let f32_or_f16 = |t: &MirType| matches!(t, MirType::F32 | MirType::F16);
+        let rounds = self.lane == VecLane::F32
+            && match kind {
+                CastKind::FpTrunc => *to == MirType::F16 && f32_or_f16(from),
+                CastKind::FpExt => *from == MirType::F16 && f32_or_f16(to),
+                _ => false,
+            };
+        if !rounds {
+            return Err("a cast the recipe has no lane form for");
+        }
+        let a = self.value(*x)?;
+        let v = self.push(VecOp::RoundF16 { a });
+        self.val.insert(r.0, v);
         Ok(())
     }
 
@@ -606,7 +707,7 @@ impl Recipe<'_> {
         let float = self.lane.is_float();
         let v = match &inst.op {
             Op::Bin(op, x, y) => {
-                if self.f.value_type(r) != self.lane_ty {
+                if !self.lane_ok(self.f.value_type(r)) {
                     return Err("arithmetic of another lane type");
                 }
                 let op = match (op, float) {
@@ -635,7 +736,7 @@ impl Recipe<'_> {
                 self.push(VecOp::Neg { a })
             }
             Op::Cmp(pred, x, y) => {
-                if self.f.value_type(*x) != self.lane_ty {
+                if !self.lane_ok(self.f.value_type(*x)) {
                     return Err("a compare of another lane type");
                 }
                 let pred =
@@ -647,14 +748,14 @@ impl Recipe<'_> {
                 k
             }
             Op::Select(c, x, y) => {
-                if self.f.value_type(r) != self.lane_ty {
+                if !self.lane_ok(self.f.value_type(r)) {
                     return Err("a blend of another lane type");
                 }
                 self.select(*c, *x, *y)?
             }
             _ => return Err("an operation the recipe has no lane form for"),
         };
-        if self.f.value_type(r) != self.lane_ty && !self.masks.contains(&v) {
+        if !self.lane_ok(self.f.value_type(r)) && !self.masks.contains(&v) {
             return Err("a result of another lane type");
         }
         self.val.insert(r.0, v);
@@ -828,6 +929,13 @@ pub(super) fn apply(f: &mut Function, p: &VecPlan, k: &KernelPlan) {
         );
     }
     for (i, &v) in scalar_vals.iter().enumerate() {
+        // An f16 invariant enters the `f32` table widened; `Recipe::value` admitted it only on
+        // the f16 grid, where the widening is exact.
+        let v = if *e.f.value_type(v) == MirType::F16 && lane_ty == MirType::F32 {
+            e.push(kc, MirType::F32, Op::Cast(CastKind::FpExt, v, MirType::F32))
+        } else {
+            v
+        };
         let at = e.int(kc, &MirType::I64, i as i64);
         let slot = e.push(
             kc,
@@ -1428,5 +1536,176 @@ mod tests {
             .collect();
         assert!(tables.contains(&&MirType::Ptr), "{tables:?}");
         assert!(tables.contains(&&MirType::F32), "{tables:?}");
+    }
+
+    // ---- f16 bodies: an `f32` recipe with F16C conversions -------------------------------------
+
+    /// Can an f16 kernel be built here (the kernels' gate plus F16C)?
+    fn host_f16() -> bool {
+        host_kernels() && wukong_mir::host_supports_f16c_kernels()
+    }
+
+    /// Five f16 kernels at a runtime trip of 2053 (256 kernel groups, then the remainder): the
+    /// contracted `x * y + x`, an ordered compare choosing `x` or `-y`, a division, `fpext` into an
+    /// `f32` output, and an `f32` input rounded into f16 — over NaN payloads (quiet and
+    /// signalling), both zeros, both infinities, subnormals, the largest finite value and ties.
+    const F16_LANES: &str = "\
+        fn pick(a: f16, b: f16) -> f16 { if a > b { return a; } return -b; } \
+        @unchecked fn k(x: []f16, y: []f16, mut o1: []f16, mut o2: []f16, mut o3: []f16, \
+          mut f: []f32, mut o5: []f16, n: i64, d: i64) { \
+          if d > 0 { k(x, y, o1, o2, o3, f, o5, n, d - 1); return; } let mut i: i64 = 0; \
+          while i < n { o1[i] = x[i] * y[i] + x[i]; i = i + 1; } \
+          i = 0; while i < n { o2[i] = pick(x[i], y[i]); i = i + 1; } \
+          i = 0; while i < n { o3[i] = x[i] / y[i]; i = i + 1; } \
+          i = 0; while i < n { f[i] = (x[i] as f32) * 0.5; i = i + 1; } \
+          i = 0; while i < n { o5[i] = (f[i] * 3.0) as f16; i = i + 1; } } \
+        fn xs(r: i64) -> u16 { let t: [u16; 16] = [32257, 32000, 32768, 0, 31744, 64512, 15872, \
+          49280, 1, 31743, 15361, 16968, 48128, 13312, 22528, 1023]; return t[r]; } \
+        fn ys(r: i64) -> u16 { let t: [u16; 16] = [15360, 16384, 31744, 32768, 0, 15361, 15359, \
+          49664, 512, 27648, 14336, 16384, 31744, 0, 16383, 32258]; return t[r]; } \
+        fn main() -> i32 { let n: i64 = 2053; \
+          let mut x: []f16 = alloc_f16(n); let mut y: []f16 = alloc_f16(n); \
+          let mut o1: []f16 = alloc_f16(n); let mut o2: []f16 = alloc_f16(n); \
+          let mut o3: []f16 = alloc_f16(n); let mut o5: []f16 = alloc_f16(n); \
+          let mut f: []f32 = alloc_f32(n); let mut i: i64 = 0; \
+          while i < n { x[i] = f16_from_bits(xs(i % 16)); \
+            y[i] = f16_from_bits(ys((5 * i + 3) % 16)); i = i + 1; } \
+          k(x, y, o1, o2, o3, f, o5, n, 0); i = 0; \
+          while i < n { print(bits(o1[i])); print(bits(o2[i])); print(bits(o3[i])); \
+            print(bits(f[i])); print(bits(o5[i])); i = i + 1; } \
+          return 0; }";
+
+    /// An f16 body's recipe is an `f32` one whose f16 loads, stores and grid roundings are the F16C
+    /// conversions: every one of the five loops takes a kernel, and between them they use all three.
+    #[test]
+    fn an_f16_body_takes_an_f32_kernel_with_f16_conversions() {
+        let (program, mut interner) = optimized(F16_LANES, 2, true);
+        let ks = kernels_of(&program, &mut interner, "k");
+        if !host_f16() {
+            assert!(ks.is_empty(), "no F16C kernels here, yet: {ks:?}");
+            return;
+        }
+        assert_eq!(ks.len(), 5, "{ks:?}");
+        assert!(ks.iter().all(|k| k.lane == VecLane::F32 && k.uses_f16()));
+        let has = |p: fn(&VecOp) -> bool| ks.iter().flat_map(|k| &k.ops).any(p);
+        assert!(has(|o| matches!(o, VecOp::LoadF16 { .. })));
+        assert!(has(|o| matches!(o, VecOp::StoreF16 { .. })));
+        assert!(has(|o| matches!(o, VecOp::RoundF16 { .. })));
+        // The f16 -> f32 loop reads an f16 stream and writes an `f32` one.
+        assert!(ks.iter().any(|k| {
+            k.ops.iter().any(|o| matches!(o, VecOp::LoadF16 { .. }))
+                && k.ops.iter().any(|o| matches!(o, VecOp::Store { .. }))
+        }));
+        // The remainders still widen at 128 bits.
+        assert!(has_vectors(&program, &mut interner, "k"));
+    }
+
+    /// Every lane of the five f16 kernels, `-O0` against `-O2`, on the interpreter.
+    #[test]
+    fn every_f16_lane_of_a_kernel_matches_the_scalar_loop() {
+        let (p0, mut i0) = optimized(F16_LANES, 0, true);
+        let (p2, mut i2) = optimized(F16_LANES, 2, true);
+        let (want, got) = (run(&p0, &mut i0), run(&p2, &mut i2));
+        assert_eq!(want.0, 0);
+        assert_eq!(want.1.lines().count(), 5 * 2053);
+        assert_eq!(want, got, "-O0 and -O2 disagree");
+    }
+
+    /// The f16 kernels really run on those lanes: rewiring every f16 store to the value of its
+    /// kernel's first load changes the output.
+    #[test]
+    fn the_f16_kernels_really_run() {
+        if !host_f16() {
+            return;
+        }
+        let (p0, mut i0) = optimized(F16_LANES, 0, true);
+        let (mut p2, mut i2) = optimized(F16_LANES, 2, true);
+        let mut corrupted = 0;
+        for f in &mut p2.funcs {
+            for k in &mut f.vec_kernels {
+                let Some(first) = k.ops.iter().position(|o| o.loaded_stream().is_some()) else {
+                    continue;
+                };
+                // Only a value of an f16 load may feed an f16 store (one width per stream is
+                // about streams, not values, so any value would do; this keeps the recipe valid).
+                for op in &mut k.ops {
+                    if let VecOp::StoreF16 { val, .. } = op {
+                        if *val as usize > first {
+                            *val = first as u32;
+                            corrupted += 1;
+                        }
+                    }
+                }
+                assert!(k.validate().is_empty(), "{:?}", k.validate());
+            }
+        }
+        assert!(corrupted >= 3, "{corrupted} f16 stores corrupted");
+        assert_ne!(
+            run(&p0, &mut i0),
+            run(&p2, &mut i2),
+            "corrupting every f16 kernel left the output unchanged: they never ran"
+        );
+    }
+
+    /// An f16 invariant enters the kernel through its `f32` scalar table, widened by an `fpext`
+    /// that rounds to the grid. A constant is on the grid and takes the kernel; a parameter need
+    /// not be (an `i as f16` stays unrounded in its register until a store or a cast), so a loop
+    /// that splats one keeps the 128-bit loop, which reads the register as the scalar loop does.
+    #[test]
+    fn an_f16_invariant_takes_the_kernel_only_on_the_grid() {
+        let constant = "fn k(x: []f16, mut o: []f16, n: i64) { let c: f16 = 0.1; \
+                        let mut i: i64 = 0; while i < n { o[i] = x[i] * c; i = i + 1; } } \
+                        fn main() -> i32 { return 0; }";
+        let (program, mut interner) = optimized(constant, 2, true);
+        let ks = kernels_of(&program, &mut interner, "k");
+        assert_eq!(ks.len(), usize::from(host_f16()), "{ks:?}");
+        if let Some(k) = ks.first() {
+            assert_eq!(
+                k.scalars, 1,
+                "the constant 0.1 is the one scalar: {:?}",
+                k.ops
+            );
+        }
+        let param = "fn k(x: []f16, mut o: []f16, s: f16, n: i64) { let mut i: i64 = 0; \
+                     while i < n { o[i] = x[i] * s; i = i + 1; } } \
+                     fn main() -> i32 { return 0; }";
+        let (program, mut interner) = optimized(param, 2, true);
+        assert!(has_vectors(&program, &mut interner, "k"));
+        let ks = kernels_of(&program, &mut interner, "k");
+        assert!(ks.is_empty(), "an f16 parameter took the kernel: {ks:?}");
+    }
+
+    /// The invariant rule is not cosmetic: an f16 parameter whose register holds a value off the
+    /// grid (`2049 as f16` is the `f32` 2049, which f16 cannot hold, and `-O2` forwards it to the
+    /// callee's multiply unrounded) must multiply as that value, at a trip that would take a kernel.
+    /// The comparison is `-O2` with the kernels on against `-O2` with them off: `-O0` rounds the
+    /// parameter where it stores it to its slot, so `-O0` and `-O2` already disagree on this
+    /// program whatever the vectorizer does (an int-to-half cast does not round at the cast).
+    #[test]
+    fn an_off_grid_f16_parameter_multiplies_as_the_scalar_loop_does() {
+        let src = "fn k(x: []f16, mut o: []f32, s: f16, n: i64, d: i64) { \
+                   if d > 0 { k(x, o, s, n, d - 1); return; } let mut i: i64 = 0; \
+                   while i < n { o[i] = (x[i] * s) as f32; i = i + 1; } } \
+                   fn main() -> i32 { let n: i64 = 2053; let m: i64 = 2049; \
+                     let mut x: []f16 = alloc_f16(n); let mut o: []f32 = alloc_f32(n); \
+                     let mut i: i64 = 0; \
+                     while i < n { x[i] = f16_from_bits(((i * 37) % 31744) as u16); i = i + 1; } \
+                     k(x, o, m as f16, n, 0); i = 0; \
+                     while i < n { print(bits(o[i])); i = i + 1; } return 0; }";
+        let (pk, mut ik) = optimized(src, 2, true);
+        let (p2, mut i2) = optimized(src, 2, false);
+        assert!(
+            has_vectors(&pk, &mut ik, "k"),
+            "not widened: proves nothing"
+        );
+        assert!(
+            kernels_of(&pk, &mut ik, "k").is_empty(),
+            "the parameter took a kernel"
+        );
+        assert_eq!(
+            run(&pk, &mut ik),
+            run(&p2, &mut i2),
+            "the kernels on and off disagree"
+        );
     }
 }

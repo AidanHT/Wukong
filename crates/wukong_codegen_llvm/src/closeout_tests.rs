@@ -1542,6 +1542,53 @@ fn vector_kernels_are_defined_in_their_lane_type() {
     }
 }
 
+/// An f16 recipe (an `f32` lane whose f16 streams convert at their loads and stores, and whose
+/// casts into f16 round) is defined with `half` memory and `fpext`/`fptrunc` at exactly those
+/// points, the evaluator's `LoadF16`, `StoreF16` and `RoundF16`; the `f32` stream stays `float`.
+#[test]
+fn f16_kernel_operations_convert_through_half() {
+    use wukong_mir::{VecBin, VecKernel, VecLane, VecOp};
+    let mut i = Interner::new();
+    let text = kernel_module(
+        "half_ops",
+        VecKernel {
+            name: i.intern("k"),
+            lane: VecLane::F32,
+            streams: 3,
+            scalars: 0,
+            ops: vec![
+                VecOp::LoadF16 { stream: 0 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                },
+                VecOp::RoundF16 { a: 1 },
+                VecOp::StoreF16 { stream: 1, val: 2 },
+                VecOp::Store { stream: 2, val: 1 },
+            ],
+            unroll: 4,
+            reduce: None,
+        },
+        &mut i,
+    );
+    for line in [
+        "%x0.a = getelementptr half, ptr %base0, i64 %i",
+        "%x0.h = load half, ptr %x0.a",
+        "%x0 = fpext half %x0.h to float",
+        "%x1 = fmul float %x0, %x0",
+        "%x2.h = fptrunc float %x1 to half",
+        "%x2 = fpext half %x2.h to float",
+        "%x3.a = getelementptr half, ptr %base1, i64 %i",
+        "%x3.h = fptrunc float %x2 to half",
+        "store half %x3.h, ptr %x3.a",
+        "%x4.a = getelementptr float, ptr %base2, i64 %i",
+        "store float %x1, ptr %x4.a",
+    ] {
+        assert!(text.contains(line), "missing `{line}`:\n{text}");
+    }
+}
+
 /// Every refusal carries a [`DECLINED`] tag, and every tag is reachable: each row is triggered
 /// here once, by the smallest MIR that needs it.
 #[test]

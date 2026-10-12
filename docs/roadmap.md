@@ -763,7 +763,11 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   (`tests/run/vec256_opt_int_sum.wk`). Still 128-bit: float sums and every other reduction kind
   (the kernel would reassociate them), casts, gathers and scatters, shifts and bitwise
   ops, the counter read as a value, countdowns, search loops, interleave groups, unsigned compares,
-  `i64` multiplies and `bf16` bodies (no recipe lane). The 2048 gate is the crossover measured for the
+  `i64` multiplies and `bf16` bodies (no recipe lane). **f16 bodies** take the kernel as an `f32`
+  recipe whose f16 loads, stores and grid roundings are F16C's `vcvtph2ps`/`vcvtps2ph` (round to
+  nearest even), the conversions the scalar path's `half`-crate shims perform, bit for bit; they
+  need F16C beside AVX2+FMA, and an f16 invariant that may lie off the f16 grid (a parameter) keeps
+  the 128-bit loop (`tests/run/vec256_f16_lanes.wk`, every lane's bits). The 2048 gate is the crossover measured for the
   front end's out-of-line *reduction* kernel; the elementwise crossover is unmeasured and likely
   lower.
   **bf16 bodies** widen too (P15.7): a bf16 lane is an `f32` lane in a register, so a bf16 loop

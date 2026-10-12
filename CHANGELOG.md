@@ -23,6 +23,20 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `fptrunc`) over NaN payloads, signed zeros, infinities, subnormals, overflow and ties, hand-derived,
   on interp and native at `-O0` and `-O2`. Six corpus programs gain `<4 x f16>` loops at `-O2`
   (no dispatch moves).
+- **f16 loops take 256-bit kernels (F16C).** A widened f16 body with a raw-AVX2 recipe form and a
+  trip of 2048 or more now calls a kernel like an `f32` one: the recipe is an `f32` recipe with
+  three new operations, `LoadF16` (`vcvtph2ps`), `StoreF16` (`vcvtps2ph`, imm8 0: round to nearest
+  even regardless of `MXCSR`) and `RoundF16` (both, for a cast into f16). F16C is used because it is
+  bit-identical to the scalar shims on every input class — on an F16C host the `half` crate *is*
+  those instructions — and the AVX2 tests check the machine code against the shims and the recipe's
+  reference evaluator on every f16 encoding and the dense `f32` cover. The kernel needs F16C beside
+  AVX2+FMA (`wukong_mir::host_supports_f16c_kernels`); an f16 invariant that may lie off the f16
+  grid (a parameter: an integer converted to f16 is not rounded until it is stored) keeps the
+  128-bit loop. The interpreter marshals f16 streams like any other, its evaluator rounding where
+  the instructions do; the LLVM emitter lowers the three ops through `half`.
+  `tests/run/vec256_f16_lanes.wk` runs five f16 kernels over 2048 lanes each and prints every
+  lane's bits (hand-derived). Census: `vec256_f16_lanes`, `vec_f16_lanes` (a runtime trip) and
+  `cov4_par_lowp_dot` gain kernels; nothing is lost.
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

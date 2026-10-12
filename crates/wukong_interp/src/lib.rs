@@ -1709,13 +1709,15 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .get_mut(*scalar as usize)
                     .ok_or("veckernel scalar index out of bounds")? = true;
             }
-            if let VecOp::Store { stream, .. } = op {
+            // `Store`/`StoreF16` and `Load`/`LoadF16`: an f16 stream is one slot per element like
+            // any other; the recipe's evaluator rounds what it reads and writes.
+            if let Some(stream) = op.stored_stream() {
                 *stored_streams
-                    .get_mut(*stream as usize)
+                    .get_mut(stream as usize)
                     .ok_or("veckernel store stream out of bounds")? = true;
             }
-            if let VecOp::Load { stream } = op {
-                if *stream as usize >= streams {
+            if let Some(stream) = op.loaded_stream() {
+                if stream as usize >= streams {
                     return Err("veckernel load stream out of bounds".into());
                 }
             }
@@ -1739,15 +1741,16 @@ impl<'a, 'k> Interp<'a, 'k> {
             alias.push(first as u32);
         }
         for (index, op) in kern.ops.iter().enumerate() {
-            if let VecOp::Load { stream } = op {
+            if let Some(stream) = op.loaded_stream() {
                 // The evaluator forwards a preceding store to this stream's class; that load never
                 // consumes the original slot, which may be undefined.
-                let class = alias[*stream as usize];
+                let class = alias[stream as usize];
                 if !kern.ops[..index].iter().any(|previous| {
-                    matches!(previous, VecOp::Store { stream: written, .. }
-                        if alias[*written as usize] == class)
+                    previous
+                        .stored_stream()
+                        .is_some_and(|written| alias[written as usize] == class)
                 }) {
-                    read_streams[*stream as usize] = true;
+                    read_streams[stream as usize] = true;
                 }
             }
         }

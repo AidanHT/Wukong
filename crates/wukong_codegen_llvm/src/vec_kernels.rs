@@ -445,6 +445,36 @@ fn emit_body(out: &mut String, kernel: &VecKernel, prefix: &str, elem: &str) -> 
                 let _ = writeln!(out, "  store {ty} {}, ptr {r}.a", names[val as usize]);
                 String::new()
             }
+            // The f16 operations (an `f32` lane only, so `ty` is `float`): an f16 element is a
+            // `half` in memory, widened exactly by `fpext` and rounded to nearest even by
+            // `fptrunc` — `VecValue::round_f16` and the evaluator's load and store.
+            VecOp::LoadF16 { stream } => {
+                let _ = writeln!(
+                    out,
+                    "  {r}.a = getelementptr half, ptr %base{stream}, i64 {elem}"
+                );
+                let _ = writeln!(out, "  {r}.h = load half, ptr {r}.a");
+                let _ = writeln!(out, "  {r} = fpext half {r}.h to {ty}");
+                r
+            }
+            VecOp::StoreF16 { stream, val } => {
+                let _ = writeln!(
+                    out,
+                    "  {r}.a = getelementptr half, ptr %base{stream}, i64 {elem}"
+                );
+                let _ = writeln!(
+                    out,
+                    "  {r}.h = fptrunc {ty} {} to half",
+                    names[val as usize]
+                );
+                let _ = writeln!(out, "  store half {r}.h, ptr {r}.a");
+                String::new()
+            }
+            VecOp::RoundF16 { a } => {
+                let _ = writeln!(out, "  {r}.h = fptrunc {ty} {} to half", names[a as usize]);
+                let _ = writeln!(out, "  {r} = fpext half {r}.h to {ty}");
+                r
+            }
         };
         names.push(name);
     }
