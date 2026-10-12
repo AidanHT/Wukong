@@ -36,6 +36,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `str`, tensor or vector still cannot be captured (`E0418`, `tests/fail/closure_capture_slice.wk`,
   `tests/fail/closure_capture_generic_counter.wk`; `tests/run/closure_captures.wk`,
   `tests/run/closure_capture_out_params.wk`, `tests/run/closure_wide_counter.wk`).
+- **Fixed: the int8 GEMM + dequant fusion dropped an accumulator a pointer still held.** The fused
+  `wukong_i8gemm_nt_deq` never writes the i32 accumulator `c`, and fired whenever nothing after the
+  window named `c`. A `let`-bound closure that writes `c` holds a pointer to it from its `let` on,
+  and a later call names only that pointer, so every lane it read back was 0 (on interp and native
+  at every `-O`, so no gate saw it); a raw `let pc = &mut c;` had the same hole. The fusion now also
+  requires that nothing before the window took `c`'s address, and keeps the unfused
+  `wukong_i8gemm_nt` otherwise (`tests/run/closure_i8_accumulator.wk`).
 - **Added: closure parameters inferred from the call's other arguments.** When the expected type
   names a callee generic, the other arguments bind it first (non-literals, then literals at their
   default type), so `fold3(|a, b| a * 10 + b, x, y, 3)` with `x: i64` types `a, b: i64` and

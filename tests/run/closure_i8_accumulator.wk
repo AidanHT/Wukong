@@ -1,0 +1,138 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -39
+// EXPECT-OUT: 2
+// EXPECT-OUT: 13
+// EXPECT-OUT: -111
+// EXPECT-OUT: -2
+// EXPECT-OUT: 27
+// EXPECT-OUT: -183
+// EXPECT-OUT: -6
+// EXPECT-OUT: 41
+// EXPECT-OUT: -40
+// EXPECT-OUT: 0
+// EXPECT-OUT: 40
+// EXPECT-OUT: -112
+// EXPECT-OUT: -8
+// EXPECT-OUT: 96
+// EXPECT-OUT: -184
+// EXPECT-OUT: -16
+// EXPECT-OUT: 152
+// EXPECT-OUT: 0
+// EXPECT-OUT: -39
+// EXPECT-OUT: 2
+// EXPECT-OUT: 13
+// EXPECT-OUT: -111
+// EXPECT-OUT: -2
+// EXPECT-OUT: 27
+// EXPECT-OUT: -183
+// EXPECT-OUT: -6
+// EXPECT-OUT: 41
+// EXPECT-OUT: -40
+// EXPECT-OUT: 0
+// EXPECT-OUT: 40
+// EXPECT-OUT: -112
+// EXPECT-OUT: -8
+// EXPECT-OUT: 96
+// EXPECT-OUT: -184
+// EXPECT-OUT: -16
+// EXPECT-OUT: 152
+module tests.run.closure_i8_accumulator
+
+// The int8 GEMM + dequant window of tests/run/i8_linear_dequant.wk fuses into one kernel that never
+// writes the i32 accumulator `c`, which is sound only while nothing reads `c` afterwards. A
+// `let`-bound closure that writes `c` holds a pointer to it from its `let` on, so a call after the
+// window reads `c` without naming it -- as does a raw `let pc = &mut c;`. The fusion must leave `c`
+// materialized for both (before, the kernel fired and every lane read back 0). Expectations by
+// hand: A rows [1 2 3 4], [5 6 7 8], [9 10 11 12]; B rows [-6 -5 -4 -3], [-2 -1 0 1], [2 3 4 5];
+// C[i,j] = A_i . B_j:
+//   -40    0   40
+//  -112   -8   96
+//  -184  -16  152
+// and out[i,j] = C[i,j] * 0.5 * scale_b[j] + bias[j] with scale_b = [2, 1, 0.5], bias = [1, 2, 3]:
+//   -39    2   13
+//  -111   -2   27
+//  -183   -6   41
+// Each function prints the nine outputs, then the nine accumulator lanes read through the closure
+// (which zeroes each lane it takes) or the pointer; `via_closure` then takes lane 0 again: 0.
+
+fn via_closure() {
+    let mut a: [u8; 12] = [0 as u8; 12];
+    let mut b: [i8; 12] = [0 as i8; 12];
+    let mut c: [i32; 9] = [0; 9];
+    let mut out: [f32; 9] = [0.0; 9];
+    let take = |k: i32| -> i32 {
+        let v = c[k];
+        c[k] = 0;
+        v
+    };
+    for i in 0..12 {
+        a[i] = (i + 1) as u8;
+        b[i] = ((i as i32) - 6) as i8;
+    }
+    let scale_a: f32 = 0.5;
+    let scale_b: [f32; 3] = [2.0, 1.0, 0.5];
+    let bias: [f32; 3] = [1.0, 2.0, 3.0];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s: i32 = 0;
+            for k in 0..4 {
+                s = s + (a[i * 4 + k] as i32) * (b[j * 4 + k] as i32);
+            }
+            c[i * 3 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i * 3 + j] = (c[i * 3 + j] as f32) * scale_a * scale_b[j] + bias[j];
+        }
+    }
+    for k in 0..9 {
+        print(out[k]);
+    }
+    for k in 0..9 {
+        print(take(k));
+    }
+    print(take(0));
+}
+
+fn via_pointer() {
+    let mut a: [u8; 12] = [0 as u8; 12];
+    let mut b: [i8; 12] = [0 as i8; 12];
+    let mut c: [i32; 9] = [0; 9];
+    let mut out: [f32; 9] = [0.0; 9];
+    let pc = &mut c;
+    for i in 0..12 {
+        a[i] = (i + 1) as u8;
+        b[i] = ((i as i32) - 6) as i8;
+    }
+    let scale_a: f32 = 0.5;
+    let scale_b: [f32; 3] = [2.0, 1.0, 0.5];
+    let bias: [f32; 3] = [1.0, 2.0, 3.0];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s: i32 = 0;
+            for k in 0..4 {
+                s = s + (a[i * 4 + k] as i32) * (b[j * 4 + k] as i32);
+            }
+            c[i * 3 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i * 3 + j] = (c[i * 3 + j] as f32) * scale_a * scale_b[j] + bias[j];
+        }
+    }
+    for k in 0..9 {
+        print(out[k]);
+    }
+    for k in 0..9 {
+        print((*pc)[k]);
+    }
+}
+
+fn main() -> i32 {
+    via_closure();
+    via_pointer();
+    return 0;
+}

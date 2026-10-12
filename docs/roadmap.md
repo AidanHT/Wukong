@@ -764,9 +764,12 @@ line table built from them is not emitted yet.
 - **int8 quantized `nn.Linear` → VNNI GEMM (+ fused dequant)**: a `u8`×`i8`→`i32` matmul nest in the
   `C = A·Bᵀ` spelling dispatches to `wukong_i8gemm_nt[_parallel]`, and when it is immediately followed
   by a per-channel dequant loop the two fold into one `wukong_i8gemm_nt_deq[_parallel]` call — the
-  scale applied in the GEMM's own writeback. Whole-function and statement forms both fire, and the
-  integer accumulate is exact mod 2^32, so interp == native bit-for-bit and `-O0` == `-O3`
-  (`tests/run/{i8_linear,i8_linear_dequant,i8_linear_parallel,dequant_perchan}.wk`). The
+  scale applied in the GEMM's own writeback. The fused form drops the i32 accumulator, so it fires
+  only when the accumulator is a local of the block that nothing names after the window and whose
+  address was never taken before it (a `let p = &mut c;` or a `let`-bound closure writing `c` keeps
+  the unfused GEMM, `tests/run/closure_i8_accumulator.wk`). Whole-function and statement forms both
+  fire, and the integer accumulate is exact mod 2^32, so interp == native bit-for-bit and `-O0` ==
+  `-O3` (`tests/run/{i8_linear,i8_linear_dequant,i8_linear_parallel,dequant_perchan}.wk`). The
   per-tensor/per-channel `absmax` that produces the symmetric quantization scale is the
   column-reduction family above.
 - **`@tile` strip-mining** on a half-open unit-step `for i in start..end`: `@tile(B)` on the function

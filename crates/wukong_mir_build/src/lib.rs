@@ -12562,8 +12562,12 @@ impl FnLowerer<'_> {
         // Soundness: the fused kernel never writes `c` (it dequants in registers), so `c`'s separate
         // materialization may be dropped only if `c` is provably dead afterward. Require `c` to be a
         // `let`-local declared earlier in *this* block (lexical scoping then forbids it escaping to an
-        // outer scope) and unmentioned in every statement after the dequant loop (and the block tail).
+        // outer scope), unmentioned in every statement after the dequant loop (and the block tail),
+        // and never address-taken before the window: a pointer taken there (`let p = &mut c;`, or a
+        // `let`-bound closure's by-reference capture `let $cap$L$j = &mut c;`) reads `c` later
+        // without naming it (`p[0]`, `peek(0)` lowered to `L($cap$L$j, 0)`).
         if !block_declares_local(&b.stmts[..i], nest.c)
+            || canon::stmts_take_address(&b.stmts[..i], nest.c)
             || block_mentions(&b.stmts[i + 2..], b.tail.as_deref(), nest.c)
         {
             return None;

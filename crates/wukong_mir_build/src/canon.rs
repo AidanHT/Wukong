@@ -1049,6 +1049,19 @@ fn subst_expr(e: &mut Expr, x: Symbol, init: &Expr) {
 
 // ---- the region fact scan ----------------------------------------------------------------------
 
+/// Does any of `stmts`, at any depth, take the address of `sym` (`&sym`, `&mut sym`, `&mut sym[i]`,
+/// `&sym.f`)? A pointer taken there can outlive its statement — `let p = &mut c;`, or the hidden
+/// `let $cap$L$j = &mut c;` of a `let`-bound closure that writes `c` (`closures.rs`) — so a later
+/// read through it reads `sym`'s storage without naming `sym`. A proof that `sym` is dead because
+/// nothing after a point mentions it (`block_mentions`) must also know this is false.
+pub(crate) fn stmts_take_address(stmts: &[Stmt], sym: Symbol) -> bool {
+    let mut f = RegionFacts::default();
+    for s in stmts {
+        scan_stmt(s, &mut f);
+    }
+    f.addressed.contains(&sym)
+}
+
 fn scan_block(b: &Block, f: &mut RegionFacts) {
     for s in &b.stmts {
         scan_stmt(s, f);

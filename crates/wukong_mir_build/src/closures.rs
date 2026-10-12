@@ -1077,6 +1077,45 @@ mod tests {
         );
     }
 
+    /// The int8 GEMM + dequant fusion never writes the i32 accumulator `c`, so it drops `c` only
+    /// when nothing after the window names `c`. A `let`-bound closure that writes `c` holds a
+    /// pointer to it from its `let` on (`let $cap$L$0 = &mut c;`), and a later call names only that
+    /// pointer: the fusion fired anyway, and every lane read back through the closure was 0. A raw
+    /// `let pc = &mut c;` had the same hole.
+    #[test]
+    fn the_int8_dequant_fusion_keeps_an_accumulator_a_pointer_holds() {
+        let src = |pre: &str, post: &str| {
+            format!(
+                "fn main() -> i32 {{ let mut a: [u8; 12] = [0 as u8; 12]; \
+                 let mut b: [i8; 12] = [0 as i8; 12]; let mut c: [i32; 9] = [0; 9]; \
+                 let mut out: [f32; 9] = [0.0; 9]; {pre} \
+                 for i in 0..12 {{ a[i] = (i + 1) as u8; b[i] = ((i as i32) - 6) as i8; }} \
+                 let scale_a: f32 = 0.5; let scale_b: [f32; 3] = [2.0, 1.0, 0.5]; \
+                 for i in 0..3 {{ for j in 0..3 {{ let mut s: i32 = 0; \
+                 for k in 0..4 {{ s = s + (a[i * 4 + k] as i32) * (b[j * 4 + k] as i32); }} \
+                 c[i * 3 + j] = s; }} }} \
+                 for i in 0..3 {{ for j in 0..3 {{ \
+                 out[i * 3 + j] = (c[i * 3 + j] as f32) * scale_a * scale_b[j]; }} }} \
+                 print(out[0]); {post} return 0; }}"
+            )
+        };
+        let fused = |pre: &str, post: &str| {
+            body(&lower(&src(pre, post)), "main").contains("wukong_i8gemm_nt_deq")
+        };
+        // The control: nothing holds `c`, so the window fuses.
+        assert!(fused("", ""));
+        assert!(!fused(
+            "let peek = |k: i32| -> i32 { c[k] = c[k] + 0; c[k] };",
+            "print(peek(0));"
+        ));
+        assert!(!fused("let pc = &mut c;", "print((*pc)[0]);"));
+        // A closure that only reads `c` copied it at its `let`: nothing holds `c` itself.
+        assert!(fused(
+            "let first = |k: i32| -> i32 { c[k] };",
+            "print(first(0));"
+        ));
+    }
+
     /// A closure body is code of the function it is written in, and lowering keys `@strict_fp`,
     /// `@generic` and `@unchecked` by item: the lifted item carries them, and nothing else.
     #[test]
