@@ -1,0 +1,24 @@
+// EXPECT-CODE: E0423
+// EXPECT-COUNT: 1
+module tests.fail.or_pattern_unbound
+
+// An or-pattern's arm reads each name from whichever alternative matched, so every alternative
+// must bind the same names. `Shape::Empty` binds no `r`: for an empty shape the arm would read a
+// name that was never bound. Bind it in every alternative, or give `Shape::Empty` its own arm.
+enum Shape {
+    Circle(i32),
+    Square(i32),
+    Empty,
+}
+
+fn size(s: Shape) -> i32 {
+    return match s {
+        Shape::Circle(r) | Shape::Empty => r, //~ E0423
+        Shape::Square(w) => w,
+    };
+}
+
+fn main() -> i32 {
+    print(size(Shape::Square(3)));
+    return 0;
+}

@@ -1,0 +1,147 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 10
+// EXPECT-OUT: -1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 203
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+// EXPECT-OUT: 34
+// EXPECT-OUT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 99
+// EXPECT-OUT: 99
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+module tests.run.or_pattern_bindings
+
+// Names bound inside an or-pattern. Every alternative binds the same names at the same types
+// (E0423, E0424), and the arm reads each name from whichever alternative matched — the FIRST that
+// matches, left to right, as in Rust. An aggregate name binds in place, like any aggregate binding.
+
+enum Shape {
+    Circle(i32),
+    Square(i32),
+    Rect(i32, i32),
+    Empty,
+}
+
+struct P {
+    x: i32,
+    y: i32,
+}
+
+enum Wrap {
+    A(P),
+    B(P),
+    C,
+}
+
+enum Reading {
+    Raw(f32, i32),
+    Scaled(i32, f32),
+}
+
+fn size(s: Shape) -> i32 {
+    return match s {
+        Shape::Circle(r) | Shape::Square(r) => r * 10,
+        Shape::Rect(w, h) => w * h,
+        Shape::Empty => -1,
+    };
+}
+
+// Both alternatives match `(0, 0)`, and `(5, 1)` matches the first as `v = 5` and the second as
+// `v = 1`: the first alternative decides.
+fn pick(t: (i32, i32)) -> i32 {
+    return match t {
+        (0, v) | (v, 0) => v,
+        (v, 1) | (_, v) if v > 4 => v,
+        (a, b) => a * 100 + b,
+    };
+}
+
+// An aggregate binding: the payload struct, by address.
+fn wsum(w: Wrap) -> i32 {
+    return match w {
+        Wrap::A(p) | Wrap::B(p) => p.x * 10 + p.y,
+        Wrap::C => 0,
+    };
+}
+
+// An or-pattern nested in a tuple, under a guard that reads its binding.
+fn nested(x: (Shape, i32)) -> i32 {
+    return match x {
+        (Shape::Circle(r) | Shape::Rect(r, _), k) if k > 0 => r + k,
+        _ => 99,
+    };
+}
+
+// Alternatives over a slice, of different lengths.
+fn ends(s: []i32) -> i32 {
+    return match s {
+        [9, a, ..] | [.., a] => a,
+        [] => 0,
+    };
+}
+
+// Two names, bound at the payload positions each variant keeps them in.
+fn reading(r: Reading) -> f32 {
+    return match r {
+        Reading::Raw(v, n) | Reading::Scaled(n, v) => v * (n as f32),
+    };
+}
+
+fn main() -> i32 {
+    println(size(Shape::Circle(3)));
+    println(size(Shape::Square(4)));
+    println(size(Shape::Rect(2, 5)));
+    println(size(Shape::Empty));
+    println(pick((0, 7)));
+    println(pick((8, 0)));
+    println(pick((0, 0)));
+    println(pick((2, 3)));
+    println(pick((5, 1)));
+    println(pick((3, 9)));
+    println(wsum(Wrap::A(P { x: 1, y: 2 })));
+    println(wsum(Wrap::B(P { x: 3, y: 4 })));
+    println(wsum(Wrap::C));
+    println(nested((Shape::Circle(5), 1)));
+    println(nested((Shape::Rect(6, 1), 2)));
+    println(nested((Shape::Square(6), 2)));
+    println(nested((Shape::Circle(5), 0)));
+    let a: [i32; 3] = [1, 2, 3];
+    let b: [i32; 3] = [9, 5, 7];
+    let e: [i32; 0] = [];
+    println(ends(a));
+    println(ends(b));
+    println(ends(e));
+    println(reading(Reading::Raw(1.25, 2)));
+    println(reading(Reading::Scaled(3, 1.5)));
+
+    // `if let` and `let` take or-patterns with bindings too.
+    let t: (i32, i32) = (70, 0);
+    if let (v, 0) | (0, v) = t {
+        println(v);
+    }
+    let (w, _) | (_, w) = (80, 1);
+    println(w);
+    let mut k: i32 = 0;
+    while let 0 | 1 = k {
+        k = k + 1;
+        println(k);
+    }
+    return 0;
+}

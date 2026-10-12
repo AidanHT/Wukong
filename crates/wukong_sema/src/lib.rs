@@ -3553,13 +3553,9 @@ impl<'a> Sema<'a> {
                     }
                 }
             }
-            // An or-pattern's alternatives are typically binding-free literals/variants; bind each
-            // against the same scrutinee type so any shared identifier resolves.
-            PatKind::Or(alts) => {
-                for a in alts {
-                    self.bind_pattern(a, ty);
-                }
-            }
+            // Every alternative of an or-pattern binds the same names at the same types
+            // (`patterns.rs`).
+            PatKind::Or(alts) => self.check_or_pattern(alts, ty),
             PatKind::Wildcard | PatKind::Unit => {}
             // A data-carrying enum-variant pattern: validate the variant + payload shape and bind the
             // inner fields to their declared types (so an arm body sees `x`/`y` typed).

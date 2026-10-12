@@ -262,7 +262,11 @@ tests at `data[i]` and `data[len - suffix + j]`; `rest @ ..` binds a fresh fat p
 `{ data + prefix, len - listed }` on a slice and the address of element `prefix`, typed
 `[T; N - listed]`, on an array. The usefulness analysis gives a slice column one constructor per
 length below `L` and one variable-length constructor for every length `>= L` (rustc's split, `L`
-past every length a row pins down). Sema's pattern-usefulness analysis
+past every length a row pins down). A name bound inside an or-pattern (`mir_build::or_pat`) is bound
+after the arm's test like any other, so some alternative is known to match: the alternatives before
+the last are re-tested in order (a test only loads and compares), each binds its names in a scope of
+its own and branches to a join block with each name's value — a scalar's value, an aggregate's
+address — as block parameters, and the join binds each name once. Sema's pattern-usefulness analysis
 (`wukong_sema::usefulness`) decides E0405 and W0020, and it also publishes a positive verdict,
 `SemaResult::exhaustive_matches`: the `Match` ids it proved exhaustive over a concrete scrutinee type
 whose all-zero value it models (`zero_value_modeled` — mir_build zero-fills `let e: E;`, so an enum

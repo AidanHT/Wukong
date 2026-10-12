@@ -343,9 +343,9 @@ every place its pattern names — `data[1]` for `[a, b]` on a slice, through the
 empty one for `[x, ..]` — so calling it before the arm's test (as `lower_match` did until slice
 patterns existed, harmlessly while every place was in bounds whatever the value) reads past a
 slice's end on the interpreter and faults natively. `emit_match_arm_test` binds on the test's
-success edge and leaves the builder where the body starts; a pattern test that needs a place to
-exist (a slice's elements) must likewise test in a block only the guarding test reaches, not AND an
-eager load into it.
+success edge and leaves the builder where the body starts, which binding itself may have moved (an
+or-pattern's alternatives branch); a pattern test that needs a place to exist (a slice's elements)
+must likewise test in a block only the guarding test reaches, not AND an eager load into it.
 
 **A new `ExprKind` variant is a sweep the compiler drives.** Every expression walker of the front
 end is an exhaustive `match` (28 of them when closures landed, across `wukong_ast`, the driver's

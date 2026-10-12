@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0424
+// EXPECT-COUNT: 1
+module tests.fail.or_pattern_type_mismatch
+
+// Every alternative of an or-pattern binds its names at one type: the arm reads a single `v`,
+// whichever alternative matched. Here `v` is an `i32` in `Num::Int` and an `f32` in `Num::Real`.
+// Match the two in separate arms and convert there (`Num::Int(v) => v as f32`).
+enum Num {
+    Int(i32),
+    Real(f32),
+}
+
+fn val(n: Num) -> f32 {
+    return match n {
+        Num::Int(v) | Num::Real(v) => v, //~ E0424
+    };
+}
+
+fn main() -> i32 {
+    print(val(Num::Real(2.5)));
+    return 0;
+}

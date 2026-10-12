@@ -23,7 +23,7 @@ use wukong_ast::{
     StmtKind, VariantPat,
 };
 use wukong_diag::Diagnostic;
-use wukong_span::Span;
+use wukong_span::{Span, Symbol};
 use wukong_types::Ty;
 
 use crate::{
@@ -151,6 +151,109 @@ impl Sema<'_> {
         }
         for p in suffix {
             self.bind_pattern(p, &elem);
+        }
+    }
+
+    /// Type-check and bind an or-pattern `A | B | ..` against `ty`. Each alternative is bound in a
+    /// scope of its own, and every alternative must bind the same names (`E0423`) with the same
+    /// types (`E0424`): whichever alternative matches, the arm body reads one binding of each
+    /// name. The names are then bound once, at the first alternative's types.
+    pub(crate) fn check_or_pattern(&mut self, alts: &[Pattern], ty: &Ty) {
+        let mut bound: Vec<Vec<(Symbol, Span, Ty)>> = Vec::with_capacity(alts.len());
+        for a in alts {
+            self.push_scope();
+            self.bind_pattern(a, ty);
+            let mut names = Vec::new();
+            binding_names(a, &mut names);
+            let scope = self.scopes.last();
+            let typed = names
+                .into_iter()
+                .map(|(n, sp)| {
+                    let t = scope
+                        .and_then(|s| s.get(&n))
+                        .cloned()
+                        .unwrap_or(Ty::Unknown);
+                    (n, sp, t)
+                })
+                .collect();
+            self.pop_scope();
+            bound.push(typed);
+        }
+        // Report each name once, against the first alternative that binds it. A name bound at two
+        // types is then bound as `Error`, so its uses do not cascade into mismatches of their own.
+        let mut reported: Vec<Symbol> = Vec::new();
+        let mut clashed: Vec<Symbol> = Vec::new();
+        for (i, names) in bound.iter().enumerate() {
+            for (n, sp, t) in names {
+                if reported.contains(n) {
+                    continue;
+                }
+                let nm = self.sym_str(*n).to_string();
+                if let Some(j) = bound.iter().position(|o| !o.iter().any(|(m, ..)| m == n)) {
+                    reported.push(*n);
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "variable `{nm}` is not bound in all alternatives of this or-pattern"
+                        ))
+                        .with_code("E0423")
+                        .primary(
+                            alts[j].span,
+                            format!("this alternative does not bind `{nm}`"),
+                        )
+                        .secondary(*sp, format!("`{nm}` is bound here"))
+                        .help(format!(
+                            "whichever alternative matches, the arm reads one `{nm}`, so every \
+                             alternative must bind it; bind it in each, or match the \
+                             alternatives in separate arms"
+                        )),
+                    );
+                    continue;
+                }
+                let clash = bound[i + 1..].iter().find_map(|o| {
+                    o.iter().find(|(m, _, u)| {
+                        m == n && !t.is_unknown() && !u.is_unknown() && !same_ty(t, u)
+                    })
+                });
+                if let Some((_, osp, ot)) = clash {
+                    reported.push(*n);
+                    clashed.push(*n);
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "variable `{nm}` has type `{}` in one alternative of this or-pattern \
+                             and `{}` in another",
+                            t.display(self.interner),
+                            ot.display(self.interner)
+                        ))
+                        .with_code("E0424")
+                        .primary(
+                            *osp,
+                            format!("`{nm}` is `{}` here", ot.display(self.interner)),
+                        )
+                        .secondary(
+                            *sp,
+                            format!("`{nm}` is `{}` here", t.display(self.interner)),
+                        )
+                        .help(
+                            "the arm reads one binding of each name, so every alternative must \
+                             bind it at the same type; match the alternatives in separate arms",
+                        ),
+                    );
+                }
+            }
+        }
+        let mut done: Vec<Symbol> = Vec::new();
+        for names in &bound {
+            for (n, _, t) in names {
+                if !done.contains(n) {
+                    done.push(*n);
+                    let t = if clashed.contains(n) {
+                        Ty::Error
+                    } else {
+                        t.clone()
+                    };
+                    self.bind(*n, t);
+                }
+            }
         }
     }
 
@@ -439,6 +542,58 @@ impl PatSite {
     }
 }
 
+/// The names `p` binds, each once, in source order, with the span of the binding (an or-pattern
+/// nested inside contributes its first alternative's, which [`Sema::check_or_pattern`] checks
+/// against the others).
+fn binding_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
+    fn push(n: Symbol, sp: Span, out: &mut Vec<(Symbol, Span)>) {
+        if !out.iter().any(|(m, _)| *m == n) {
+            out.push((n, sp));
+        }
+    }
+    match &p.kind {
+        PatKind::Ident(n) => push(*n, p.span, out),
+        PatKind::Binding { name, sub } => {
+            push(*name, p.span, out);
+            binding_names(sub, out);
+        }
+        PatKind::Tuple(subs) => subs.iter().for_each(|s| binding_names(s, out)),
+        PatKind::Or(alts) => {
+            if let Some(a) = alts.first() {
+                binding_names(a, out);
+            }
+        }
+        PatKind::Variant { fields, .. } => match fields {
+            VariantPat::Tuple(subs) => subs.iter().for_each(|s| binding_names(s, out)),
+            VariantPat::Struct(fps) => fps.iter().for_each(|fp| binding_names(&fp.pat, out)),
+        },
+        PatKind::Struct { fields, .. } => fields.iter().for_each(|fp| binding_names(&fp.pat, out)),
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
+            .iter()
+            .chain(rest_binding.as_deref())
+            .chain(suffix)
+            .for_each(|s| binding_names(s, out)),
+        PatKind::Wildcard
+        | PatKind::Unit
+        | PatKind::Int { .. }
+        | PatKind::Char(_)
+        | PatKind::Bool(_)
+        | PatKind::Path(_)
+        | PatKind::Range { .. } => {}
+    }
+}
+
+/// Whether two alternatives' bindings have one type. A literal-typed binding (`Unknown` until
+/// inference) never clashes; nor does anything sema reported already (`Error`).
+fn same_ty(a: &Ty, b: &Ty) -> bool {
+    a == b || matches!(a, Ty::Error) || matches!(b, Ty::Error)
+}
+
 /// The payload of the variant `Enum::Variant` names, when it resolves.
 fn variant_payload(path: &Path, defs: &DefMap) -> Option<VariantPayload> {
     let (Some(ename), Some(vname)) = (path.segments.first(), path.segments.last()) else {
@@ -670,6 +825,32 @@ mod tests {
             "fn f(ss: [[]i32; 2]) -> i64 { let mut t: i64 = 0; for [all @ ..] in ss {              t = t + all.len(); } return t; }",
         );
         assert_clean("fn f(s: []i32) -> i64 { let [..] = s; let [r @ ..] = s; return r.len(); }");
+    }
+
+    /// Every alternative of an or-pattern binds the same names (E0423) at the same types (E0424).
+    #[test]
+    fn or_pattern_bindings() {
+        assert_clean(&format!(
+            "{SHAPE}fn f(s: Shape) -> i32 {{ return match s {{ Shape::Circle(r) |              Shape::Square(r) => r }}; }}"
+        ));
+        assert_clean(
+            "fn f(t: (i32, i32)) -> i32 { return match t { (0, v) | (v, 0) => v, (a, b) => a + b              }; }",
+        );
+        assert_clean("fn f(s: []i32) -> i32 { return match s { [x] | [x, _] => x, _ => 0 }; }");
+        let d = check(
+            "enum E { A(i32), B } fn f(e: E) -> i32 { return match e { E::A(x) | E::B => x }; }",
+        );
+        assert!(
+            d.iter()
+                .any(|d| d.code == Some("E0423") && d.message.contains("`x` is not bound")),
+            "{d:?}"
+        );
+        // A name bound at two types is reported once, and its use does not cascade.
+        let d = check(
+            "enum N { I(i32), R(f32) } fn f(n: N) -> f32 { return match n { N::I(v) | N::R(v) =>              v }; }",
+        );
+        let codes: Vec<_> = d.iter().filter_map(|d| d.code).collect();
+        assert_eq!(codes, ["E0424"], "{d:?}");
     }
 
     #[test]

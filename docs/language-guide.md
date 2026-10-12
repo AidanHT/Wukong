@@ -724,6 +724,15 @@ its struct and a data-carrying variant pattern (`Shape::Circle(r)`) its enum, an
 must be of that type — `E0401` otherwise, in a `match`, a `let` and a `for` head alike
 (`tests/fail/for_head_variant_mismatch.wk`).
 
+An **or-pattern may bind names** (✅) when every alternative binds the same ones at the same types:
+`Shape::Circle(r) | Shape::Square(r) => r * 10`, `(0, v) | (v, 0) => v`, `[x] | [x, _] => x`. The arm
+reads each name from the **first** alternative that matches, left to right (`(v, 1) | (_, v)`
+against `(5, 1)` binds `v = 5`), and an aggregate name binds in place like any other. A name one
+alternative leaves out is `E0423`, and a name bound at two types (`Num::Int(v) | Num::Real(v)` over
+`i32` and `f32` payloads) is `E0424`; split such alternatives into arms of their own
+(`tests/run/or_pattern_bindings.wk`, `tests/fail/or_pattern_unbound.wk`,
+`tests/fail/or_pattern_type_mismatch.wk`).
+
 **`if let`, `while let` and `let … else`** (✅) are what they are in Rust, and the parser rewrites
 each into a `match`:
 
@@ -749,8 +758,7 @@ exit — because the names its pattern binds do not exist on that path (`E0401` 
 `let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
 for every other shape, so it is `E0442`, with a witness naming a value it misses
 (`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
-`tests/fail/let_else_not_diverging.wk`). Not yet: a binding inside an or-pattern (`C0001` at the
-pattern), and more than one `let` in an `if let` chain.
+`tests/fail/let_else_not_diverging.wk`). Not yet: more than one `let` in an `if let` chain.
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to

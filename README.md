@@ -329,7 +329,8 @@ Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `->
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
 (`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`
 that a nested `break 'outer` / `continue 'outer` can target) execute end-to-end on both backends — as do
-**`match`** (literal / range / or / enum-variant / tuple / struct / `name @ sub` / array patterns —
+**`match`** (literal / range / or (binding the same names in each alternative) / enum-variant /
+tuple / struct / `name @ sub` / array patterns —
 on `[T; N]` arrays and, as a run-time length test, on `[]T` slices, with `rest @ ..` sub-array and
 sub-slice bindings — with guards, and exhaustiveness decided by pattern usefulness with a witness — a proven-exhaustive
 match takes its last arm untested, so an exhaustive `bool` match is one branch), **`if let`** and

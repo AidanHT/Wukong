@@ -705,6 +705,28 @@ fn main() -> i32 {
         good: "module ex.e0420\nfn first(x: str) -> str {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n"
     ),
     entry!(
+        "E0423",
+        "or-pattern alternatives bind different names",
+        "An or-pattern `A | B` matches when any alternative does, and its arm then reads the names \
+         the pattern binds from whichever alternative matched. So every alternative must bind \
+         exactly the same names: `Shape::Circle(r) | Shape::Square(r)` is fine, but \
+         `Shape::Circle(r) | Shape::Empty` leaves `r` unbound when the value is `Shape::Empty`. \
+         Bind the name in every alternative, or split the alternatives into arms of their own.",
+        bad: "module ex.e0423\nenum Shape { Circle(i32), Square(i32), Empty }\nfn size(s: Shape) -> i32 {\n    return match s {\n        Shape::Circle(r) | Shape::Empty => r,\n        Shape::Square(w) => w,\n    };\n}\nfn main() -> i32 {\n    return size(Shape::Square(3));\n}\n",
+        good: "module ex.e0423\nenum Shape { Circle(i32), Square(i32), Empty }\nfn size(s: Shape) -> i32 {\n    return match s {\n        Shape::Circle(r) | Shape::Square(r) => r,\n        Shape::Empty => 0,\n    };\n}\nfn main() -> i32 {\n    return size(Shape::Square(3));\n}\n"
+    ),
+    entry!(
+        "E0424",
+        "or-pattern binds a name at different types",
+        "Every alternative of an or-pattern binds the same names, and each name must have one \
+         type across them: the arm reads a single binding, whichever alternative matched. \
+         `Num::Int(v) | Num::Real(v)` with `Int(i32)` and `Real(f32)` binds `v` as an `i32` in \
+         one alternative and an `f32` in the other. Match the alternatives in separate arms and \
+         convert there (`Num::Int(v) => v as f32`).",
+        bad: "module ex.e0424\nenum Num { Int(i32), Real(f32) }\nfn val(n: Num) -> f32 {\n    return match n {\n        Num::Int(v) | Num::Real(v) => v,\n    };\n}\nfn main() -> i32 {\n    return val(Num::Int(2)) as i32;\n}\n",
+        good: "module ex.e0424\nenum Num { Int(i32), Real(f32) }\nfn val(n: Num) -> f32 {\n    return match n {\n        Num::Int(v) => v as f32,\n        Num::Real(v) => v,\n    };\n}\nfn main() -> i32 {\n    return val(Num::Int(2)) as i32;\n}\n"
+    ),
+    entry!(
         "E0430",
         "struct literal field error",
         "A struct literal (and a struct-payload enum variant, `E::V { .. }`) initializes every field \

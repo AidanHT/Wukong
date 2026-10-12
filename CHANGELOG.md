@@ -23,6 +23,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   place, its length part of its type (passing it where another length is expected is `E0501`). In a
   `match` that place is the scrutinee's, as for every aggregate a pattern binds; a `let` copies its
   initializer into its own slot first, so `let [_, tail @ ..] = v;` does not see a later `v[1] = …`.
+- **Bindings inside or-patterns (N26).** `Shape::Circle(r) | Shape::Square(r) => r`,
+  `(0, v) | (v, 0) => v` and `[x] | [x, _] => x` now compile; a binding inside an or-pattern was
+  `C0001` at the pattern. Every alternative must bind the same names (`E0423`) at the same types
+  (`E0424`); the arm reads each name from the first alternative that matches, left to right, as in
+  Rust. The lowering re-tests the alternatives in order after the arm's test passed and joins each
+  name through a block parameter (`tests/run/or_pattern_bindings.wk`,
+  `tests/fail/or_pattern_unbound.wk`, `tests/fail/or_pattern_type_mismatch.wk`). Or-patterns also
+  bind in `if let`, `while let` and an irrefutable `let`.
 - **A match binds an arm's names only after the arm's test passed.** The names used to be bound
   before the test, harmlessly while every place a pattern names was in bounds whatever the value; on
   a slice, `[a, b]` against a one-element slice would load past its end and `[x, ..]` against an

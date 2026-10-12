@@ -47,6 +47,8 @@ mod match_tests;
 mod methods;
 mod minmax;
 mod noalias;
+// Names bound inside an or-pattern (see the module docs).
+mod or_pat;
 mod par_grain;
 #[cfg(test)]
 mod repr_tests;
@@ -10446,6 +10448,7 @@ impl FnLowerer<'_> {
                     ast::PatKind::Struct { .. }
                     | ast::PatKind::Binding { .. }
                     | ast::PatKind::Slice { .. }
+                    | ast::PatKind::Or(_)
                     | ast::PatKind::Variant { .. }
                         if match &pat.kind {
                             ast::PatKind::Variant { path, .. } => self
@@ -21725,15 +21728,10 @@ impl FnLowerer<'_> {
         scrut_ty: &Ty,
     ) {
         match &pat.kind {
-            // A name bound inside an or-pattern would need one binding fed by whichever
-            // alternative matched; nothing lowers that yet. Refuse it at the pattern, and bind one
-            // alternative's names so the arm body does not cascade into a second error at each
-            // use (the program is rejected either way).
+            // A name bound inside an or-pattern: one binding, fed by whichever alternative
+            // matched (`or_pat.rs`).
             ast::PatKind::Or(alts) if alts.iter().any(pattern_has_binding) => {
-                self.unsupported(pat.span, "a binding inside an or-pattern");
-                if let Some(alt) = alts.iter().find(|a| pattern_has_binding(a)) {
-                    self.bind_match_ident(alt, scrut, scrut_mir, scrut_ty);
-                }
+                self.bind_or_pattern(alts, (scrut, scrut_mir, scrut_ty), pat.span);
             }
             ast::PatKind::Ident(name) => {
                 let is_slice = matches!(scrut_ty, Ty::Slice(_));
@@ -21921,8 +21919,8 @@ impl FnLowerer<'_> {
     /// matches the scrutinee `(value, MIR type, sema type)` and its guard, if any, holds; to
     /// `next_bb` otherwise. The pattern's names are bound in the scope the caller pushed, on the
     /// success edge of the test, so the guard and the body may read them. The builder is left
-    /// where the body starts — without a guard that is after the bindings, so the body must not
-    /// re-enter `body_bb` itself.
+    /// where the body starts — without a guard that is after the bindings, which may have
+    /// branched (an or-pattern's, `or_pat.rs`), so the body must not re-enter `body_bb` itself.
     ///
     /// Binding only after the test is what makes an array pattern over a `[]T` safe: `[a, b]`
     /// against a one-element slice must not load `data[1]`, and `[x, ..]` against an empty one

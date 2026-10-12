@@ -359,6 +359,7 @@ opt4_promote_slice.wk:
 opt4_tile_edge_guard.wk: veckernel*3
 opt5_fuse_multiblock.wk: veckernel*6
 opt5_unswitch_guarded_call.wk: wukong_rt_alloc wukong_rt_alloc*4 wukong_rt_free wukong_rt_free*4
+or_pattern_bindings.wk:
 parallel_absmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_abssum.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_argmax.wk: wukong_argreduce_f32_parallel wukong_argreduce_f32_parallel*2

@@ -95,8 +95,9 @@ pub enum PatKind {
     Char(Symbol),
     /// A boolean literal pattern (`true` / `false`).
     Bool(bool),
-    /// An or-pattern `A | B | C` — matches if any alternative matches. Alternatives are typically
-    /// literals / enum variants (binding-free); a binding inside one is not recommended.
+    /// An or-pattern `A | B | C` — matches if any alternative matches. Every alternative binds the
+    /// same names at the same types (sema's `E0423` / `E0424`); the names take their values from
+    /// the first alternative that matches.
     Or(Vec<Pattern>),
     /// A path pattern — an enum variant such as `Color::Red`, matched by its integer discriminant.
     Path(Path),
