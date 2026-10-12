@@ -1,0 +1,17 @@
+// EXPECT-CODE: C0001
+// EXPECT-COUNT: 2
+module tests.fail.extern_i128
+
+// An `extern "C"` signature cannot carry a 128-bit integer: C has no standard one, and the
+// compilers that offer `__int128` disagree on passing it (a register pair under System V, by
+// reference under the Windows ABI), so no call the native backend could emit is right for every C
+// definition. The declaration is refused (C0001) for a parameter and for a result alike; pass the
+// value by pointer (`*i128`) instead.
+extern "C" {
+    fn wide_add(a: i128, b: i64) -> i64; //~ C0001
+    fn wide_make(x: i64) -> u128; //~ C0001
+}
+
+fn main() -> i32 {
+    return 0;
+}

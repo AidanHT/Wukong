@@ -2835,7 +2835,8 @@ fn parallel_spec<'a>(
     }
     let start_ty = MirType::from_scalar(*start_scalar);
     let end_ty = MirType::from_scalar(*end_scalar);
-    if mir_byte_size(&start_ty) > mir_byte_size(&end_ty) {
+    // A 128-bit counter is never chunked: the runtime's iteration space is 64-bit.
+    if mir_byte_size(&start_ty) > mir_byte_size(&end_ty) || mir_byte_size(&end_ty) > 8 {
         return None;
     }
     let unsigned_counter =
@@ -4832,15 +4833,21 @@ impl FnLowerer<'_> {
                     BitXor => l ^ r,
                     // Runtime shifts mask their count. Prove only in-range counts, and reject
                     // a left shift that loses bits rather than accidentally proving zero.
-                    Shl if r < sc.size() * 8 => l.checked_mul(1u64 << r)?,
-                    Shr if r < sc.size() * 8 => l >> r,
+                    // (A 128-bit type's count can pass 63, which no `u64` factor represents.)
+                    Shl if r < sc.size() * 8 => {
+                        l.checked_mul(1u64.checked_shl(u32::try_from(r).ok()?)?)?
+                    }
+                    Shr if r < sc.size() * 8 => l.checked_shr(u32::try_from(r).ok()?).unwrap_or(0),
                     _ => return None,
                 }
             }
             _ => return None,
         };
         let bits = sc.size() * 8;
-        let max = if sc.is_signed() {
+        let max = if bits > 64 {
+            // Every `u64` is an `i128` and a `u128`.
+            u64::MAX
+        } else if sc.is_signed() {
             (1u64 << (bits - 1)) - 1
         } else {
             u64::MAX >> (64 - bits)
@@ -6079,6 +6086,10 @@ impl FnLowerer<'_> {
     /// (`mir_byte_size < 8`) have always been accepted without a value proof.
     fn kernel_range_supported(&self, start: &Expr, end: &Expr) -> bool {
         let (ity, signed) = self.range_counter_type(start, end);
+        // A 128-bit counter has no kernel or vector form (no ISA has 128-bit integer lanes).
+        if mir_byte_size(&ity) > 8 {
+            return false;
+        }
         // Sema assigns the iterator the start's signedness. A signed-start/unsigned-end
         // comparison can reach the counter's high half, but scalar source index expressions
         // still interpret those bits as signed. A positive-offset kernel is equivalent only
@@ -9556,7 +9567,9 @@ impl FnLowerer<'_> {
             match me.expr_ty(expr) {
                 Ty::Scalar(scalar) if scalar.is_int() => {
                     let bits = scalar.size() * 8;
-                    let max = if scalar.is_signed() {
+                    let max = if bits > 64 {
+                        u64::MAX
+                    } else if scalar.is_signed() {
                         (1u64 << (bits - 1)) - 1
                     } else {
                         u64::MAX >> (64 - bits)
@@ -10590,8 +10603,14 @@ impl FnLowerer<'_> {
                 let (ptr, elem) = self.lower_place(target);
                 // Coerce the value to the place's type before storing, so a narrowing store (e.g.
                 // an `f32` value into a `[bf16; N]` slot) carries the element type — the backends
-                // then store the right width and round to bf16. A no-op when the types match.
-                let rhs = self.coerce_to(rhs0, &rhs_ty, &elem, self.signed(value));
+                // then store the right width and round to bf16. A no-op when the types match. A
+                // `<<=`/`>>=` count is the one operand sema lets be WIDER than the place: it is
+                // taken modulo the width, so it narrows by its low bits (`coerce_count`).
+                let rhs = if matches!(op, ast::AssignOp::Shl | ast::AssignOp::Shr) {
+                    self.coerce_count(rhs0, &rhs_ty, &elem, self.signed(value))
+                } else {
+                    self.coerce_to(rhs0, &rhs_ty, &elem, self.signed(value))
+                };
                 let store_val = match op {
                     ast::AssignOp::Assign => rhs,
                     _ => {
@@ -15087,7 +15106,11 @@ impl FnLowerer<'_> {
         if as_int_lit(start, self.interner) != Some(0) {
             return Err("the range does not start at literal 0");
         }
-        let max = (1i128 << (mir_byte_size(ity) * 8 - 1)) - 1;
+        // The runtime's iteration space is 64-bit (`parallel_spec` declines the same counter).
+        if mir_byte_size(ity) > 8 {
+            return Err("a 128-bit counter");
+        }
+        let max = i128::MAX >> (128 - mir_byte_size(ity) * 8);
         let constant = as_int_lit(end, self.interner)
             .map(|n| n as i128)
             .or_else(|| self.const_runtime_u64_expr(end).map(i128::from));
@@ -18241,6 +18264,12 @@ impl FnLowerer<'_> {
         if !ity.is_int() || !self.expr_mir(start).is_int() || !self.expr_mir(end).is_int() {
             return false;
         }
+        // A 128-bit counter has no vector form (no ISA has 128-bit integer lanes, and the strips'
+        // saturated limits are computed at the counter width): it stays the scalar loop, exactly
+        // as `kernel_range_supported` keeps it off every kernel.
+        if mir_byte_size(&ity) > 8 {
+            return false;
+        }
         // The five arms below are kernel *recognizers* that happen to be probed from here (they all
         // beat the generic vectorizer on width or store path), so they answer to the recognition
         // switch exactly like the `lower_for` cascade: with recognition off, an elementwise loop is
@@ -19717,7 +19746,7 @@ impl FnLowerer<'_> {
         let span = (unroll * w) as i128;
         // Saturate end-(span-1) at the signed minimum. If subtraction would underflow,
         // even the smallest counter leaves fewer than span elements, so no vector fits.
-        let min = -(1i128 << (mir_byte_size(ity) * 8 - 1));
+        let min = i128::MIN >> (128 - mir_byte_size(ity) * 8);
         let off = self
             .builder
             .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
@@ -20278,7 +20307,7 @@ impl FnLowerer<'_> {
         let span = (unroll * w) as i128;
         // Saturate end-(span-1) at the signed minimum. If subtraction would underflow,
         // even the smallest counter leaves fewer than span elements, so no vector fits.
-        let min = -(1i128 << (mir_byte_size(ity) * 8 - 1));
+        let min = i128::MIN >> (128 - mir_byte_size(ity) * 8);
         let off = self
             .builder
             .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
@@ -21570,6 +21599,9 @@ impl FnLowerer<'_> {
         if ty == MirType::I64 {
             return v;
         }
+        if ty == MirType::I128 {
+            return self.saturate_i128_to_i64(v, self.signed(e));
+        }
         let kind = if self.signed(e) {
             CastKind::SExt
         } else {
@@ -21577,6 +21609,45 @@ impl FnLowerer<'_> {
         };
         self.builder
             .build(MirType::I64, Op::Cast(kind, v, MirType::I64))
+    }
+
+    /// A 128-bit index `v` as the `i64` an address is computed from, clamped to `i64`'s range rather
+    /// than truncated: truncation would turn `2^64 + 1` into the in-bounds `1`, while a clamped
+    /// index stays out of bounds for every array and slice (no extent reaches `i64::MAX`), so a
+    /// bounds check still sees it fail. `signed` reads `v` as an `i128`, else as a `u128`.
+    fn saturate_i128_to_i64(&mut self, v: ValueId, signed: bool) -> ValueId {
+        let wide = MirType::I128;
+        let hi = self.builder.build(
+            wide.clone(),
+            Op::ConstInt(i128::from(i64::MAX), wide.clone()),
+        );
+        let gt = if signed { CmpOp::Sgt } else { CmpOp::Ugt };
+        let over = self.builder.build(MirType::I1, Op::Cmp(gt, v, hi));
+        let mut c = self.builder.build(wide.clone(), Op::Select(over, hi, v));
+        if signed {
+            let lo = self.builder.build(
+                wide.clone(),
+                Op::ConstInt(i128::from(i64::MIN), wide.clone()),
+            );
+            let under = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Slt, c, lo));
+            c = self.builder.build(wide.clone(), Op::Select(under, lo, c));
+        }
+        self.builder
+            .build(MirType::I64, Op::Cast(CastKind::Trunc, c, MirType::I64))
+    }
+
+    /// A shift or rotate COUNT `v` of type `from`, converted to the shifted value's type `to`. The
+    /// count is taken modulo `to`'s width, which only its low bits decide, so a 128-bit count
+    /// narrows by truncation — never by [`Self::coerce_to`]'s clamp of a 128-bit index or extent
+    /// into `i64`'s range, which turned `x_i64 <<= 2^64 + 3` into a shift by 63 instead of 3 (and
+    /// disagreed with a 32-bit place, which already truncated). Any other pair is `coerce_to`'s.
+    fn coerce_count(&mut self, v: ValueId, from: &MirType, to: &MirType, signed: bool) -> ValueId {
+        if *from == MirType::I128 && to.is_int() && *to != MirType::I128 {
+            return self
+                .builder
+                .build(to.clone(), Op::Cast(CastKind::Trunc, v, to.clone()));
+        }
+        self.coerce_to(v, from, to, signed)
     }
 
     /// Lower a multi-dimensional tensor index `base[i0, i1, …]` to a single `Gep` at the row-major
@@ -22417,7 +22488,7 @@ impl FnLowerer<'_> {
             ast::PatKind::Int { sym, neg } => {
                 let mut v = parse_int(self.interner.resolve(*sym));
                 if *neg {
-                    v = -v;
+                    v = v.wrapping_neg();
                 }
                 let Some(c) = self.pattern_const(v, scrut_mir, scrut_ty, pat.span) else {
                     return Some(
@@ -22654,7 +22725,7 @@ impl FnLowerer<'_> {
         match &pat.kind {
             ast::PatKind::Int { sym, neg } => {
                 let v = parse_int(self.interner.resolve(*sym));
-                Some(if *neg { -v } else { v })
+                Some(if *neg { v.wrapping_neg() } else { v })
             }
             ast::PatKind::Char(sym) => {
                 Some(decode_char_literal(self.interner.resolve(*sym)) as i128)
@@ -22689,9 +22760,14 @@ impl FnLowerer<'_> {
             return None;
         }
         let bits = mir_byte_size(scrut_mir) * 8;
-        let lo = -(1i128 << (bits - 1));
-        let hi = (1i128 << bits) - 1;
-        if v < lo || v > hi {
+        // A 128-bit literal is already its bit pattern (`parse_int` wraps a `u128` past `i128::MAX`)
+        // and sema range-checked it against the scrutinee, so every `v` is a value of that width.
+        let in_band = bits >= 128 || {
+            let lo = -(1i128 << (bits - 1));
+            let hi = (1i128 << bits) - 1;
+            (lo..=hi).contains(&v)
+        };
+        if !in_band {
             let name = match scrut_ty {
                 Ty::Scalar(s) => s.name().to_string(),
                 _ => scrut_mir.display(),
@@ -23238,6 +23314,12 @@ impl FnLowerer<'_> {
     fn coerce_to(&mut self, v: ValueId, from: &MirType, to: &MirType, signed: bool) -> ValueId {
         if from == to || !is_numeric(from) || !is_numeric(to) {
             return v;
+        }
+        // An implicit `i128` -> `i64` conversion is a count, an extent or an index handed to a
+        // builtin's 64-bit ABI (an `as` cast lowers in `lower_cast` and truncates, as written):
+        // clamp it, so `alloc_i32(2^64 + 4)` asks for `i64::MAX` elements rather than 4.
+        if *from == MirType::I128 && *to == MirType::I64 {
+            return self.saturate_i128_to_i64(v, signed);
         }
         let kind = cast_kind(from, to, signed);
         self.builder
@@ -26230,6 +26312,7 @@ fn checked_mir_byte_size(t: &MirType) -> Option<u64> {
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::I128 => 16,
         MirType::Vec(e, n) | MirType::Array(e, n) => {
             checked_mir_byte_size(e)?.checked_mul(*n as u64)?
         }
@@ -26316,7 +26399,11 @@ fn const_usize_depth(
         return None;
     }
     match &e.kind {
-        ExprKind::Int(s) => Some(u64::try_from(parse_int(interner.resolve(*s))).unwrap_or(0)),
+        // A literal past `u64` saturates, mirroring sema's `eval_usize_depth` (which then rejects
+        // the length as out of range rather than reading it as `0`).
+        ExprKind::Int(s) => {
+            Some(u64::try_from(parse_int(interner.resolve(*s))).unwrap_or(u64::MAX))
+        }
         ExprKind::Path(p) if p.is_single() => {
             let name = p.first().sym;
             let init_depth = depth + 1;
@@ -33961,6 +34048,7 @@ fn numeric_join(a: &MirType, b: &MirType) -> MirType {
         MirType::I8 => 8,
         MirType::I16 | MirType::F16 | MirType::BF16 => 16,
         MirType::I32 | MirType::F32 => 32,
+        MirType::I128 => 128,
         _ => 64,
     };
     match (a.is_float(), b.is_float()) {
@@ -33983,6 +34071,7 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
         MirType::I16 => 16,
         MirType::I32 => 32,
         MirType::I64 => 64,
+        MirType::I128 => 128,
         _ => 0,
     };
     let fsz = |t: &MirType| match t {
@@ -34390,17 +34479,19 @@ fn parse_int_checked(text: &str) -> Option<i128> {
     } else {
         s
     };
+    // The magnitude is read as a `u128` and held as its two's-complement bit pattern, so a `u128`
+    // literal past `i128::MAX` keeps its bits (sema has range-checked it against its type).
     let val = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        i128::from_str_radix(h, 16)
+        u128::from_str_radix(h, 16)
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-        i128::from_str_radix(o, 8)
+        u128::from_str_radix(o, 8)
     } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-        i128::from_str_radix(b, 2)
+        u128::from_str_radix(b, 2)
     } else {
-        body.parse::<i128>()
+        body.parse::<u128>()
     }
-    .ok()?;
-    Some(if neg { -val } else { val })
+    .ok()? as i128;
+    Some(if neg { val.wrapping_neg() } else { val })
 }
 
 fn parse_float(text: &str) -> f64 {

@@ -59,6 +59,12 @@ pub enum MirType {
     I16,
     I32,
     I64,
+    /// A 128-bit integer (`i128`/`u128` in source). Scalar only: no vector has `i128` lanes (the
+    /// verifier rejects one), and no backend matches on it as a `switch` scrutinee, an
+    /// `atomic.add` value or an `IntUnary` operand. Cranelift's x64 backend holds it in a register
+    /// pair and legalizes what it has no instruction for (division, float conversion) into
+    /// runtime calls; the interpreter's `i128` integer holds it exactly.
+    I128,
     F16,
     BF16,
     F32,
@@ -84,6 +90,7 @@ impl MirType {
             I16 | U16 => MirType::I16,
             I32 | U32 => MirType::I32,
             I64 | U64 | Usize | Isize => MirType::I64,
+            I128 | U128 => MirType::I128,
             F16 => MirType::F16,
             Bf16 => MirType::BF16,
             F32 => MirType::F32,
@@ -96,7 +103,7 @@ impl MirType {
     pub fn is_int(&self) -> bool {
         matches!(
             self,
-            MirType::I1 | MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+            MirType::I1 | MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64 | MirType::I128
         )
     }
 
@@ -127,6 +134,7 @@ impl MirType {
             MirType::I16 => "i16".into(),
             MirType::I32 => "i32".into(),
             MirType::I64 => "i64".into(),
+            MirType::I128 => "i128".into(),
             MirType::F16 => "f16".into(),
             MirType::BF16 => "bf16".into(),
             MirType::F32 => "f32".into(),

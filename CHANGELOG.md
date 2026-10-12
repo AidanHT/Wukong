@@ -5,6 +5,82 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
+
+- **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a
+  narrower integer takes — locals, parameters and results, struct and tuple fields, arrays,
+  slices, `alloc::<i128>(n)` buffers, `match` scrutinees — on the interpreter, the native backend
+  (JIT and `--emit=obj|exe`) and the LLVM text emitter. Arithmetic follows the rules of every
+  width: `+ - *` and unary `-` wrap, `/` and `%` truncate with a zero divisor giving `0` and
+  `MIN / -1` wrapping to `MIN`, shifts take their amount modulo 128, `>>` is arithmetic on `i128`
+  and logical on `u128`. Mixed arithmetic promotes losslessly (`i64 + i128` is `i128`; `u128 + i64`
+  is `E0440`, `i128 < u128` is `E0433`). `as` reaches every integer and float type; an
+  integer-to-float conversion rounds once (2^54 + 2^30 + 1 converts to the `f32` 2^54 + 2^31, never
+  the double-rounded 2^54) and a float-to-integer one saturates, NaN to 0.
+- **Literals reach the full 128-bit range.** `5i128`, `5u128`, and unsuffixed literals past `u64`
+  (which widen to `i128`, then `u128`, instead of being malformed); a literal past `u128`, or one
+  that does not fit the type it adapts to — now checked at every width, so `let x: u64 =
+  18446744073709551616` is `E0431` instead of truncating — is rejected. A suffix used to be
+  `E0431` outright (`tests/fail/int_literal_128_suffix.wk` is gone). A pattern literal past `u128`
+  is `E0431` too: it used to lower as `0` and match the wrong value.
+- **Printing, matching, builtins.** `print`/`println` and every `printf` spec print the full value
+  (`wukong_rt_fmt_i128`), arrays and structs holding one print it in place, `match` exhaustiveness
+  covers the 128-bit ranges with witnesses, and the integer scalar builtins (`popcount`, `clz`,
+  `ctz`, `bswap`, `rotl`/`rotr`, `sat_*`, `mulhi`, `overflowing_*`, `sat_cast`, `min`/`max`/`clamp`)
+  take 128-bit operands; `widening_mul` of two `u64`/`i64` now returns the exact `u128`/`i128`
+  product (a 128-bit `widening_mul` is `E0446`).
+- **Native lowering.** Cranelift holds an `i128` in a register pair; x86-64 has no 128-bit divide
+  or integer/float conversion, so those call `wukong_runtime::int128` (operands as `i64` halves,
+  results through a stack slot, unit-tested against Rust's `i128`). A 128-bit `select` is emitted
+  per half, because Cranelift's mid-end turned `select(icmp)` into an `smin`/`umax` x64 cannot
+  lower at 128 bits (`min(a, b)` failed to compile at `-O2`). `i128` parameters and results use
+  LLVM's two-register convention (`enable_llvm_abi_extensions`).
+- **Not 128-bit (documented sharp edges):** `atomic_add` (`E0446`), an `extern "C"` signature
+  (`C0001`), SIMD lanes (a loop over `i128` stays scalar) and `--backend=gpu-native` (declines the
+  function). FP8 as a first-class `f8` type, packed `int4` and constructible SIMD values remain
+  open (N25).
+- **A 128-bit index or count is clamped, never truncated.** `s[i]` with `i: i128` clamps `i` to
+  `i64`'s range before forming the address, so `s[2^64 + 1]` fails its bounds check instead of
+  reading `s[1]`, and a constant one past `i64` on an array is `E0501`; a 128-bit count handed to a
+  builtin's 64-bit operand (`alloc_i32(n)`) clamps the same way. An `as i64` still truncates.
+- **Fixed (review): a 128-bit loop counter panicked the compiler.** A `for` loop whose counter is
+  `i128`/`u128` (`for j in 0..n` with `n: i128`, `0i128..4i128`) still reached the AST vectorizer
+  and the `@parallel` region outliner, which compute saturated bounds at the counter's width:
+  `-(1 << 127)` and `(1 << 127) - 1` overflow, so a debug-build compiler panicked on a valid
+  program at every `-O` level (and a release build vectorized over an `i128` counter by accident).
+  Both now decline such a counter, as the kernel recognizers and `parallel_spec` already did; the
+  loop stays scalar and serial (`tests/run/i128_loop_counters.wk`).
+- **Fixed (review): a negated literal takes its value's type.** The bare magnitude 2^127 types as
+  `u128` and (2^63, 2^64) as `u64`, and the unsigned negation wrapped back to the positive bits, so
+  the guide's own `-170141183460469231731687303715884105728` printed `+2^127`, compared `>= 0`,
+  divided unsigned and converted to a positive float, and `-9223372036854775809` printed
+  9223372036854775807 — on both backends alike. A negated unsuffixed literal is now `i64` for
+  exactly 2^63 and `i128` up to 2^127; past that it is `E0431`
+  (`tests/run/i128_negated_literals.wk`, `tests/fail/negated_literal_past_i128.wk`).
+- **Fixed (review): every literal past `u64` is range-checked where it stands.** Making such a
+  literal well-formed had left three forms that used to be `E0431` silently keeping their low bits:
+  a suffixed literal past its suffix (`0x1_2345_6789_abcd_ef01u64`, `18446744073709551616u64`,
+  `170141183460469231731687303715884105728i128`), an all-literal expression adapting to a narrower
+  type (`let x: u64 = 18446744073709551616 + 5` stored 5) and a `char` target. A suffixed literal is
+  now checked against its own type at every width — so `300u8`, `128i8` and `-5u32`, which always
+  kept their low bits, are `E0431` too, while `-128i8` stays the `i8` minimum — each wide literal of
+  an adapting expression is checked by itself, `char` takes a 32-bit code, and a lone literal is
+  read exactly from its 128-bit magnitude (`let x: i8 = 9223372036854775808` and
+  `let x: i64 = -9223372036854775809` used to pass). An array length past `u64` read as 0
+  (`[7; 2^64]` printed `[]`); it is `E0401` now
+  (`tests/fail/{suffixed_literal_out_of_range,wide_literal_arith_into_narrow,wide_literal_into_char,array_repeat_count_past_u64}.wk`).
+- **Fixed (review): a 128-bit shift or rotate count keeps its low bits.** The clamp for 128-bit
+  indices and extents also caught the count of `<<=`/`>>=` and `rotl`/`rotr`, so on a 64-bit value a
+  count at or past 2^63 became a shift by 63 (`x_i64 <<= 2^64 + 3` gave `i64::MIN`, not 8) while a
+  32-bit value truncated correctly. A count is taken modulo the width, so it now narrows by
+  truncation at every width (`tests/run/i128_shift_counts.wk`).
+- **Tests.** `tests/run/i128_{arith,casts,aggregates,match_builtins,index_clamp}.wk` pin every
+  operation at both range ends with operands the optimizer cannot fold, interpreter == native at
+  every `-O` (expected values from Python's integers, not compiler output); six new `tests/fail`
+  fixtures pin the literal range, the past-`u128` literal (expression and pattern), the
+  past-`u64` literal at a narrow type, the mixed-signedness add, the 128-bit `widening_mul` and
+  the `extern "C"` refusal; sema, MIR-verifier and runtime unit tests.
+
 ### Compile time: the GEMM bias-alias preflight walks each loop once (`gap6/gemm-bias-memo`, N65)
 
 - **Fixed: quadratic recognizer work on deep loop nests.** Before any kernel is substituted or a

@@ -420,9 +420,9 @@ pub enum IntUnOp {
     Clz,
     /// The number of trailing zero bits — the full width for zero.
     Ctz,
-    /// The bytes in reverse order. Defined on `i16`/`i32`/`i64` only: Cranelift has no 8-bit
-    /// `bswap`, so the verifier rejects an `i8` one (the front end lowers `bswap` of a byte to the
-    /// byte itself).
+    /// The bytes in reverse order. Defined on `i16`/`i32`/`i64`/`i128` only: Cranelift has no
+    /// 8-bit `bswap`, so the verifier rejects an `i8` one (the front end lowers `bswap` of a byte to
+    /// the byte itself).
     Bswap,
 }
 
@@ -437,29 +437,35 @@ impl IntUnOp {
     }
 
     /// The result of this operation on the low `bits` bits of `x` (`bits` one of 8, 16, 32, 64),
-    /// zero-extended to `u64`. The definition every backend implements: the interpreter calls it
-    /// directly, and it is what the hardware instruction computes.
+    /// zero-extended to `u64`: [`IntUnOp::eval_wide`] below 128 bits.
     pub fn eval(self, x: u64, bits: u32) -> u64 {
-        let bits = bits.clamp(8, 64);
-        let x = if bits == 64 {
+        self.eval_wide(u128::from(x), bits.clamp(8, 64)) as u64
+    }
+
+    /// The result of this operation on the low `bits` bits of `x` (`bits` one of 8, 16, 32, 64,
+    /// 128), zero-extended to `u128`. The definition every backend implements: the interpreter
+    /// calls it directly, and it is what the hardware instruction computes.
+    pub fn eval_wide(self, x: u128, bits: u32) -> u128 {
+        let bits = bits.clamp(8, 128);
+        let x = if bits == 128 {
             x
         } else {
-            x & ((1u64 << bits) - 1)
+            x & ((1u128 << bits) - 1)
         };
         match self {
-            IntUnOp::Popcnt => u64::from(x.count_ones()),
-            // `x` fits in `bits` bits, so it has at least `64 - bits` leading zeros as a u64.
-            IntUnOp::Clz => u64::from(x.leading_zeros() - (64 - bits)),
+            IntUnOp::Popcnt => u128::from(x.count_ones()),
+            // `x` fits in `bits` bits, so it has at least `128 - bits` leading zeros as a u128.
+            IntUnOp::Clz => u128::from(x.leading_zeros() - (128 - bits)),
             IntUnOp::Ctz => {
                 if x == 0 {
-                    u64::from(bits)
+                    u128::from(bits)
                 } else {
-                    u64::from(x.trailing_zeros())
+                    u128::from(x.trailing_zeros())
                 }
             }
-            // The operand's bytes sit at the bottom of the u64; reversing all eight moves them to
-            // the top in reverse order, and the shift brings them back down.
-            IntUnOp::Bswap => x.swap_bytes() >> (64 - bits),
+            // The operand's bytes sit at the bottom of the u128; reversing all sixteen moves them
+            // to the top in reverse order, and the shift brings them back down.
+            IntUnOp::Bswap => x.swap_bytes() >> (128 - bits),
         }
     }
 }
@@ -730,5 +736,33 @@ mod tests {
         assert_eq!(Bswap.eval(0x1234_5678, 32), 0x7856_3412);
         assert_eq!(Bswap.eval(0x0102_0304_0506_0708, 64), 0x0807_0605_0403_0201);
         assert_eq!(Bswap.eval(0xAB, 8), 0xAB);
+    }
+
+    /// The same definitions at 128 bits, against Rust's own `u128` operations, and `eval` is
+    /// `eval_wide` below them.
+    #[test]
+    fn int_unary_eval_wide_covers_128_bits() {
+        use IntUnOp::*;
+        for x in [
+            0u128,
+            1,
+            u128::MAX,
+            1 << 127,
+            0x0123_4567_89ab_cdef_0011_2233_4455_6677,
+        ] {
+            assert_eq!(Popcnt.eval_wide(x, 128), u128::from(x.count_ones()));
+            assert_eq!(Clz.eval_wide(x, 128), u128::from(x.leading_zeros()));
+            assert_eq!(Ctz.eval_wide(x, 128), u128::from(x.trailing_zeros()));
+            assert_eq!(Bswap.eval_wide(x, 128), x.swap_bytes());
+        }
+        for op in [Popcnt, Clz, Ctz, Bswap] {
+            for (x, bits) in [(0x1234u64, 16), (u64::MAX, 64), (0x8000_0000, 32), (0, 8)] {
+                assert_eq!(
+                    u128::from(op.eval(x, bits)),
+                    op.eval_wide(u128::from(x), bits),
+                    "{op:?} {x:#x} at {bits}"
+                );
+            }
+        }
     }
 }

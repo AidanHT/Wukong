@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
+module tests.fail.array_repeat_count_past_u64
+
+// An array length is read as a u64, and a literal past u64 (well-formed since `i128`/`u128`) read as
+// the fallback 0: `[7; 2^64]` silently became an empty array (`println` printed `[]`), and
+// `let c: [i32; 0] = [7; 2^64]` even type-checked. It is out of range for a length, like `[7; 2^32]`.
+fn main() -> i32 {
+    let a = [7; 18446744073709551616]; //~ E0401
+    println(a);
+    return 0;
+}

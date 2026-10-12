@@ -95,7 +95,12 @@ sources:
   / `wukong_rt_env` / `wukong_rt_read_stdin` / `wukong_rt_exit` builtins — is declared from its
   `#[no_mangle] extern "C"` definition in `wukong_runtime` (a generated table, never inferred from a
   call site), and each argument is converted to its slot exactly as the Cranelift call converts it:
-  integers widened to `i64`, an absent optional pointer passed as `ptr null`;
+  integers widened to `i64`, an `i128` split into two `i64` slots (low half first, the way
+  `wukong_rt_fmt_i128` takes it), an absent optional pointer passed as `ptr null`;
+- an `i128` division or integer/float conversion inside a function stays LLVM's own `i128`
+  instruction, which LLVM lowers to the compiler-rt `__divti3`/`__floattidf`/`__fixdfti` family —
+  provided by `compiler_builtins` in the rustc link (Cranelift calls `wukong_runtime::int128`
+  instead, with the same results);
 - the general vectorizer's synthesized kernels — raw AVX2 bytes inside the Cranelift backend — are
   **defined in the module** from their backend-agnostic recipe in their own lane type (`f32`,
   `f64`, `i32` or `i64`), with the interpreter's exact element order and reduction reassociation.

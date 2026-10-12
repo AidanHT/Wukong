@@ -224,6 +224,20 @@ impl Sema<'_> {
         // A closure adding to an element of a variable it captures shares the variable.
         self.note_capture_write(place);
         let elem = match &arg_tys[0] {
+            // Every backend lowers the add to one machine read-modify-write; x86-64 has none at
+            // 128 bits (only a compare-exchange loop on an optional extension), and the GPU none.
+            Ty::Scalar(s) if s.is_128() => {
+                self.error(
+                    place.span,
+                    "E0446",
+                    format!(
+                        "`atomic_add` adds to an integer place of at most 64 bits, but this place \
+                         is a `{}`; there is no single-instruction 128-bit atomic add",
+                        s.name()
+                    ),
+                );
+                return;
+            }
             Ty::Scalar(s) if s.is_int() && *s != Scalar::Char => *s,
             Ty::Unknown | Ty::Error => {
                 self.check_projection_write(place);
@@ -1693,7 +1707,12 @@ impl Sema<'_> {
         if let Some(d) = self.enum_variant_disc(e) {
             return Some(d);
         }
-        crate::eval_const_int(e, self.interner)
+        // A literal past `i64` (a 128-bit index) is clamped to `i64`'s range, exactly as lowering
+        // clamps it (`saturate_i128_to_i64`), so the check still sees it out of bounds.
+        crate::eval_const_int(e, self.interner).or_else(|| {
+            let (neg, mag, _) = crate::wide_lit_value(e, self.interner)?;
+            (mag > i64::MAX as u128).then_some(if neg { i64::MIN } else { i64::MAX })
+        })
     }
 
     pub(crate) fn type_index(&mut self, base: &Expr, indices: &[Expr], span: Span) -> Ty {

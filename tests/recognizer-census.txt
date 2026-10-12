@@ -233,6 +233,14 @@ heap_alloc.wk: veckernel*1 wukong_rt_alloc wukong_rt_free
 heap_alloc_fn.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
 heap_len.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*4 wukong_rt_free wukong_rt_free*4
 heap_zero_init.wk: wukong_rt_alloc wukong_rt_alloc*9 wukong_rt_free wukong_rt_free*9
+i128_aggregates.wk: wukong_rt_alloc wukong_rt_arg_count wukong_rt_fmt_i128 wukong_rt_fmt_i128*18 wukong_rt_fmt_int wukong_rt_fmt_int*6 wukong_rt_fmt_lit wukong_rt_fmt_lit*38 wukong_rt_fmt_slice wukong_rt_fmt_slice*3 wukong_rt_fmt_str wukong_rt_fmt_str*6 wukong_rt_free
+i128_arith.wk: wukong_rt_arg_count wukong_rt_fmt_i128 wukong_rt_fmt_i128*35 wukong_rt_fmt_lit wukong_rt_fmt_lit*35
+i128_casts.wk: wukong_rt_arg_count wukong_rt_fmt_i128 wukong_rt_fmt_i128*24 wukong_rt_fmt_lit wukong_rt_fmt_lit*24
+i128_index_clamp.wk: wukong_rt_alloc
+i128_loop_counters.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*5 wukong_rt_fmt_slice wukong_rt_fmt_slice*5
+i128_match_builtins.wk: wukong_rt_arg_count wukong_rt_fmt_i128 wukong_rt_fmt_i128*29 wukong_rt_fmt_int wukong_rt_fmt_int*4 wukong_rt_fmt_lit wukong_rt_fmt_lit*38 wukong_rt_fmt_str wukong_rt_fmt_str*3
+i128_negated_literals.wk: wukong_rt_fmt_i128 wukong_rt_fmt_i128*8 wukong_rt_fmt_lit wukong_rt_fmt_lit*8
+i128_shift_counts.wk:
 i8_linear.wk: wukong_i8gemm_nt
 i8_linear_dequant.wk: veckernel*1 wukong_i8gemm_nt_deq
 i8_linear_parallel.wk: wukong_i8gemm_nt_parallel

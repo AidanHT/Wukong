@@ -45,7 +45,19 @@ fn width(ty: &MirType) -> u32 {
         MirType::I8 => 8,
         MirType::I16 => 16,
         MirType::I32 => 32,
+        MirType::I128 => 128,
         _ => 64,
+    }
+}
+
+/// The range of a `w`-bit integer as `(min, max)`: the minimum in `i128` (it is never below
+/// `i128::MIN`) and the maximum in `u128` (it is never above `u128::MAX`), so the 128-bit types'
+/// ends are exact.
+fn int_range(w: u32, signed: bool) -> (i128, u128) {
+    if signed {
+        (i128::MIN >> (128 - w), (1u128 << (w - 1)) - 1)
+    } else {
+        (0, u128::MAX >> (128 - w))
     }
 }
 
@@ -107,7 +119,10 @@ impl FnLowerer<'_> {
             Rotl | Rotr => {
                 let rty = self.sb_int_ty(e)?;
                 let x = self.sb_operand(&args[0], &rty);
-                let n = self.sb_operand(&args[1], &rty);
+                // The count is taken modulo the width: a wider one keeps its low bits.
+                let nv = self.lower_expr(&args[1]);
+                let nty = self.operand_mir(nv, &args[1]);
+                let n = self.coerce_count(nv, &nty, &rty, self.signed(&args[1]));
                 Some(self.sb_rotate(x, n, &rty, b == Rotl))
             }
             SatAdd | SatSub => {
@@ -385,13 +400,9 @@ impl FnLowerer<'_> {
 
     /// `ty`'s range as `(min, max)` in canonical constants.
     fn sb_range(&mut self, ty: &MirType, signed: bool) -> (ValueId, ValueId) {
-        let w = width(ty);
-        let (lo, hi) = if signed {
-            (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1)
-        } else {
-            (0, (1i128 << w) - 1)
-        };
-        (self.sb_int(lo, ty), self.sb_int(hi, ty))
+        let (lo, hi) = int_range(width(ty), signed);
+        // `hi` as its bit pattern: `u128::MAX` is the constant `-1` of an `i128` register.
+        (self.sb_int(lo, ty), self.sb_int(hi as i128, ty))
     }
 
     /// `sat_add` / `sat_sub`: the wrapped result, replaced by the bound it crossed. Unsigned: an
@@ -452,8 +463,9 @@ impl FnLowerer<'_> {
     }
 
     /// The wrapped `a · b` and whether it overflowed `ty`. Below 64 bits the exact product is
-    /// formed in `i64` and must survive the round trip through `ty`; at 64 bits the high half of
-    /// the 128-bit product must be the sign extension of the low half (all zero, unsigned).
+    /// formed in `i64` and must survive the round trip through `ty`; at 64 and 128 bits the high
+    /// half of the double-width product must be the sign extension of the low half (all zero,
+    /// unsigned).
     fn sb_overflowing_mul(
         &mut self,
         a: ValueId,
@@ -474,7 +486,7 @@ impl FnLowerer<'_> {
         let r = self.sb_bin(BinOp::Mul, a, b, ty);
         let hi = self.sb_mulhi(a, b, ty, signed);
         let expect = if signed {
-            self.sb_bin_k(BinOp::AShr, r, 63, ty)
+            self.sb_bin_k(BinOp::AShr, r, i128::from(width(ty) - 1), ty)
         } else {
             self.sb_int(0, ty)
         };
@@ -483,9 +495,10 @@ impl FnLowerer<'_> {
     }
 
     /// The high half of the double-width product of `a` and `b` (type `ty`). Below 64 bits: one
-    /// exact `i64` multiply and a shift. At 64 bits the unsigned high half comes from four
-    /// 32×32→64 partial products (Hacker's Delight `mulhu`), and the signed one subtracts the
-    /// operands' sign corrections: `mulhs = mulhu − (a < 0 ? b : 0) − (b < 0 ? a : 0)`.
+    /// exact `i64` multiply and a shift. At 64 (128) bits the unsigned high half comes from four
+    /// 32×32→64 (64×64→128) partial products (Hacker's Delight `mulhu`, over half-width digits),
+    /// and the signed one subtracts the operands' sign corrections:
+    /// `mulhs = mulhu − (a < 0 ? b : 0) − (b < 0 ? a : 0)`.
     fn sb_mulhi(&mut self, a: ValueId, b: ValueId, ty: &MirType, signed: bool) -> ValueId {
         let i64t = MirType::I64;
         let w = width(ty);
@@ -497,22 +510,24 @@ impl FnLowerer<'_> {
             let hi = self.sb_bin_k(shr, p, i128::from(w), &i64t);
             return self.sb_cast(CastKind::Trunc, hi, ty);
         }
-        let mask = 0xffff_ffff;
+        // Digits of half the width: 32 bits of an `i64`, 64 of an `i128`.
+        let half = i128::from(w / 2);
+        let mask = (1i128 << half) - 1;
         let a0 = self.sb_bin_k(BinOp::And, a, mask, ty);
-        let a1 = self.sb_bin_k(BinOp::LShr, a, 32, ty);
+        let a1 = self.sb_bin_k(BinOp::LShr, a, half, ty);
         let b0 = self.sb_bin_k(BinOp::And, b, mask, ty);
-        let b1 = self.sb_bin_k(BinOp::LShr, b, 32, ty);
+        let b1 = self.sb_bin_k(BinOp::LShr, b, half, ty);
         let w0 = self.sb_bin(BinOp::Mul, a0, b0, ty);
-        let w0h = self.sb_bin_k(BinOp::LShr, w0, 32, ty);
+        let w0h = self.sb_bin_k(BinOp::LShr, w0, half, ty);
         let a1b0 = self.sb_bin(BinOp::Mul, a1, b0, ty);
         let t = self.sb_bin(BinOp::Add, a1b0, w0h, ty);
         let w1 = self.sb_bin_k(BinOp::And, t, mask, ty);
-        let w2 = self.sb_bin_k(BinOp::LShr, t, 32, ty);
+        let w2 = self.sb_bin_k(BinOp::LShr, t, half, ty);
         let a0b1 = self.sb_bin(BinOp::Mul, a0, b1, ty);
         let w1b = self.sb_bin(BinOp::Add, a0b1, w1, ty);
         let a1b1 = self.sb_bin(BinOp::Mul, a1, b1, ty);
         let s = self.sb_bin(BinOp::Add, a1b1, w2, ty);
-        let w1h = self.sb_bin_k(BinOp::LShr, w1b, 32, ty);
+        let w1h = self.sb_bin_k(BinOp::LShr, w1b, half, ty);
         let hu = self.sb_bin(BinOp::Add, s, w1h, ty);
         if !signed {
             return hu;
@@ -546,19 +561,13 @@ impl FnLowerer<'_> {
             return None;
         }
         let ss = self.signed(arg);
-        let range = |w: u32, signed: bool| -> (i128, i128) {
-            if signed {
-                (-(1i128 << (w - 1)), (1i128 << (w - 1)) - 1)
-            } else {
-                (0, (1i128 << w) - 1)
-            }
-        };
-        let (lo_s, hi_s) = range(width(&from), ss);
-        let (lo_t, hi_t) = range(width(&tty), t.is_signed());
+        let (lo_s, hi_s) = int_range(width(&from), ss);
+        let (lo_t, hi_t) = int_range(width(&tty), t.is_signed());
         let mut y = v;
         if hi_t < hi_s {
             let gt = if ss { CmpOp::Sgt } else { CmpOp::Ugt };
-            let k = self.sb_int(hi_t, &from);
+            // `hi_t < hi_s <= u128::MAX`, so `hi_t` fits `i128`.
+            let k = self.sb_int(hi_t as i128, &from);
             let c = self.sb_cmp(gt, y, k);
             y = self.sb_select(c, k, y, &from);
         }
@@ -751,6 +760,7 @@ impl FnLowerer<'_> {
     ) -> ValueId {
         let i64t = MirType::I64;
         let f64t = MirType::F64;
+        // `coerce_to` clamps a 128-bit count into `i64`'s range, so it narrows without wrapping.
         let n64 = self.coerce_to(n, nty, &i64t, n_signed);
         // An unsigned 64-bit count above i64::MAX is a huge positive scale, not a negative one.
         let unsigned64 = !n_signed && width(nty) == 64;

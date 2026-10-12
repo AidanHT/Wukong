@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 2
+module tests.fail.wide_literal_into_char
+
+// An integer literal adapting to `char` must be a 32-bit code. `2^64` became the char 0 once a
+// literal past u64 was well-formed (it was E0431 while such a literal was malformed), and `5000000000`
+// always kept its low 32 bits; the range check skipped `char` entirely.
+fn main() -> i32 {
+    let c: char = 18446744073709551616; //~ E0431
+    let d: char = 5000000000; //~ E0431
+    return (c as i32) + (d as i32);
+}

@@ -362,6 +362,28 @@ fn rows(mut out: [f32; 64], n: i64, u: u64) {
     assert_eq!(trace, vec![Ok(())]);
 }
 
+/// A 128-bit counter stays serial by name, before any bound is computed at its width: the
+/// runtime's iteration space is 64-bit, and `(1 << 127) - 1` overflowed (a debug-build panic on
+/// every `for h in 0..n` with `n: i128`/`u128` in a `@parallel fn`).
+#[test]
+fn a_128_bit_counter_stays_serial() {
+    let src = "module m
+@parallel
+fn rows(mut out: [f32; 64], n: TY) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for r in 0..END {
+        for j in 0..8 { out[r * 8 + j] = 1.0; }
+    }
+}
+";
+    for (ty, end) in [("i128", "n"), ("u128", "n"), ("i64", "8i128")] {
+        let (prog, it, trace) = lower(&src.replace("TY", ty).replace("END", end));
+        assert_eq!(trace, vec![Err("a 128-bit counter")], "{ty} {end}");
+        assert_eq!(pfor(&prog, &it), 0, "{ty} {end}");
+    }
+}
+
 /// The two-digit form under a run-time trip count keeps `t / C` as the high digit (its range is
 /// unbounded) and declines the reverse order.
 #[test]

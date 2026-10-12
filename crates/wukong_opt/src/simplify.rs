@@ -559,6 +559,7 @@ fn int_bits(ty: &MirType) -> u32 {
         MirType::I16 => 16,
         MirType::I32 => 32,
         MirType::I64 => 64,
+        MirType::I128 => 128,
         _ => 64,
     }
 }

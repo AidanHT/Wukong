@@ -44,6 +44,12 @@ impl Interp<'_, '_> {
                 fmt::format_int(&mut out, int(args, 4), Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
+            // The whole 128-bit value travels in one slot (the native call splits it in halves).
+            I::RtFmtI128 => {
+                let x = args.get(4).map_or(0, |v| v.as_int());
+                fmt::format_i128(&mut out, x, Spec::unpack(int(args, 5)));
+                self.text_emit(args, &out)
+            }
             I::RtFmtF64 => {
                 fmt::format_f64(&mut out, float(args, 4), Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
@@ -286,7 +292,12 @@ impl Interp<'_, '_> {
             len,
             |i| {
                 let v = slots[i];
-                fmt::elem_of(dt, v.as_int() as i64, v.as_float(), spec.style)
+                if matches!(dt, fmt::DT_I128 | fmt::DT_U128) {
+                    // A 128-bit slot holds its whole bit pattern.
+                    fmt::elem_of_wide(dt, v.as_int(), spec.style)
+                } else {
+                    fmt::elem_of(dt, v.as_int() as i64, v.as_float(), spec.style)
+                }
             },
             spec,
         );
@@ -354,6 +365,10 @@ mod tests {
         }
         assert_eq!(st::PRINT_DT_BOOL, rt::DT_BOOL);
         assert_eq!(st::PRINT_DT_CHAR, rt::DT_CHAR);
+        assert_eq!(st::PRINT_DT_I128, rt::DT_I128);
+        assert_eq!(st::PRINT_DT_U128, rt::DT_U128);
+        assert_eq!(rt::elem_size(rt::DT_I128), Some(16));
+        assert_eq!(rt::elem_size(rt::DT_U128), Some(16));
         assert_eq!(st::SUMMARIZE_THRESHOLD as usize, rt::SUMMARIZE_THRESHOLD);
         assert_eq!(st::EDGE_ITEMS as usize, rt::EDGE_ITEMS);
         // Every printable scalar maps to a dtype the runtime knows the width of.

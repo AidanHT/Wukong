@@ -1,0 +1,117 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 170141183460469231731687303715884105727
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: 340282366920938463463374607431768211455
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: 170141183460469231731687303715884105727
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: 0
+// EXPECT-OUT: 340282366920938463463374607431768211455
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 14285714285
+// EXPECT-OUT: 5000000000000000000
+// EXPECT-OUT: -14285714285
+// EXPECT-OUT: -5000000000000000000
+// EXPECT-OUT: -14285714285
+// EXPECT-OUT: 5000000000000000000
+// EXPECT-OUT: 14285714285
+// EXPECT-OUT: -5000000000000000000
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 113427455640312821154458202477256070485
+// EXPECT-OUT: 279632276
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 18446744073709551616
+// EXPECT-OUT: 1267650600228229401496703205376
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 338953138925153547590470800371487866880
+// EXPECT-OUT: 4
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+module tests.run.i128_arith
+
+// First-class `i128` / `u128` arithmetic at the edges of the 128-bit ranges. Every expected line is
+// the language's integer semantics evaluated independently (Python's unbounded integers, reduced
+// mod 2^128 and read back signed or unsigned) — never a recording of compiler output:
+//
+// * `+ - *` and unary `-` wrap at 128 bits, like every other width: MAX + 1 is MIN, -MIN is MIN,
+//   0u128 - 1 is u128::MAX, u128::MAX * u128::MAX is 1;
+// * `/` and `%` truncate toward zero (the remainder takes the dividend's sign), a zero divisor
+//   yields 0, and MIN / -1 wraps to MIN with remainder 0 — x86-64 has no 128-bit divide, so the
+//   native backend lowers these to a runtime call, and this is the program that pins it;
+// * a shift amount is taken modulo 128 (`1 << 130` is `1 << 2`), `>>` is arithmetic on `i128` and
+//   logical on `u128`, and shifts at and past 64 cross the two halves of the native register pair.
+//
+// Every operand is a runtime value — an opaque zero is added to it: `arg_count()` is 1 (`arg(0)`, the
+// program) on every backend, but the optimizer cannot know that — so nothing is constant-folded at
+// -O2 and both backends execute every operation.
+fn main() -> i32 {
+    let o: i128 = (arg_count() - 1) as i128;
+    let uo: u128 = o as u128;
+
+    let max: i128 = 170141183460469231731687303715884105727 + o;
+    let min: i128 = -170141183460469231731687303715884105728 + o;
+    let umax: u128 = 340282366920938463463374607431768211455 + uo;
+    println(max);
+    println(min);
+    println(umax);
+
+    // Wrapping at both ends.
+    println(max + 1);
+    println(min - 1);
+    println(-min);
+    println(umax + 1);
+    println(uo - 1);
+    println(max * 2);
+    println(umax * umax);
+
+    // Division and remainder: every sign combination, a dividend past 64 bits.
+    let a: i128 = 100000000000000000000000000000 + o;
+    let b: i128 = 7000000000000000000 + o;
+    println(a / b);
+    println(a % b);
+    println(-a / b);
+    println(-a % b);
+    println(a / -b);
+    println(a % -b);
+    println(-a / -b);
+    println(-a % -b);
+    println(min / (o - 1));
+    println(min % (o - 1));
+    println(a / o);
+    println(a % o);
+    println(umax / 3);
+    println(umax % 1000000007);
+    let two64: u128 = 18446744073709551616 + uo;
+    println(umax / two64);
+    println(umax % two64);
+
+    // Shifts at and past 64 bits.
+    let one: i128 = 1 + o;
+    println(one << 64);
+    println(one << 100);
+    println(one << 127);
+    println(min >> 64);
+    println(min >> 127);
+    println((min as u128) >> 127);
+    println(umax >> 64);
+    println(umax << 120);
+    let s: i128 = 130 + o;
+    println(one << s);
+
+    // Comparisons read the full 128 bits, signed or unsigned.
+    println(min < max);
+    println(umax > two64);
+    println((min as u128) > (max as u128));
+    return 0;
+}

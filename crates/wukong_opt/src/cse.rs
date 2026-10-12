@@ -312,6 +312,7 @@ fn scalar_of(code: u64) -> MirType {
         8 => MirType::F32,
         9 => MirType::F64,
         10 => MirType::Ptr,
+        12 => MirType::I128,
         _ => MirType::Void,
     }
 }
@@ -334,6 +335,7 @@ fn scalar_code(ty: &MirType) -> Option<u64> {
         MirType::F64 => 9,
         MirType::Ptr => 10,
         MirType::Void => 11,
+        MirType::I128 => 12,
         MirType::Vec(..) | MirType::Array(..) => return None,
     })
 }

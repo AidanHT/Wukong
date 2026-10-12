@@ -18,6 +18,12 @@
 //! The UTF-8 entries of the `str` operations (`wukong_rt_utf8_*`) read their bytes and return a
 //! number, so the JIT binds the runtime's own entries and a linked executable resolves the same
 //! ones from the rlib.
+//!
+//! The 128-bit integer entries (`wukong_rt_i128_*`, `wukong_rt_f64_to_i128`) are not called from
+//! MIR at all: they are what this backend legalizes an `i128` division or float conversion into
+//! (`int128.rs`), since x64 has no instruction for either. They live in this table so declaration
+//! and JIT binding cover them like every other runtime entry; a linked executable resolves them
+//! from the rlib.
 
 use std::collections::HashMap;
 
@@ -37,6 +43,14 @@ pub(crate) const RT_PRINT_CHAR: &str = "wukong_rt_print_char";
 /// `exit(code)`: `(code: i64)`. Lowered by `lower_call` itself (it must return through the
 /// callers), declared and bound from this table.
 pub(crate) const RT_EXIT: &str = "wukong_rt_exit";
+/// `i128` division and remainder: `(a_lo, a_hi, b_lo, b_hi, op, out)` (`wukong_runtime::int128`).
+pub(crate) const RT_I128_DIVREM: &str = "wukong_rt_i128_divrem";
+/// `i128`/`u128` to `f64`: `(lo, hi, signed) -> f64`.
+pub(crate) const RT_I128_TO_F64: &str = "wukong_rt_i128_to_f64";
+/// `i128`/`u128` to `f32`, rounded once: `(lo, hi, signed) -> f32`.
+pub(crate) const RT_I128_TO_F32: &str = "wukong_rt_i128_to_f32";
+/// A float to `i128`/`u128`, saturating: `(x: f64, signed, out)`.
+pub(crate) const RT_F64_TO_I128: &str = "wukong_rt_f64_to_i128";
 
 /// The ABI class of one parameter or return value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +64,9 @@ pub(crate) enum Abi {
     F32,
     /// An `f64`; a narrower float argument is widened to it (exactly).
     F64,
+    /// A 128-bit integer, passed as two 64-bit parameters, its low half first. One MIR argument;
+    /// a narrower integer argument is sign-extended to it.
+    I128,
 }
 
 impl Abi {
@@ -59,6 +76,8 @@ impl Abi {
             Abi::I64 => types::I64,
             Abi::F32 => types::F32,
             Abi::F64 => types::F64,
+            // Its two halves; `declare` pushes the second.
+            Abi::I128 => types::I64,
         }
     }
 }
@@ -111,6 +130,26 @@ extern "C" fn rt_fmt_int(target: i64, buf: *mut u8, cap: i64, pos: i64, x: i64, 
     let mut s = Vec::new();
     wukong_runtime::fmt::format_int(&mut s, x, wukong_runtime::fmt::Spec::unpack(spec));
     // SAFETY: the generated code passes a buffer of `cap` writable bytes, or a stream target.
+    unsafe { jit_emit(target, buf, cap, pos, &s) }
+}
+
+extern "C" fn rt_fmt_i128(
+    target: i64,
+    buf: *mut u8,
+    cap: i64,
+    pos: i64,
+    lo: i64,
+    hi: i64,
+    spec: i64,
+) -> i64 {
+    use wukong_runtime::fmt;
+    let mut s = Vec::new();
+    fmt::format_i128(
+        &mut s,
+        fmt::i128_from_halves(lo, hi),
+        fmt::Spec::unpack(spec),
+    );
+    // SAFETY: as in `rt_fmt_int`.
     unsafe { jit_emit(target, buf, cap, pos, &s) }
 }
 
@@ -197,8 +236,8 @@ extern "C" fn rt_fmt_slice(
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 19] {
-    use Abi::{Ptr, F32, F64, I64};
+pub(crate) fn entries() -> [Entry; 24] {
+    use Abi::{Ptr, F32, F64, I128, I64};
     [
         Entry {
             name: RT_PRINT_F32,
@@ -225,6 +264,12 @@ pub(crate) fn entries() -> [Entry; 19] {
             params: &[I64, Ptr, I64, I64, I64, I64],
             ret: Some(I64),
             addr: rt_fmt_int as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_fmt_i128",
+            params: &[I64, Ptr, I64, I64, I128, I64],
+            ret: Some(I64),
+            addr: rt_fmt_i128 as *const u8,
         },
         Entry {
             name: "wukong_rt_fmt_f64",
@@ -320,6 +365,31 @@ pub(crate) fn entries() -> [Entry; 19] {
             ret: Some(I64),
             addr: wukong_runtime::utf8::wukong_rt_utf8_count as *const u8,
         },
+        // The `i128` legalization entries (`int128.rs`): pure, so the JIT binds the runtime's own.
+        Entry {
+            name: RT_I128_DIVREM,
+            params: &[I64, I64, I64, I64, I64, Ptr],
+            ret: None,
+            addr: wukong_runtime::int128::wukong_rt_i128_divrem as *const u8,
+        },
+        Entry {
+            name: RT_I128_TO_F64,
+            params: &[I64, I64, I64],
+            ret: Some(F64),
+            addr: wukong_runtime::int128::wukong_rt_i128_to_f64 as *const u8,
+        },
+        Entry {
+            name: RT_I128_TO_F32,
+            params: &[I64, I64, I64],
+            ret: Some(F32),
+            addr: wukong_runtime::int128::wukong_rt_i128_to_f32 as *const u8,
+        },
+        Entry {
+            name: RT_F64_TO_I128,
+            params: &[F64, I64, Ptr],
+            ret: None,
+            addr: wukong_runtime::int128::wukong_rt_f64_to_i128 as *const u8,
+        },
     ]
 }
 
@@ -335,6 +405,9 @@ pub(crate) fn declare<M: Module>(
         let mut sig = Signature::new(call_conv);
         for p in e.params {
             sig.params.push(AbiParam::new(p.ty(ptr_ty)));
+            if *p == Abi::I128 {
+                sig.params.push(AbiParam::new(types::I64));
+            }
         }
         if let Some(r) = e.ret {
             sig.returns.push(AbiParam::new(r.ty(ptr_ty)));
@@ -366,14 +439,23 @@ impl FnTranslator<'_> {
         if e.params.len() != args.len() {
             return None;
         }
-        let mut vals = Vec::with_capacity(args.len());
+        let mut vals = Vec::with_capacity(args.len() + 1);
         for (&p, &a) in e.params.iter().zip(args) {
-            vals.push(match p {
+            let v = match p {
                 Abi::Ptr => self.val(a),
                 Abi::I64 => self.coerce_to_i64(a),
                 Abi::F32 => self.coerce_to_f32(a),
                 Abi::F64 => self.coerce_to_f64(a),
-            });
+                Abi::I128 => {
+                    let x = self.val(a);
+                    let from = self.dfg_ty(x);
+                    let wide = self.resize_int(x, from, types::I128, true);
+                    let (lo, hi) = self.builder.ins().isplit(wide);
+                    vals.push(lo);
+                    hi
+                }
+            };
+            vals.push(v);
         }
         let fref = self.runtime_ref(e.name);
         let call = self.builder.ins().call(fref, &vals);

@@ -148,6 +148,10 @@ pub const KIND_CHAR: u8 = 3;
 pub const PRINT_DT_BOOL: i64 = 12;
 /// The runtime dtype code of a printed `char` buffer; the runtime's `fmt::DT_CHAR`.
 pub const PRINT_DT_CHAR: i64 = 13;
+/// The runtime dtype code of a printed `i128` buffer; the runtime's `fmt::DT_I128`.
+pub const PRINT_DT_I128: i64 = 14;
+/// The runtime dtype code of a printed `u128` buffer; the runtime's `fmt::DT_U128`.
+pub const PRINT_DT_U128: i64 = 15;
 /// An array or slice longer than this prints summarized, NumPy-style (the runtime's
 /// `fmt::SUMMARIZE_THRESHOLD`; the compiler unrolls an array of aggregates by the same rule).
 pub const SUMMARIZE_THRESHOLD: u64 = 1000;
@@ -159,6 +163,8 @@ pub fn print_dtype(s: Scalar) -> i64 {
     match s {
         Scalar::Bool => PRINT_DT_BOOL,
         Scalar::Char => PRINT_DT_CHAR,
+        Scalar::I128 => PRINT_DT_I128,
+        Scalar::U128 => PRINT_DT_U128,
         Scalar::Usize => crate::io_dtype_code(Scalar::U64),
         Scalar::Isize => crate::io_dtype_code(Scalar::I64),
         s => crate::io_dtype_code(s),

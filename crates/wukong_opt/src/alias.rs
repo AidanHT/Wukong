@@ -153,6 +153,7 @@ fn byte_size(t: &MirType) -> Option<u32> {
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::I128 => 16,
         MirType::Vec(e, n) | MirType::Array(e, n) => byte_size(e)?.checked_mul(*n)?,
         MirType::Void => 0,
     })

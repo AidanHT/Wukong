@@ -64,6 +64,7 @@ pub(crate) struct TextSyms {
     print_char: Symbol,
     println_char: Symbol,
     fmt_int: Symbol,
+    fmt_i128: Symbol,
     fmt_f64: Symbol,
     fmt_f32: Symbol,
     fmt_str: Symbol,
@@ -86,6 +87,7 @@ impl TextSyms {
             print_char: interner.intern("print_char"),
             println_char: interner.intern("println_char"),
             fmt_int: interner.intern("wukong_rt_fmt_int"),
+            fmt_i128: interner.intern("wukong_rt_fmt_i128"),
             fmt_f64: interner.intern("wukong_rt_fmt_f64"),
             fmt_f32: interner.intern("wukong_rt_fmt_f32"),
             fmt_str: interner.intern("wukong_rt_fmt_str"),
@@ -151,6 +153,15 @@ impl FnLowerer<'_> {
             return Some(self.const_zero(MirType::I32));
         }
         let syms = self.gemm.text;
+        // A 128-bit integer has no per-type printer: it prints through the formatting entry, then
+        // the newline every integer `print` ends with (`printf("{}\n", x)`).
+        if let ty @ Ty::Scalar(Scalar::I128 | Scalar::U128) = self.expr_ty(arg) {
+            let mut sink = self.text_stream(false, arg.span);
+            let v = self.lower_expr(arg);
+            self.text_scalar(&mut sink, v, &ty, &FmtSpec::default());
+            self.text_lit(&mut sink, b"\n");
+            return Some(self.const_zero(MirType::I32));
+        }
         let (plain, line) = match self.expr_ty(arg) {
             Ty::Scalar(Scalar::Bool) => (syms.print_bool, syms.println_bool),
             Ty::Scalar(Scalar::Char) => (syms.print_char, syms.println_char),
@@ -722,6 +733,17 @@ impl FnLowerer<'_> {
                 let sp = self.text_const(spec.pack(st::KIND_SIGNED));
                 self.text_call(sink, syms.fmt_f32, &[x, sp]);
             }
+            // A 128-bit integer: its whole value, through the 128-bit entry (two `i64` halves on
+            // the native call). A radix style prints a signed value's bits, as below.
+            Ty::Scalar(s @ (Scalar::I128 | Scalar::U128)) => {
+                let kind = if *s == Scalar::I128 && !spec.is_radix() {
+                    st::KIND_SIGNED
+                } else {
+                    st::KIND_UNSIGNED
+                };
+                let sp = self.text_const(spec.pack(kind));
+                self.text_call(sink, syms.fmt_i128, &[v, sp]);
+            }
             Ty::Scalar(s) => {
                 // A signed integer under a radix style prints its own width's bits, as Rust's
                 // `{:x}` of `-1i8` prints `ff`: zero-extend it and print it unsigned.
@@ -766,6 +788,7 @@ impl FnLowerer<'_> {
                     MirType::I16 => Scalar::I16,
                     MirType::I32 => Scalar::I32,
                     MirType::I64 => Scalar::I64,
+                    MirType::I128 => Scalar::I128,
                     _ => {
                         self.unsupported(sink.span, "printing a value of this type");
                         return;

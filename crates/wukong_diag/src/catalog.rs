@@ -192,7 +192,8 @@ static CATALOG: &[Explanation] = &[
         "E0302",
         "invalid element type",
         "The element type of a SIMD vector or tensor must be a scalar (e.g. `f32`, `i32`), not a \
-         compound type."
+         compound type. A SIMD vector's lanes are at most 64 bits wide: no vector instruction set \
+         has `i128`/`u128` lanes."
     ),
     entry!(
         "E0303",
@@ -964,12 +965,12 @@ fn main() -> i32 {
          its width: `f32_from_bits` a 32-bit integer, `f64_from_bits` 64, `f16_from_bits` and \
          `bf16_from_bits` 16, `f8e4m3_to_f32`/`f8e5m2_to_f32` 8 (an unsuffixed literal adapts). \
          `sat_cast::<T>` converts to an integer type `T` only, and `ldexp`'s exponent must be an \
-         integer. `widening_mul` of two 64-bit operands has no result type — there are no 128-bit \
+         integer. `widening_mul` of two 128-bit operands has no result type — there are no 256-bit \
          integers — so use `mulhi` for the high half and `*` for the low half. `atomic_add` adds \
-         to an integer place only, with an integer value: integer addition commutes, so the total \
-         is the same in every thread schedule, while a float sum depends on the order of the adds \
-         (there is no atomic float add). The bounds of a range index `s[a..b]` must be integers \
-         too.",
+         to an integer place of at most 64 bits only, with an integer value: integer addition \
+         commutes, so the total is the same in every thread schedule, while a float sum depends \
+         on the order of the adds (there is no atomic float add, and no single-instruction \
+         128-bit one). The bounds of a range index `s[a..b]` must be integers too.",
         bad: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(x);\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n",
         good: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(bits(x)) as i32;\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n"
     ),

@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 5
+module tests.fail.suffixed_literal_out_of_range
+
+// A suffix names a literal's type outright, so its value must be one of that type's. Once a literal
+// past u64 became well-formed (it is an `i128`/`u128` value now), a 17-hex-digit typo with a `u64`
+// suffix silently kept its low 64 bits, `2^64` with a `u64` suffix became 0 and `2^127` with an
+// `i128` suffix became i128::MIN — all three were E0431 while such a literal was malformed. The same
+// rule holds below 64 bits (`300u8` used to keep its low byte, 44); only a unary minus lets a signed
+// suffix reach its minimum (`-128i8` is fine, `128i8` is not).
+fn main() -> i32 {
+    let h = 0x1_2345_6789_abcd_ef01u64; //~ E0431
+    let z = 18446744073709551616u64; //~ E0431
+    let m = 170141183460469231731687303715884105728i128; //~ E0431
+    let b = 300u8; //~ E0431
+    let s = 128i8; //~ E0431
+    let ok = -128i8;
+    return (h as i32) + (z as i32) + (m as i32) + (b as i32) + (s as i32) + (ok as i32);
+}

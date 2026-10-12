@@ -937,6 +937,7 @@ pub fn parse_type(s: &str) -> Result<MirType, String> {
         "i16" => Some(MirType::I16),
         "i32" => Some(MirType::I32),
         "i64" => Some(MirType::I64),
+        "i128" => Some(MirType::I128),
         "f16" => Some(MirType::F16),
         "bf16" => Some(MirType::BF16),
         "f32" => Some(MirType::F32),

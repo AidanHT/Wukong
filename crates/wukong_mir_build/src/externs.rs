@@ -130,6 +130,9 @@ fn c_abi(ty: &Ty, is_ret: bool) -> Option<ExternParam> {
     let (ty, signed) = match ty {
         Ty::Unit if is_ret => (MirType::Void, false),
         Ty::Scalar(Scalar::F16 | Scalar::Bf16) => return None,
+        // C has no standard 128-bit integer, and the compilers that offer `__int128` disagree on
+        // how it is passed (a register pair, or by reference on Windows).
+        Ty::Scalar(Scalar::I128 | Scalar::U128) => return None,
         Ty::Scalar(s) => (MirType::from_scalar(*s), s.is_signed()),
         Ty::Ptr { .. } | Ty::Ref { .. } => (MirType::Ptr, false),
         _ => return None,
@@ -145,7 +148,7 @@ fn no_c_abi(name: &str, ty: &Ty, span: Span, interner: &Interner) -> Diagnostic 
     .with_code("C0001")
     .primary(span, "not C-ABI representable")
     .help(
-        "C functions take and return integers, `bool`, `f32`, `f64` and pointers; pass an \
-         aggregate or a buffer by pointer (`*T`)",
+        "C functions take and return integers of at most 64 bits, `bool`, `f32`, `f64` and \
+         pointers; pass an aggregate, a buffer or a 128-bit integer by pointer (`*T`)",
     )
 }

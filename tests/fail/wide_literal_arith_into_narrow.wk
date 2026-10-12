@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 3
+module tests.fail.wide_literal_arith_into_narrow
+
+// An all-literal expression adapts to its annotation as a whole: every literal in it is re-stamped
+// with the annotated type before the arithmetic runs. The range check folds such an expression in
+// `i64`, which cannot read a literal past u64, so `2^64 + 5` into a `u64` stored 5 and `10^20 * 1`
+// into an `i32` stored 10^20's low 32 bits — both E0431 while such a literal was malformed. Each
+// literal no value of the type can hold is reported where it is written; an `i128` target, which
+// the `i64` fold never checks, takes each literal exactly (u128::MAX is not an `i128`).
+fn main() -> i32 {
+    let x: u64 = 18446744073709551616 + 5; //~ E0431
+    let y: i32 = 100000000000000000000 * 1; //~ E0431
+    let z: i128 = 340282366920938463463374607431768211455 - 1; //~ E0431
+    return (x as i32) + y + (z as i32);
+}

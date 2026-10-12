@@ -466,6 +466,7 @@ fn mem_size(t: &MirType) -> u64 {
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::I128 => 16,
         MirType::Vec(e, n) | MirType::Array(e, n) => mem_size(e).saturating_mul(u64::from(*n)),
         MirType::Void => 0,
     }
@@ -795,19 +796,29 @@ fn check_runtime_call(
             def_params.join(", ")
         ))
     };
+    // An `i128` is never narrowed into one integer slot: it is passed as its two 64-bit halves,
+    // two consecutive `i64` slots (`runtime_arg_slots`), as the Cranelift call passes it.
     let fits = |slot: &str, t: &MirType| {
         if is_int_slot(slot) || slot == "ptr" {
-            t.is_int() || *t == MirType::Ptr
+            (t.is_int() && *t != MirType::I128) || *t == MirType::Ptr
         } else {
             matches!(slot, "float" | "double") && !t.is_vector() && reg_ty(t) == slot
         }
     };
-    if args.len() != def_params.len() {
+    let slots = runtime_arg_slots(f, args);
+    if slots != def_params.len() {
         return decline(format!("the call passes {} arguments", args.len()));
     }
-    for (k, (a, slot)) in args.iter().zip(def_params).enumerate() {
+    let mut slot = def_params.iter();
+    for (k, a) in args.iter().enumerate() {
         let t = f.value_type(*a);
-        if !fits(slot, t) {
+        if *t == MirType::I128 {
+            if !slot.by_ref().take(2).all(|s| *s == "i64") {
+                return decline(format!("argument {k} is an `i128`, two `i64` halves"));
+            }
+            continue;
+        }
+        if !slot.next().is_some_and(|s| fits(s, t)) {
             return decline(format!("argument {k} is `{}`", reg_ty(t)));
         }
     }
@@ -818,6 +829,14 @@ fn check_runtime_call(
         }
     }
     Ok(())
+}
+
+/// How many C parameters a runtime call's arguments fill: one each, except an `i128`, which is
+/// passed as its low and high 64-bit halves in two `i64` parameters.
+fn runtime_arg_slots(f: &Function, args: &[ValueId]) -> usize {
+    args.iter()
+        .map(|a| 1 + usize::from(*f.value_type(*a) == MirType::I128))
+        .sum()
 }
 
 /// One `extern "C"` parameter or result as an LLVM type, with the `signext`/`zeroext` attribute a
@@ -1171,6 +1190,7 @@ impl Emitter<'_> {
                         MirType::I16 => 16,
                         MirType::I32 => 32,
                         MirType::I64 => 64,
+                        MirType::I128 => 128,
                         _ => unreachable!("integer shift type"),
                     };
                     let amount_ty = self.mir(*r).clone();
@@ -1779,10 +1799,23 @@ impl Emitter<'_> {
         let name = self.interner.resolve(func);
         let declared = self.declarations.get(name);
         let slots = declared.map(|s| &s.1);
-        let mut argstr: Vec<String> = Vec::with_capacity(args.len());
-        for (k, a) in args.iter().enumerate() {
+        let mut argstr: Vec<String> = Vec::with_capacity(args.len() + 1);
+        let mut k = 0;
+        for a in args {
             let slot = slots.and_then(|s| s.get(k)).map(|s| abi_base(s));
+            k += 1;
             let ty = self.mir(*a);
+            if *ty == MirType::I128 {
+                // Its two halves, low first (`check_runtime_call` matched them to two `i64`s).
+                let (v, lo, hi) = (self.operand(*a), self.fresh(), self.fresh());
+                let _ = writeln!(out, "  {lo} = trunc i128 {v} to i64");
+                let _ = writeln!(out, "  {hi}.top = lshr i128 {v}, 64");
+                let _ = writeln!(out, "  {hi} = trunc i128 {hi}.top to i64");
+                argstr.push(format!("i64 {lo}"));
+                argstr.push(format!("i64 {hi}"));
+                k += 1;
+                continue;
+            }
             argstr.push(match slot {
                 Some("ptr") if ty.is_int() => {
                     if self.consts.get(&a.0).is_some_and(|c| c == "0") {
@@ -1982,6 +2015,7 @@ fn llvm_ty(t: &MirType) -> String {
         MirType::I16 => "i16".into(),
         MirType::I32 => "i32".into(),
         MirType::I64 => "i64".into(),
+        MirType::I128 => "i128".into(),
         MirType::F16 => "half".into(),
         MirType::BF16 => "bfloat".into(),
         MirType::F32 => "float".into(),
@@ -2078,6 +2112,7 @@ fn int_const(v: i128, ty: &MirType) -> String {
         MirType::I16 => 16,
         MirType::I32 => 32,
         MirType::I64 => 64,
+        MirType::I128 => 128,
         MirType::Ptr if v == 0 => return "null".into(),
         MirType::Ptr => return format!("inttoptr (i64 {} to ptr)", v as i64),
         _ => return v.to_string(),

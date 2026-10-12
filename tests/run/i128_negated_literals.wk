@@ -1,0 +1,54 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: true
+// EXPECT-OUT: -85070591730234615865843651857942052864
+// EXPECT-OUT: -2
+// EXPECT-OUT: -170141183460469231731687303715884105727
+// EXPECT-OUT: true
+// EXPECT-OUT: -9223372036854775809
+// EXPECT-OUT: true
+// EXPECT-OUT: -4611686018427387905
+// EXPECT-OUT: -18446744073709551616
+// EXPECT-OUT: -4503599627370496
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: true
+module tests.run.i128_negated_literals
+
+// An unsuffixed negated literal is typed by its VALUE, as the bare literal is: the narrowest signed
+// type that holds it. The bare magnitude alone can overflow that type — 2^127 types as `u128`, and
+// anything in (2^63, 2^64) as `u64` — and an unsigned negation wraps back to the positive bits, so
+// `-170141183460469231731687303715884105728` (the i128::MIN the language guide spells) printed
+// +2^127, compared `>= 0` against `0`, divided unsigned and converted to a positive float, and
+// `-9223372036854775809` printed the wrapped u64 9223372036854775807 — all identically on both
+// backends, so no differential gate could see it. Each is now `i128` (exactly 2^63 stays `i64`).
+//
+// Expected values, by hand (2^127 = 170141183460469231731687303715884105728, 2^63 =
+// 9223372036854775808, 2^62 = 4611686018427387904, 2^52 = 4503599627370496):
+//   m = -2^127: printed as is; m < 0; m / 2 = -2^126 = -85070591730234615865843651857942052864;
+//   m % 3 = -(2^127 mod 3) = -2 (2 = -1 mod 3, so 2^odd = 2 mod 3; `%` takes the dividend's sign);
+//   m + 1 = -170141183460469231731687303715884105727; (m as f64) < 0.0.
+//   w = -(2^63 + 1): printed as is; w < 0; w >> 1 = floor(w / 2) = -2^62 - 1 = -4611686018427387905.
+//   -2^64 printed as is; -2^64 / 4096 = -2^52 = -4503599627370496.
+//   -2^63 stays the `i64` minimum, and is below 0.
+fn main() -> i32 {
+    println(-170141183460469231731687303715884105728);
+    println(-170141183460469231731687303715884105728 < 0);
+    let m = -170141183460469231731687303715884105728;
+    println(m / 2);
+    println(m % 3);
+    println(m + 1);
+    println((m as f64) < 0.0);
+
+    let w = -9223372036854775809;
+    println(w);
+    println(w < 0);
+    println(w >> 1);
+
+    println(-18446744073709551616);
+    println(-18446744073709551616 / 4096);
+
+    println(-9223372036854775808);
+    println(-9223372036854775808 < 0);
+    return 0;
+}
