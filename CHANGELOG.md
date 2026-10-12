@@ -25,6 +25,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and `corpus_mir_is_identical_with_and_without_the_bias_alias_memo` lowers every corpus program
   with the memo on and off and compares the printed MIR. `cargo test -p wukong_mir_build --lib
   bias_memo -- --nocapture` prints the counts; the linear-growth test pins them.
+
 ### Batched decode attention and GQA-group blocking (`gap6/decode-attention-2`, N81)
 
 - **Added: `sdpa_kv_batch`, batched and padded KV-cache attention.** `sdpa_kv_batch(q, k, v, out,
