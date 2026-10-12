@@ -686,13 +686,14 @@ fn main() -> i32 {
         "A closure parameter without an annotation takes its type from the function type of the \
          parameter the closure is passed to. When that type names a generic parameter of the \
          callee, as the type itself (`fn fold3<T>(f: fn(T, T) -> T, ..)`) or as a tensor's \
-         element type or dimension (`fn(Tensor[T, N]) -> f32`), nothing has fixed it yet — the \
-         closure is checked before the call's other arguments bind it — so the parameter needs \
-         an annotation: `|a: i32, b: i32| a + b`. The same holds for the return type of a closure \
-         whose body uses `return` while the expected return type is generic: annotate it \
-         (`|..| -> i32 { .. }`).",
-        bad: "module ex.e0419\nfn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {\n    return f(f(a, b), c);\n}\nfn main() -> i32 {\n    return fold3(|a, b| a + b, 1, 2, 3);\n}\n",
-        good: "module ex.e0419\nfn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {\n    return f(f(a, b), c);\n}\nfn main() -> i32 {\n    return fold3(|a: i32, b: i32| a + b, 1, 2, 3);\n}\n"
+         element type or dimension (`fn(Tensor[T, N]) -> f32`), the call's other arguments bind \
+         it first (`fold3(|a, b| a + b, x, y, z)` types `a` and `b` as `x`'s type). When none of \
+         them does, or the closure is bound by `let` and has no function type to take it from, \
+         the parameter needs an annotation: `|a: i32, b: i32| a + b`. The same holds for the \
+         return type of a closure whose body uses `return` while no return type is known: \
+         annotate it (`|..| -> i32 { .. }`).",
+        bad: "module ex.e0419\nfn twice<T>(_f: fn(T) -> T, n: i32) -> i32 {\n    return n * 2;\n}\nfn main() -> i32 {\n    return twice(|x| x, 1);\n}\n",
+        good: "module ex.e0419\nfn twice<T>(_f: fn(T) -> T, n: i32) -> i32 {\n    return n * 2;\n}\nfn main() -> i32 {\n    return twice(|x: i32| x, 1);\n}\n"
     ),
     entry!(
         "E0420",

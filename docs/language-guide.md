@@ -166,7 +166,12 @@ type-generic higher-order function binds its type parameters from the function a
 type is only a parameter's type (not a local, field, element, return type or `extern` parameter); a
 function cannot be bound to a `let` or passed to a non-function parameter; the argument must name a
 function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
-(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
+(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. A parameter whose type
+names a dimension generic of the callee (`fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])`)
+accepts a function of the extent the call binds: from the function itself (`fn head(t: Tensor[f32, 4])`
+binds `N = 4`) or from another argument, the first binding winning and every other argument checked
+against it (`E0401` at the function, `E0501` at a buffer). `tests/run/fn_params.wk`,
+`tests/run/closure_infer.wk`.
 
 ### Closures ✅
 
@@ -198,11 +203,14 @@ fn main() -> i32 {
   or element, an operand, a `const` initializer, a `where` predicate or a `static_assert` — a
   closure is `E0411`: there are no run-time function values.
 - **Parameters and return type.** Each parameter is a name with an optional `: Type` (no patterns,
-  no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it;
-  when that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, ..)`), even as a
-  tensor's element type or dimension (`fn(Tensor[T, N]) -> f32`), nothing has fixed it yet, and it
-  must be annotated (`E0419`) — as must every parameter of a `let`-bound closure without a
-  function-type annotation. The return type is the annotation, else the declared one, else the
+  no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it.
+  When that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, a: T, ..)`), even
+  as a tensor's element type or dimension (`fn(Tensor[T, N]) -> f32`), the call's other arguments
+  bind it first — the non-literal ones, then a literal at its default type — so
+  `fold3(|a, b| a * 10 + b, x, y, 3)` types `a` and `b` as `x`'s type. A generic none of them binds
+  needs an annotation (`E0419`), and so does every parameter of a `let`-bound closure without a
+  function-type annotation; one bound to the enclosing function's own generic is `E0418` (the
+  closure is not generic). The return type is the annotation, else the declared one, else the
   body's type, and a body that uses `return` then needs the annotation (`E0419`). With `->` the body
   must be a block. The closure's type must equal the parameter's once the call binds the callee's
   generics (`E0401`).
@@ -232,7 +240,7 @@ It costs nothing at run time: the closure is lifted to a function whose leading 
 captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
 function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
 direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
-`tests/run/{closures,closure_let,closure_method,closure_captures}.wk`.
+`tests/run/{closures,closure_let,closure_method,closure_captures,closure_infer}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅
 

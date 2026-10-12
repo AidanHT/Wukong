@@ -100,7 +100,10 @@ line table built from them is not emitted yet.
   function (`v.map(|a| a * k)`, `V::make(..)`) specializes the method like a free function
   (`tests/run/{closure_let,closure_method}.wk`). A closure captures an array, tuple, struct or
   data-carrying enum by value (a copy), and a variable it writes by reference — the enclosing
-  function sees the write (`tests/run/closure_captures.wk`). Interp and native agree at every `-O`.
+  function sees the write (`tests/run/closure_captures.wk`). An unannotated closure parameter is
+  typed from the call's other arguments when the expected type names a callee generic, and a
+  function-typed parameter over a dimension generic (`fn(Tensor[f32, N]) -> f32`) binds it from the
+  function passed (`tests/run/closure_infer.wk`). Interp and native agree at every `-O`.
 - **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
   then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
   `--error-format=json`
@@ -1528,9 +1531,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   type is not a field, element or return type. A closure argument of a call through a trait bound
   is not supported (a trait method cannot declare a function-typed parameter). A slice, `str`,
   tensor or vector cannot be captured (`E0418`; capture a pointer), nor the enclosing function's
-  function-typed parameter. An unannotated parameter is typed only from the parameter's declared
-  function type, never from the call's other arguments, so a closure passed to `fold3<T>`'s
-  `fn(T, T) -> T` needs its parameters annotated (`E0419`).
+  function-typed parameter. Inference of an unannotated parameter from the call's other arguments
+  never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2, 3)` binds `T = i32` from the
+  literals, whatever the result is assigned to.
 
 - **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
   only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an

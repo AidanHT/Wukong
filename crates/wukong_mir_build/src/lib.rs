@@ -299,6 +299,14 @@ fn collect_symbolic_dims(ty: &Ty, out: &mut Vec<Symbol>) {
                 collect_symbolic_dims(f, out);
             }
         }
+        // A function-typed parameter's dimensions (`f: fn(Tensor[f32, N]) -> f32`) are the
+        // callee's too: the call binds them from the function it passes.
+        Ty::Fn { params, ret } => {
+            for p in params {
+                collect_symbolic_dims(p, out);
+            }
+            collect_symbolic_dims(ret, out);
+        }
         _ => {}
     }
 }

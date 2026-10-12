@@ -86,6 +86,7 @@ char_match.wk:
 char_type.wk:
 closure_captures.wk:
 closure_hidden_reads.wk:
+closure_infer.wk:
 closure_let.wk:
 closure_method.wk:
 closure_str.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*2 wukong_rt_fmt_str wukong_rt_fmt_str*2

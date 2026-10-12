@@ -1255,6 +1255,15 @@ impl Sema<'_> {
                     }
                 }
             }
+            // A function-typed parameter fed a function: its tensor extents bind the callee's
+            // dimension generics (`fn(Tensor[f32, N]) -> f32` fed a function of
+            // `Tensor[f32, 4]` binds `N = 4`), so later parameters are checked against them. Bind
+            // only: whether the function's type is the expected one is `check_fn_value_args`'s
+            // `E0401`. Every dimension variable still in the parameter after substitution is an
+            // unbound generic of the callee.
+            (Ty::Fn { .. }, Ty::Fn { .. }) if !rigid => {
+                crate::closures::bind_dims(param, arg, &|_| true, dims);
+            }
             // Two DECLARED nominal types are not interchangeable. `Ty::Named` also spells a bare
             // generic TYPE variable (`fn f<T>(x: T)`), which must stay lenient, so — exactly like
             // the `(Tensor, Named)` arm below — only a name that resolves to a declared struct/enum

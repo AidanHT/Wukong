@@ -28,6 +28,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and native alike; the variable's own mutability rules apply (`E0304` for an immutable binding),
   where every write to a capture used to be `E0304`. A slice, `str`, tensor or vector still cannot
   be captured (`E0418`, `tests/fail/closure_capture_slice.wk`; `tests/run/closure_captures.wk`).
+- **Added: closure parameters inferred from the call's other arguments.** When the expected type
+  names a callee generic, the other arguments bind it first (non-literals, then literals at their
+  default type), so `fold3(|a, b| a * 10 + b, x, y, 3)` with `x: i64` types `a, b: i64` and
+  `mapn(|t| t[1] * t[2], xs)` types `t` as `Tensor[f32, 4]`. It was `E0419`, which now fires only
+  when nothing binds the generic (`tests/run/closure_infer.wk`, `tests/fail/closure_param_infer.wk`).
+- **Fixed: a function-typed parameter over a dimension generic rejected every function.**
+  `fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])` called as `mapn(head, xs)` with
+  `head: fn(Tensor[f32, 4]) -> f32` was `E0401` ("expected `fn(Tensor[f32, N]) -> f32`"), because
+  the expected type was compared before the call's dimensions were substituted. The call now binds
+  `N` from the function too (first binding wins, every other argument checked against it), and a
+  dimension named only by the function parameter is passed to the instance as a hidden dimension
+  argument (`tests/run/closure_infer.wk`).
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 

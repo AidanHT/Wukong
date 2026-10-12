@@ -135,7 +135,8 @@ Three front-end surfaces lower to plain calls before any recognizer sees the tre
 `wukong_sema::closures` checks each `|x| body` literal where it is written — as an argument of a
 function-typed parameter (of a function, a method, or a call through a function-typed parameter or
 closure-bound local) or a `let` initializer, `E0411` elsewhere — typing its parameters from that
-parameter's function type and recording, per literal, its parameter, return and capture types
+parameter's function type (after the call's other arguments bind what they can of the
+callee's generics, `type_args_against`) and recording, per literal, its parameter, return and capture types
 (`SemaResult::closures`). A `let`-bound name is tracked per scope (`closure_binds`): every use is
 either a call or a function-typed argument, recorded with the literal it denotes
 (`SemaResult::closure_refs`), and anything else is `E0421`. A capture is every enclosing local the body reads: `note_local_use` sees

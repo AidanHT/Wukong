@@ -603,9 +603,15 @@ impl Sema<'_> {
     /// the caller's own function-typed parameter, whose type equals the parameter's (with the
     /// callee's type parameters substituted as the call binds them).
     pub(crate) fn check_fn_value_args(&mut self, sig: &FnSig, args: &[Expr], arg_tys: &[Ty]) {
+        // The call's bindings, in argument order (the order `check_fn_call` binds in): a function
+        // argument binds what its own type fixes too, so `fn(Tensor[f32, N]) -> f32` accepts a
+        // function of `Tensor[f32, 4]` exactly when the call binds `N = 4`.
         let mut tys: HashMap<Symbol, Ty> = HashMap::default();
+        let mut dims: HashMap<Symbol, wukong_types::Dim> = HashMap::default();
+        let is_generic = |g: Symbol| sig.generics.contains(&g);
         for (p, a) in sig.params.iter().zip(arg_tys) {
             crate::shape::infer_type_generics(p, a, &sig.generics, &mut tys);
+            crate::closures::bind_dims(p, a, &is_generic, &mut dims);
         }
         for (i, a) in args.iter().enumerate() {
             let (Some(pty), Some(aty)) = (sig.params.get(i), arg_tys.get(i)) else {
@@ -639,7 +645,7 @@ impl Sema<'_> {
                         );
                         continue;
                     }
-                    let want = crate::shape::apply_subst(pty, &HashMap::default(), &tys);
+                    let want = crate::shape::apply_subst(pty, &dims, &tys);
                     let unresolved = sig.generics.iter().any(|g| mentions(&want, *g));
                     if !matches!(aty, Ty::Fn { .. }) || (!unresolved && *aty != want) {
                         let (w, f) = (want.display(self.interner), aty.display(self.interner));

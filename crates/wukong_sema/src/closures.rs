@@ -13,8 +13,9 @@
 //! use of a closure-bound local denotes ([`crate::SemaResult::closure_refs`]).
 //!
 //! * **Typing.** Parameter `i` takes its annotation, else the `i`-th parameter of the expected
-//!   function type when that names no generic of the callee; otherwise, and for every unannotated
-//!   parameter of a `let`-bound closure with no function-type annotation, it is `E0419`.
+//!   function type once the call's other arguments have bound what they can of the callee's
+//!   generics ([`Sema::type_args_against`]); one that still names a callee generic, and every
+//!   unannotated parameter of a `let`-bound closure with no function-type annotation, is `E0419`.
 //!   The return type is the annotation, else the expected return when it is generic-free, else the
 //!   body's type (and a body that then uses `return` is `E0419` too: nothing fixes what it
 //!   returns). The closure's type `fn(P..) -> R` must equal the expected one after the call's
@@ -34,7 +35,7 @@
 
 use wukong_ast::{Expr, ExprKind, NodeId, PatKind, Pattern, Stmt, TypeExpr};
 use wukong_diag::Diagnostic;
-use wukong_span::{FxHashSet as HashSet, Span, Symbol};
+use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
 use crate::{DefKind, Sema};
@@ -127,35 +128,84 @@ impl Sema<'_> {
     /// Type `args` against the parameter types `params` of a callee whose generics are `generics`
     /// (see [`Self::type_call_args`]): a closure literal at a function-typed parameter is checked
     /// against it, and a single name there may denote a closure-bound local.
+    ///
+    /// When a closure's expected type names a generic of the callee (`fn fold3<T>(f: fn(T, T) -> T,
+    /// a: T, ..)`, `fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])`), the call's other
+    /// arguments are typed first and bind what they can — the non-literal ones, then an unsuffixed
+    /// literal at its default type, exactly the order the call's own inference uses — and the
+    /// closure is checked against the expected type with those bindings applied. A generic they
+    /// leave open still needs an annotation (`E0419`).
     pub(crate) fn type_args_against(
         &mut self,
         args: &[Expr],
         params: &[Ty],
         generics: &[Symbol],
     ) -> Vec<Ty> {
-        let mut tys = Vec::with_capacity(args.len());
+        let is_generic = |g: Symbol| generics.contains(&g);
+        let closure_at = |i: usize, a: &Expr| {
+            matches!(a.kind, ExprKind::Closure { .. })
+                && matches!(params.get(i), Some(Ty::Fn { .. }))
+        };
+        let deferred = !generics.is_empty()
+            && args.iter().enumerate().any(|(i, a)| {
+                closure_at(i, a) && params.get(i).is_some_and(|p| names_generic(p, &is_generic))
+            });
+        let mut tys: Vec<Option<Ty>> = vec![None; args.len()];
         for (i, a) in args.iter().enumerate() {
-            let want = match params.get(i) {
-                Some(t @ Ty::Fn { .. }) => Some(t),
-                _ => None,
-            };
-            let t = match (want, &a.kind) {
-                (Some(want), ExprKind::Closure { .. }) => {
-                    let t = self.type_closure(a, Some(want), generics);
-                    self.types.insert(a.id, t.clone());
-                    t
-                }
-                (Some(_), ExprKind::Path(p)) if p.is_single() => {
-                    let outer = self.fn_value_arg.replace(a.id);
-                    let t = self.type_expr(a);
-                    self.fn_value_arg = outer;
-                    t
-                }
-                _ => self.type_expr(a),
-            };
-            tys.push(t);
+            if deferred && closure_at(i, a) {
+                continue;
+            }
+            tys[i] = Some(self.type_arg(a, params.get(i), generics));
         }
-        tys
+        if deferred {
+            let mut types: HashMap<Symbol, Ty> = HashMap::default();
+            let mut dims: HashMap<Symbol, Dim> = HashMap::default();
+            for literal in [false, true] {
+                for (i, a) in args.iter().enumerate() {
+                    if let (Some(p), Some(Some(t))) = (params.get(i), tys.get(i)) {
+                        if self.is_adaptable_num_literal(a) == literal {
+                            crate::shape::infer_type_generics(p, t, generics, &mut types);
+                            bind_dims(p, t, &is_generic, &mut dims);
+                        }
+                    }
+                }
+            }
+            for (i, a) in args.iter().enumerate() {
+                if tys[i].is_some() {
+                    continue;
+                }
+                let want = params
+                    .get(i)
+                    .map(|p| crate::shape::apply_subst(p, &dims, &types));
+                let t = self.type_arg(a, want.as_ref(), generics);
+                // A closure checked here binds what its own type fixes, for the ones after it.
+                if let Some(p) = params.get(i) {
+                    crate::shape::infer_type_generics(p, &t, generics, &mut types);
+                    bind_dims(p, &t, &is_generic, &mut dims);
+                }
+                tys[i] = Some(t);
+            }
+        }
+        tys.into_iter().map(|t| t.unwrap_or(Ty::Error)).collect()
+    }
+
+    /// Type one argument `a` of a parameter of type `want` (see [`Self::type_args_against`]).
+    fn type_arg(&mut self, a: &Expr, want: Option<&Ty>, generics: &[Symbol]) -> Ty {
+        let want = want.filter(|t| matches!(t, Ty::Fn { .. }));
+        match (want, &a.kind) {
+            (Some(want), ExprKind::Closure { .. }) => {
+                let t = self.type_closure(a, Some(want), generics);
+                self.types.insert(a.id, t.clone());
+                t
+            }
+            (Some(_), ExprKind::Path(p)) if p.is_single() => {
+                let outer = self.fn_value_arg.replace(a.id);
+                let t = self.type_expr(a);
+                self.fn_value_arg = outer;
+                t
+            }
+            _ => self.type_expr(a),
+        }
     }
 
     /// `let f = |..| ..;` — bind the name to the closure. Calls through `f` and arguments `g(f)`
@@ -371,6 +421,14 @@ impl Sema<'_> {
         for (i, p) in params.iter().enumerate() {
             let t = match (&p.ty, want_params.get(i)) {
                 (Some(te), _) => self.lower_type(te),
+                // Bound by the call's other arguments to a type of the enclosing function's own
+                // generics: the lifted function is not generic (`E0418`, as for an annotation).
+                (None, Some(t)) if generic_free(t) && self.mentions_enclosing_generic(t) => {
+                    if let Some(g) = self.enclosing_generic_in(t) {
+                        self.note_generic_use(g, p.span);
+                    }
+                    Ty::Error
+                }
                 (None, Some(t)) if generic_free(t) => t.clone(),
                 (None, Some(_)) => {
                     uninferred.push(p);
@@ -410,8 +468,7 @@ impl Sema<'_> {
                 let note = match expected {
                     Some(w) => format!(
                         "the closure is passed as `{}`, whose parameter types are generic \
-                         parameters of the callee; the closure is checked before the call's \
-                         other arguments bind them",
+                         parameters of the callee that the call's other arguments do not fix",
                         w.display(self.interner)
                     ),
                     None => "a closure bound by `let` has no function type to take its parameter \
@@ -844,6 +901,13 @@ impl Sema<'_> {
     fn mentions_enclosing_generic(&self, t: &Ty) -> bool {
         names_generic(t, &|g| self.generics.contains(&g))
     }
+
+    /// One generic parameter of the enclosing function that `t` names, for its diagnostic.
+    fn enclosing_generic_in(&self, t: &Ty) -> Option<Symbol> {
+        let mut gs: Vec<Symbol> = self.generics.iter().copied().collect();
+        gs.sort_by_key(|g| g.0);
+        gs.into_iter().find(|g| names_generic(t, &|x| x == *g))
+    }
 }
 
 /// Does `t` name a generic `is_generic` accepts — as a type, a tensor's element type or one of its
@@ -870,6 +934,63 @@ fn names_generic(t: &Ty, is_generic: &dyn Fn(Symbol) -> bool) -> bool {
                 })
         }
         Ty::Scalar(_) | Ty::Str | Ty::Unit | Ty::Vector { .. } | Ty::Unknown | Ty::Error => false,
+    }
+}
+
+/// Bind each dimension generic of a callee (`is_generic`) that `param` names to the extent `arg`
+/// gives it, structurally — a tensor axis against a tensor axis, a rank-1 tensor against a
+/// fixed-size array's length, through pointers, elements, tuple fields and function types. The
+/// first binding wins (as in the call's own inference); a run-time `?` extent binds nothing.
+pub(crate) fn bind_dims(
+    param: &Ty,
+    arg: &Ty,
+    is_generic: &dyn Fn(Symbol) -> bool,
+    dims: &mut HashMap<Symbol, Dim>,
+) {
+    match (param, arg) {
+        (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. })
+            if ps.0.len() == as_.0.len() =>
+        {
+            for (p, a) in ps.0.iter().zip(&as_.0) {
+                if let Dim::Var(v) = p {
+                    if is_generic(*v) && !matches!(a, Dim::Dynamic) {
+                        dims.entry(*v).or_insert_with(|| a.clone());
+                    }
+                }
+            }
+        }
+        (Ty::Tensor { shape: ps, .. }, Ty::Array { len, .. }) if ps.0.len() == 1 => {
+            if let Dim::Var(v) = &ps.0[0] {
+                if is_generic(*v) {
+                    dims.entry(*v).or_insert(Dim::Const(*len));
+                }
+            }
+        }
+        (Ty::Ptr { pointee: p, .. }, Ty::Ptr { pointee: a, .. })
+        | (Ty::Ref { pointee: p, .. }, Ty::Ref { pointee: a, .. })
+        | (Ty::Slice(p), Ty::Slice(a)) => bind_dims(p, a, is_generic, dims),
+        (Ty::Array { elem: p, .. }, Ty::Array { elem: a, .. }) => bind_dims(p, a, is_generic, dims),
+        (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+            for (p, a) in ps.iter().zip(as_) {
+                bind_dims(p, a, is_generic, dims);
+            }
+        }
+        (
+            Ty::Fn {
+                params: ps,
+                ret: pr,
+            },
+            Ty::Fn {
+                params: as_,
+                ret: ar,
+            },
+        ) => {
+            for (p, a) in ps.iter().zip(as_) {
+                bind_dims(p, a, is_generic, dims);
+            }
+            bind_dims(pr, ar, is_generic, dims);
+        }
+        _ => {}
     }
 }
 
@@ -1107,26 +1228,43 @@ mod tests {
         assert_eq!(error_codes(&g("m")), Vec::<&str>::new());
     }
 
-    /// A callee generic hidden in a tensor parameter type — its element type or a dimension —
-    /// leaves the closure parameter as open as a bare `T` does: `E0419`, not the callee's own `T`
-    /// or `N` leaking into the closure's type.
+    /// A callee generic hidden in a tensor parameter type — its element type or a dimension — is
+    /// bound by the call's other arguments when they fix it (the closure is then checked at the
+    /// bound type), and leaves the closure parameter as open as a bare `T` does when they do not:
+    /// `E0419`, not the callee's own `T` or `N` leaking into the closure's type.
     #[test]
     fn a_callee_generic_inside_a_tensor_parameter_is_e0419() {
         for callee in [
             "fn first<T>(f: fn(Tensor[T, 4]) -> f32, t: Tensor[T, 4]) -> f32 { return f(t); }",
             "fn first<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N]) -> f32 { return f(t); }",
         ] {
+            let src = format!(
+                "{callee} fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+                 return first(|t| t[0], xs) as i32; }}"
+            );
+            assert_eq!(error_codes(&src), Vec::<&str>::new(), "{callee}");
+            let got = infos(&src);
+            let Ty::Tensor { elem, shape, .. } = &got[0].1.params[0] else {
+                panic!("{:?}", got[0].1.params);
+            };
+            assert_eq!(*elem, Scalar::F32, "{callee}");
+            assert_eq!(shape.0, vec![wukong_types::Dim::Const(4)], "{callee}");
+        }
+        // Nothing else binds them: annotations needed.
+        for callee in [
+            "fn first<T>(f: fn(Tensor[T, 4]) -> f32) -> f32 { return 1.0; }",
+            "fn first<N>(f: fn(Tensor[f32, N]) -> f32) -> f32 { return 1.0; }",
+        ] {
             assert_eq!(
                 error_codes(&format!(
-                    "{callee} fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
-                     return first(|t| t[0], xs) as i32; }}"
+                    "{callee} fn main() -> i32 {{ return first(|t| t[0]) as i32; }}"
                 )),
                 vec!["E0419"],
                 "{callee}"
             );
         }
         // Annotated, the closure is no longer open: it is checked exactly like a named function of
-        // the same type passed there (whatever that call's verdict is), never `E0419`.
+        // the same type passed there, and the function's extent binds `N`.
         let first = "fn first<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N]) -> f32 { \
                      return f(t); } ";
         let annotated = error_codes(&format!(
@@ -1138,27 +1276,101 @@ mod tests {
              fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
              return first(head, xs) as i32; }}"
         ));
-        assert!(!annotated.contains(&"E0419"), "{annotated:?}");
+        assert!(annotated.is_empty(), "{annotated:?}");
         assert_eq!(annotated, named);
     }
 
+    /// A function-typed parameter whose type names a dimension generic accepts a function whose
+    /// extents the call binds it to — and only that: the binding is the one every argument agrees
+    /// on, checked like any other.
+    #[test]
+    fn a_dimension_generic_function_parameter_binds_from_the_function() {
+        let mapn = "fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N]) -> f32 { \
+                    return f(t); } fn head(t: Tensor[f32, 4]) -> f32 { return t[0]; } ";
+        assert_eq!(
+            error_codes(&format!(
+                "{mapn} fn main() -> i32 {{ let xs: [f32; 4] = [1.0; 4]; \
+                 return mapn(head, xs) as i32; }}"
+            )),
+            Vec::<&str>::new()
+        );
+        // `head` binds `N = 4` first, so an 8-element buffer is the mismatch.
+        assert_eq!(
+            error_codes(&format!(
+                "{mapn} fn main() -> i32 {{ let xs: [f32; 8] = [1.0; 8]; \
+                 return mapn(head, xs) as i32; }}"
+            )),
+            vec!["E0501"]
+        );
+        // The buffer binds `N = 8` first, so `head` is the mismatch.
+        let rev = "fn mapr<N>(t: Tensor[f32, N], f: fn(Tensor[f32, N]) -> f32) -> f32 { \
+                   return f(t); } fn head(t: Tensor[f32, 4]) -> f32 { return t[0]; } ";
+        assert_eq!(
+            error_codes(&format!(
+                "{rev} fn main() -> i32 {{ let xs: [f32; 8] = [1.0; 8]; \
+                 return mapr(xs, head) as i32; }}"
+            )),
+            vec!["E0401"]
+        );
+        // A dimension named only by the function parameter is bound by the function alone.
+        assert_eq!(
+            error_codes(
+                "fn gen<N>(_f: fn(Tensor[f32, N]) -> f32) -> f32 { return N as f32; } \
+                 fn head(t: Tensor[f32, 4]) -> f32 { return t[0]; } \
+                 fn main() -> i32 { return gen(head) as i32; }"
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// An unannotated closure parameter typed by a callee generic takes the type the call's other
+    /// arguments bind: the non-literal ones first, then a literal at its default type.
     #[test]
     fn a_parameter_typed_by_a_callee_generic_is_e0419() {
         let fold3 =
             "fn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T { return f(f(a, b), c); } ";
+        let params = |main: &str| {
+            let got = infos(&format!("{fold3} {main}"));
+            got[0].1.params.clone()
+        };
         assert_eq!(
-            error_codes(&format!(
-                "{fold3} fn main() -> i32 {{ return fold3(|a, b| a + b, 1, 2, 3); }}"
-            )),
-            vec!["E0419"]
+            params("fn main() -> i32 { return fold3(|a, b| a + b, 1, 2, 3); }"),
+            vec![Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I32)]
         );
-        // Annotated, it checks, and the closure binds `T`.
+        assert_eq!(
+            params(
+                "fn main() -> i32 { let x: i64 = 1; return fold3(|a, b| a + b, 2, x, 3) as i32; }"
+            ),
+            vec![Ty::Scalar(Scalar::I64), Ty::Scalar(Scalar::I64)]
+        );
+        // A later closure is checked against what an earlier one bound.
+        let two = "fn two<T>(f: fn(T) -> T, g: fn(T) -> T) -> i32 { return 0; } ";
         assert_eq!(
             error_codes(&format!(
-                "{fold3} fn main() -> i32 {{ let off = 10; \
-                 return fold3(|a: i32, b: i32| a + b + off, 1, 2, 3); }}"
+                "{two} fn main() -> i32 {{ return two(|a: f64| a, |b| b * 2.0); }}"
             )),
             Vec::<&str>::new()
+        );
+        // Nothing binds `T`: the parameter needs an annotation.
+        let mk = "fn mk<T>(f: fn(T) -> T) -> i32 { return 0; } ";
+        assert_eq!(
+            error_codes(&format!("{mk} fn main() -> i32 {{ return mk(|x| x); }}")),
+            vec!["E0419"]
+        );
+        assert_eq!(
+            error_codes(&format!(
+                "{mk} fn main() -> i32 {{ return mk(|x: u8| x); }}"
+            )),
+            Vec::<&str>::new()
+        );
+        // Bound to the enclosing function's own generic: the lifted function is not generic.
+        assert_eq!(
+            error_codes(
+                "fn ap<U>(f: fn(U) -> U, x: U) -> U { return f(x); } \
+                 fn outer<T>(x: T) -> T { return ap(|y| y, x); } \
+                 fn main() -> i32 { return outer(3); }"
+            ),
+            vec!["E0418"]
         );
     }
 

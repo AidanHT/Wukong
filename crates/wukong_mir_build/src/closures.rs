@@ -1246,4 +1246,20 @@ mod tests {
         assert!(body(&funcs, "main").contains("call V.map$main$closure$0("));
         assert!(body(&funcs, "V.map$main$closure$0").contains("call main$closure$0("));
     }
+
+    /// A dimension generic named by a function-typed parameter is a hidden dimension parameter
+    /// of the instance, bound at the call from the function passed.
+    #[test]
+    fn a_dimension_of_a_function_parameter_is_passed_to_the_instance() {
+        let funcs = lower(
+            "fn gen<N>(_f: fn(Tensor[f32, N]) -> f32) -> f32 { return N as f32; } \
+             fn head(t: Tensor[f32, 4]) -> f32 { return t[0]; } \
+             fn main() -> i32 { return gen(head) as i32; }",
+        );
+        assert!(
+            body(&funcs, "gen$head").starts_with("fn gen$head(v0 i64)"),
+            "{funcs:?}"
+        );
+        assert!(body(&funcs, "main").contains("const.i64 4"));
+    }
 }
