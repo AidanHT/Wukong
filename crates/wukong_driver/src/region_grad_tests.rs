@@ -543,7 +543,7 @@ fn loss(x: [f64; 16], w: [f64; 4], @noalias mut s: [f64; 4], mut out: [f64; 1]) 
 /// Every refusal names the region and the reason, instead of a silently wrong gradient.
 #[test]
 fn unsupported_regions_decline_by_name() {
-    let cases: [(&str, &str); 3] = [
+    let cases: [(&str, &str); 4] = [
         // In place: the iteration reads what it writes, which the forward has already overwritten.
         (
             "@parallel
@@ -604,6 +604,24 @@ fn loss(x: [f32; 16], mut out: [f32; 1]) -> f32 {
 }
 ",
             "written again after it",
+        ),
+        // Under `@unchecked` a slice store is straight-line, but a slice's elements have no
+        // gradient the loss can key: refused by name, not dropped as a dead output.
+        (
+            "@parallel @unchecked
+fn loss(w: [f32; 4], mut out: [f32; 1]) -> f32 {
+    let t: f32 = w[0] * w[1];
+    let mut h: [f32; 8] = [0.0; 8];
+    let mut hs: []f32 = h;
+    for i in 0..8 {
+        hs[i] = t * (i as f32);
+    }
+    let l: f32 = h[0] * h[0] + h[1] * h[1] + h[2] * h[2] + h[3] * h[3] + h[4] * h[4] + h[5] * h[5] + h[6] * h[6] + h[7] * h[7];
+    out[0] = l;
+    return l;
+}
+",
+            "writes through captured slice",
         ),
     ];
     for (src, why) in cases {

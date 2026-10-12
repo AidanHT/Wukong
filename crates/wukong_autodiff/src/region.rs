@@ -38,8 +38,9 @@
 //! loop, a run-time bounds check or an overlap guard has control flow in it and declines by name.
 //! Every other refusal is loud too: a captured buffer the region both reads and writes (an in-place
 //! update: the recompute would read the forward's result), a captured buffer something after the
-//! region writes again, a captured slice whose elements need a gradient, a shared buffer of no known
-//! size, and second-order differentiation.
+//! region writes again, a store through a captured slice (straight-line under `@unchecked`), a
+//! written slot that is a view into another buffer, a captured slice whose elements need a gradient,
+//! a shared buffer of no known size, and second-order differentiation.
 
 use crate::{map_operands, Mode, Vjp};
 use std::collections::{HashMap, HashSet};
@@ -129,7 +130,8 @@ pub(crate) enum CapGrad {
     /// Written by the region, and its adjoint is live in the loss: the iteration reads it as the
     /// output adjoint and zeroes the slice it overwrote.
     Live,
-    /// Written by the region, but nothing downstream reads it with a gradient.
+    /// Written by the region, but nothing downstream reads it with a gradient. (Only a parameter or
+    /// a local buffer of its own can be dead: those are the names the loss keys gradients by.)
     Dead,
     /// Read by the region, and the loss keeps (or can make) a gradient buffer for it.
     HasGrad,
@@ -557,6 +559,15 @@ fn extract<'a>(p: &'a Function, nslots: usize, it: &Interner) -> Result<IterBody
     let f = fb.finish();
     let (cap_of, root, slots) = slot_uses(&f, nenv, nslots, it)?;
     for (k, s) in slots.iter().enumerate() {
+        // (Loading the data pointer also marks the slot read, so this must come first.)
+        if s.via_slice && s.write {
+            return Err(format!(
+                "autodiff: the @parallel region `{name}` writes through captured slice #{k}; a \
+                 slice's elements are reached through its data pointer, and the region backward \
+                 can neither key the output adjoint of those writes to the array behind it nor \
+                 prove what else that pointer addresses (write into the array itself)"
+            ));
+        }
         if s.read && s.write {
             return Err(format!(
                 "autodiff: the @parallel region `{name}` both reads and writes captured buffer \
@@ -1172,6 +1183,21 @@ impl<'a> Vjp<'a> {
             let base = self.canon(v);
             bases[k] = Some(base);
             kinds[k] = if u.write {
+                // The loss keys every gradient of memory by a parameter or a local buffer of its
+                // own (`resolve_access`, `grad_target`), so only such a base can tell a live output
+                // from a dead one: a view into another buffer (a non-zero `gep`) finds no adjoint
+                // under its own name and would silently drop the region's output gradient.
+                let own = self.fwd.params.contains(&base)
+                    || matches!(self.def_op.get(&base), Some(Op::Alloca { .. }));
+                if !own {
+                    return Err(format!(
+                        "autodiff: the @parallel region `{name}` writes captured buffer #{k} \
+                         through v{}, a view into another buffer rather than a parameter or a \
+                         local array of its own; the loss keys gradients by whole buffers, so the \
+                         output adjoint of those writes cannot be found (pass the whole buffer)",
+                        base.0
+                    ));
+                }
                 if self.buf_adj.contains_key(&base) || self.grad_buf.contains_key(&base) {
                     CapGrad::Live
                 } else {

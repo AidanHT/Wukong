@@ -218,6 +218,59 @@ fn shared_weight_region_matches_f64_finite_differences() {
     assert_close(&got[2], &vec![0.0; n], "dL/ds");
 }
 
+/// A region whose written env slot is a VIEW into a buffer (`gep s, 2`) rather than a buffer of its
+/// own. The loss keys the gradient of `s`, never of the view, so classifying the written slot by the
+/// view finds no adjoint, calls the output dead, and drops `dL/dx` to zero. It must decline by name.
+/// (`L = Σ s[2+i]²` with `s[2+i] = x[i]²` would give `dL/dx[i] = 4·x[i]³`.)
+#[test]
+fn a_region_writing_a_sub_view_declines_by_name() {
+    let n = 4u64;
+    let mut it = Interner::default();
+    let body = outlined(&mut it, "wukong$par$0", 2, false, |b, hh, caps| {
+        let (x, s) = (caps[0], caps[1]);
+        let xp = gep(b, x, hh, F64);
+        let xi = b.build(F64, Op::Load(xp, F64));
+        let sq = b.build(F64, Op::Bin(BinOp::FMul, xi, xi));
+        let sp = gep(b, s, hh, F64);
+        b.build_void(Op::Store { ptr: sp, value: sq });
+    });
+    let mut b = Builder::new(sym(&mut it, "view_loss"), F64);
+    let x = b.add_param(PTR);
+    let s = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    b.set_param_attrs(x, extent(n));
+    b.set_param_attrs(s, extent(n + 2));
+    let two = cint(&mut b, 2);
+    let view = gep(&mut b, s, two, F64);
+    call_region(&mut b, &mut it, "wukong$par$0", n as i64, &[x, view]);
+    let mut acc = b.build(F64, Op::ConstFloat(0.0, F64));
+    for i in 0..n as i64 {
+        let si = load_elem(&mut b, s, 2 + i);
+        acc = b.build(F64, Op::Fma(si, si, acc));
+    }
+    b.build_void(Op::Store {
+        ptr: out,
+        value: acc,
+    });
+    b.ret(Some(acc));
+    let loss = b.finish();
+    let src = Program {
+        funcs: vec![loss.clone(), body],
+        statics: Vec::new(),
+        externs: Vec::new(),
+        level: wukong_mir::MirLevel::Low,
+    };
+    for wrt in [&[0usize][..], &[0, 1]] {
+        let err = grad_program(&src, &loss, wrt, &mut it)
+            .err()
+            .unwrap_or_else(|| panic!("wrt {wrt:?}: a written sub-view must decline"));
+        assert!(
+            err.contains("wukong$par$0") && err.contains("a view into"),
+            "wrt {wrt:?}: {err}"
+        );
+    }
+}
+
 /// A region the region rule cannot take apart says so by name: an iteration with control flow, a
 /// region reading and writing one buffer, a region in a second-order loss, and a region whose body
 /// the program does not hold.
