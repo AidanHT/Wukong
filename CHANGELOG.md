@@ -32,7 +32,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   step reads its cache up to 8x less often. Every (row, head) keeps the exact per-head operation
   order, so the grouped pass equals the per-head scalar twin bit for bit (pinned over GQA ratios
   1, 2, 3, 4, 5, 7, 8, 12 and 16, every `d % 8` tail and both sides of the 64-key block). Not yet
-  measured: no throughput claim is made.
+  measured: no throughput claim is made. The instrument is an ignored same-run A/B of the grouped
+  pass against the same code one head at a time (best of 15 each, ratio only, bit-equality
+  asserted): `cargo test -p wukong_runtime --release --lib gqa_group_blocking_ab -- --ignored
+  --nocapture`.
 - **Runtime** `wukong_attention_kv_batch_f32[_parallel]` with `kv_batch_plan` /
   `kv_batch_check_lens` (shared by the interpreter twin), Cranelift and textual-LLVM ABI rows, and
   autodiff refusing it like `sdpa_kv`.

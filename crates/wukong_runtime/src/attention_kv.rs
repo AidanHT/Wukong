@@ -2323,4 +2323,80 @@ mod tests {
         assert_eq!(code, KV_OK);
         assert_eq!(bits(&o), [0u32; 8]);
     }
+
+    /// The GQA-blocking A/B instrument, not a gate: one decode step (`sq = 1`, `d = 128`, a long
+    /// cache) through the grouped AVX2 pass versus the same code one head at a time (blocks of one,
+    /// the per-head schedule every head used before), single-threaded, alternating the two arms and
+    /// keeping each arm's best of 15 — report the ratio only, never an absolute time, and read it on
+    /// a release build with the power state noted:
+    /// `cargo test -p wukong_runtime --release --lib gqa_group_blocking_ab -- --ignored --nocapture`.
+    /// Both arms must also agree bit for bit.
+    #[test]
+    #[ignore]
+    fn gqa_group_blocking_ab() {
+        if !simd_available() {
+            return;
+        }
+        let d = 128usize;
+        for &(nh, nkv, skv) in &[
+            (32usize, 32usize, 4096usize),
+            (32, 8, 4096),
+            (32, 4, 4096),
+            (28, 4, 4096),
+            (32, 1, 4096),
+        ] {
+            let group = nh / nkv;
+            let (q_row, kv_row) = (nh * d, nkv * d);
+            let q = fill(1, q_row);
+            let k = fill(2, skv * kv_row);
+            let v = fill(3, skv * kv_row);
+            let scale = 1.0 / (d as f32).sqrt();
+            let mut acc = vec![0.0f32; KV_GROUP_BLOCK * d];
+            let mut sc = vec![0.0f32; KV_GROUP_BLOCK * KV_BC];
+            let kv = |g: usize| KvRow {
+                k: k.as_ptr().wrapping_add(g * d),
+                v: v.as_ptr().wrapping_add(g * d),
+                stride: kv_row,
+                keys: skv,
+            };
+            // `block` heads per call: the grouped schedule (8) or one head at a time (1).
+            let mut run = |block: usize, o: &mut [f32]| {
+                let t0 = std::time::Instant::now();
+                for g in 0..nkv {
+                    let mut h = 0;
+                    while h < group {
+                        let nb = (group - h).min(block);
+                        let off = (g * group + h) * d;
+                        // SAFETY: every pointer stays inside the buffers sized above.
+                        unsafe {
+                            attend_group_simd(
+                                q.as_ptr().add(off),
+                                nb,
+                                kv(g),
+                                d,
+                                scale,
+                                o.as_mut_ptr().add(off),
+                                &mut acc,
+                                &mut sc,
+                            );
+                        }
+                        h += nb;
+                    }
+                }
+                t0.elapsed()
+            };
+            let (mut og, mut oh) = (vec![0.0f32; q_row], vec![0.0f32; q_row]);
+            let (mut best_g, mut best_h) = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for _ in 0..15 {
+                best_g = best_g.min(run(KV_GROUP_BLOCK, &mut og));
+                best_h = best_h.min(run(1, &mut oh));
+            }
+            assert_eq!(bits(&og), bits(&oh), "H={nh} HKV={nkv}");
+            println!(
+                "decode step H={nh} HKV={nkv} (G={group}) skv={skv} d={d}: per-head / grouped = \
+                 {:.2}x",
+                best_h.as_secs_f64() / best_g.as_secs_f64()
+            );
+        }
+    }
 }
