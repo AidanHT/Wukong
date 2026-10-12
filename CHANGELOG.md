@@ -315,6 +315,49 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `fn(str) -> i64` reached lowering with a raw `str` (an internal error on every backend). The
   closure record is erased too (`tests/run/closure_str.wk`).
 
+### Optimizer: fusion over branching bodies, unswitching past guarded calls (`gap5/opt-fuse-unswitch-cfg`)
+
+- **Loop fusion over branching bodies (N31).** `fuse` took only innermost two-block loops, so a
+  producer/consumer pair whose body still branched when it ran -- an `if`/`else` of stores, a clamp
+  written as a branch -- kept its intermediate store and reload. A loop whose body is a region of
+  jumps and two-way branches (at most 8 blocks, entered from the header by one parameterless block,
+  one latch, the header's exit its only exit) now fuses as well: the first body's latch runs on into
+  the second body, absorbing its entry block, and the second latch carries both loops' next values
+  back to the fused header. Legality is the two-block rule over every access of every block: an
+  access under a condition only removes executions, so proving every potential pair is enough. Two
+  widenable loops fuse only when the vectorizer still widens the fused loop, asked on a fused copy of
+  the function: an if-converted region sinks its stores to one address, so two widenable diamonds of
+  stores stay apart, while a widenable straight loop beside a diamond fuses into one widened loop.
+  Two unwidenable loops stay apart when either branches on a condition `unswitch` may decide later in
+  the sweep -- an invariant flag, or the counter against an invariant (`if i < m`): split or
+  unswitched alone, its copies may widen, while fused, each copy would carry the other loop's scalar
+  work: `if i < m { t[i] = a[i] * 3; } else { u[i] = a[i] * 5 - 1; }` beside a recurrence loop is
+  split into two widened loops, not fused into one loop that splits into two scalar ones. The
+  check is conservative: such a pair stays apart even when no copy would widen. A
+  pair of two-block loops fuses exactly as before, byte for byte. A two-block loop fused into a
+  branching one gives up the 4x partial unroll, which takes two-block loops only. No program in
+  `tests/run` or `examples` has such a pair; `tests/run/opt5_fuse_multiblock.wk` covers a diamond in
+  either loop and in both, a third loop fusing onto the fused region, a read ahead that must not
+  fuse, and two widened fusions, every element printed for n = 0, 1, 7 and 32.
+- **Unswitching and IV-range splitting past a guarded call (N30).** `unswitch` refused every loop
+  holding a call, so `while i < n { if dbg { print(i); } o[i] = a[i] * 2.0 + 1.0; i = i + 1; }`
+  kept the call -- and with it the dependence verdict "a call may touch any memory" -- in every
+  iteration, and never widened. A loop holding calls is now unswitched or split when the decided
+  condition kills, in one of the two copies, an arm that holds every call: a body block branches on
+  exactly that condition into an arm other than the latch, entered only from that block, which
+  dominates every block with a call. Simplify-cfg deletes the arm from that copy, which then widens;
+  the other copy keeps the calls for exactly the iterations it runs, in order. No call is
+  duplicated, dropped or reordered, and no recognizer-census row moved. An unguarded call, calls on
+  both arms, a call under an `and`/`or` of which the condition is only one operand, and a barrier,
+  atomic, vector-kernel call or frame slot still block the rewrite. In the corpus,
+  `loop_counter_wider_bound.wk` (`if i > 1 { print(..) }` now splits at 2) and
+  `vectorized_edge_values.wk` / `vectorized_mixed_widths.wk` change: there a print loop's slice
+  bounds check has a passing arm that is not the latch (a second checked read follows, or an inlined
+  `code(..)` branches) and that dominates the prints, so the loop splits into a check-free prefix
+  and a tail that fails on its first iteration. Every other program's `-O2` MIR is unchanged.
+  `tests/run/opt5_unswitch_guarded_call.wk` covers an invariant flag and a prefix guard (both now
+  widen), printing every call line and every lane.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

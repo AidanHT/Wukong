@@ -1,0 +1,530 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: 27
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 34
+// EXPECT-OUT: 35
+// EXPECT-OUT: 36
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: 27
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: -99
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: 27
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 34
+// EXPECT-OUT: 35
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+module tests.run.opt5_unswitch_guarded_call
+
+// Unswitching and splitting a loop whose guarded arm holds a CALL (-O2, `wukong_opt::unswitch`).
+// A `print` in the loop keeps the verdict "a call may touch any memory" in every iteration, and
+// with it the whole loop scalar. Two shapes now lose it:
+//   flagged   `if dbg { print(i) }` on a loop-invariant flag: the loop is unswitched on `dbg`, and
+//             the copy where it is false has no call and widens.
+//   prefix    `if i < m { print(i) }`: the loop is split at m, and the `[m, n)` half has no call
+//             and widens.
+// The call is never duplicated: it lives on in exactly one copy, which runs exactly the iterations
+// that make it, in order. `WUKONG_VEC_TRACE=1 wukongc --emit=mir -O2` on this file shows a
+// `vectorize: WIDEN` line for each kernel (and none before this change).
+//
+// Each kernel is kept OUT of line: the kernels and `again` call each other, so the inliner never
+// splices them into `main`, where the `@noalias` destination would lose its promise. `again` hands
+// the kernels fresh buffers rather than their own. n = 37 is nine groups of four and a scalar
+// tail of one.
+//
+// a[j] = j * 0.5 - 9.0, so every written o[i] = a[i] * 2.0 + 1.0 = i - 17 exactly; o starts as
+// -99.0 before every call, and every lane is printed as `o[i] as i64` after the call's own lines.
+// Every expected line is the scalar loop's answer, derived by hand:
+//   flagged(n = 37, dbg)   prints 0..36, then o = -17..19
+//   flagged(n = 37, !dbg)  o = -17..19
+//   flagged(n = 6, dbg)    prints 0..5, then o = -17..-12 and 31 lanes of -99
+//   prefix(37, m = 5)      prints 0..4, then o = -17..19
+//   prefix(37, m = 0)      o = -17..19
+//   prefix(30, m = 50)     prints 0..29 (every iteration), then o = -17..12 and 7 lanes of -99
+//   prefix(37, m = 36)     prints 0..35, then o = -17..19
+//   prefix(37, m = -3)     o = -17..19
+
+@unchecked
+fn flagged(@noalias mut o: []f32, a: []f32, n: i64, dbg: bool, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        if dbg {
+            print(i);
+        }
+        o[i] = a[i] * 2.0 + 1.0;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn prefix(@noalias mut o: []f32, a: []f32, n: i64, m: i64, d: i64) {
+    if d > 0 {
+        again(d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        if i < m {
+            print(i);
+        }
+        o[i] = a[i] * 2.0 + 1.0;
+        i = i + 1;
+    }
+}
+
+fn again(d: i64) {
+    let mut x: []f32 = alloc_f32(1);
+    let mut y: []f32 = alloc_f32(1);
+    flagged(x, y, 0, false, d);
+    prefix(x, y, 0, 0, d);
+    free(x);
+    free(y);
+}
+
+@unchecked
+fn reset(mut o: []f32) {
+    let mut j: i64 = 0;
+    while j < 37 {
+        o[j] = 0.0 - 99.0;
+        j = j + 1;
+    }
+}
+
+@unchecked
+fn show(o: []f32) {
+    let mut j: i64 = 0;
+    while j < 37 {
+        print(o[j] as i64);
+        j = j + 1;
+    }
+}
+
+@unchecked
+fn main() -> i32 {
+    let mut a: []f32 = alloc_f32(37);
+    let mut o: []f32 = alloc_f32(37);
+    let mut j: i64 = 0;
+    while j < 37 {
+        a[j] = (j as f32) * 0.5 - 9.0;
+        j = j + 1;
+    }
+    reset(o);
+    flagged(o, a, 37, true, 0);
+    show(o);
+    reset(o);
+    flagged(o, a, 37, false, 0);
+    show(o);
+    reset(o);
+    flagged(o, a, 6, true, 0);
+    show(o);
+    let ns: [i64; 5] = [37, 37, 30, 37, 37];
+    let ms: [i64; 5] = [5, 0, 50, 36, 0 - 3];
+    for q in 0..5 {
+        reset(o);
+        prefix(o, a, ns[q], ms[q], 0);
+        show(o);
+    }
+    free(a);
+    free(o);
+    return 0;
+}

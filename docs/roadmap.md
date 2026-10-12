@@ -903,11 +903,14 @@ another architecture or OS is not supported. A native-backend failure is a catal
   equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, **loop-invariant code motion**, **MIR loop fusion** of adjacent same-range loops
   after inlining (`-O2`; also at a non-negative read-behind distance, with first-loop live-outs, and
-  over proved-disjoint parameter and `@noalias` slice bases; innermost two-block loops only, so a
-  body that still branches never fuses), **loop unswitching** and
+  over proved-disjoint parameter and `@noalias` slice bases, and over bodies that still branch -- an
+  `if`/`else` of stores, up to 8 blocks -- when that costs no loop the vector body the vectorizer
+  would give it, directly or after a later unswitch or split),
+  **loop unswitching** and
   **induction-variable range splitting** of guarded loop bodies (`-O2`, also past a bounds-check
-  trap or `break`, and on guards derived from the counter -- `i + 1 < n`, the tile edge
-  `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap), and **partial loop unrolling** (4×, with a
+  trap or `break`, on guards derived from the counter -- `i + 1 < n`, the tile edge
+  `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap, and on loops whose calls sit
+  in one guarded arm, `if dbg { print(i) }`, whose call-free copy then widens), and **partial loop unrolling** (4×, with a
   wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
   serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a
   float reduction). Guarded by an `-O0`-vs-`-O{1,2,3}` differential
@@ -1498,6 +1501,25 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   there are no by-reference captures (`&mut` of a capture is `E0304`). An unannotated parameter is
   typed only from the parameter's declared function type, never from the call's other arguments,
   so a closure passed to `fold3<T>`'s `fn(T, T) -> T` needs its parameters annotated (`E0419`).
+
+- **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
+  only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an
+  early `return` or a slice bounds check's trap in either loop keeps the pair apart. A two-block loop
+  fused into a branching one gives up the 4x partial unroll, which takes two-block loops only. Two
+  widenable loops of which either branches fuse only when the fused body still widens, so two
+  `if`/`else` store loops (each if-converted to one store address of its own) stay apart. Two
+  unwidenable loops stay apart when either branches on a condition unswitching may decide later
+  (an invariant flag, or the counter against an invariant, `if i < m`): split alone, its copies
+  may widen, while fused, each would carry the other loop's scalar work. The check is
+  conservative, so such a pair stays apart even when no copy would widen (arms that divide, say),
+  and it gives up the fused store/reload saving there.
+
+- **A call keeps its loop whole unless one guarded arm holds it** (2026-10-12). Unswitching and
+  IV-range splitting clone a loop holding calls only when one arm, which the decided condition kills
+  in one copy, dominates every call. A call every iteration makes, calls on both arms of the
+  branch, or a call under an `and`/`or` of which the condition is only one operand keep the loop in
+  one piece, and the call's "may touch any memory" verdict keeps it scalar. The copy that keeps the
+  calls stays scalar too.
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and
