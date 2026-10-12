@@ -64,7 +64,9 @@
 //! * a moved access against every *unmoved* instruction it moves past (strictly between the first
 //!   moved access and `P`): a store moved past a load or store, or a load moved past a store, must
 //!   be proved disjoint; a call (or vector-kernel call) in between declines unless the moved
-//!   access is to storage no callee can name ([`AliasInfo::is_call_proof`]); a barrier declines;
+//!   access is to storage no callee can name ([`AliasInfo::is_call_proof`]); an `atomic.add`
+//!   declines unless the moved access is call-proof *and* provably not its location; a barrier
+//!   declines;
 //! * the moved accesses among themselves: one vector load at `P` now runs *before* the vector
 //!   store at `P`, so a chunk store that originally preceded a LOAD lane must be proved disjoint
 //!   from it — otherwise the tree may read back what the bundle stores.
@@ -705,6 +707,18 @@ fn legal(
                     return Err("a call between the members may touch a moved access");
                 }
             }
+            // An atomic RMW reads and writes its own location, and other threads may race it: a
+            // moved access must be storage no callee can name (the opaque-effect rule `cse`,
+            // `dse` and `licm` apply to it) AND provably not that location (a `@noalias` slot
+            // is call-proof yet is exactly what `atomic_add(o[0], ..)` targets).
+            Op::AtomicAdd { ptr, .. } => {
+                if passed.any(|m| {
+                    !alias.is_call_proof(m.ptr)
+                        || alias.may_alias_sized(m.ptr, m.bytes, *ptr, u32::MAX)
+                }) {
+                    return Err("an atomic add between the members may touch a moved access");
+                }
+            }
             Op::Barrier => return Err("a barrier between the members"),
             Op::Store { ptr, .. } => {
                 let w = width(&inst.op);
@@ -1069,6 +1083,43 @@ mod tests {
                    o[0] = s * 1.5; o[1] = s * 2.5; sync_block(); o[2] = s * 3.5; o[3] = s * 4.5; } \
                    fn main() -> i32 { return 0; }";
         assert!(!has_vectors(src, "k"), "stores moved across a barrier");
+    }
+
+    /// `atomic_add(o[0], ..)` between the members reads the element the first store wrote. Sinking
+    /// that store to the last member makes the add land on the old value and the vector store then
+    /// overwrite it: `-O0` printed 111, the packed `-O2` 11. `o` is `@noalias`, so the storage is
+    /// call-proof — the call rule alone would have let it through. An add on a different
+    /// promised object is no obstacle once every moved access is call-proof too (the opaque-effect
+    /// rule keeps a load of an unpromised parameter from crossing any atomic).
+    #[test]
+    fn an_atomic_add_between_members_blocks_packing() {
+        let k = "fn k(@noalias mut o: [i32; 4], a: [i32; 4], b: [i32; 4], d: i64) { \
+                   if d > 0 { again(d - 1); return; } \
+                   o[0] = a[0] + b[0]; o[1] = a[1] + b[1]; atomic_add(o[0], 100); \
+                   o[2] = a[2] + b[2]; o[3] = a[3] + b[3]; } \
+                 fn again(d: i64) { let mut i4: [i32; 4] = [0; 4]; let j4: [i32; 4] = [0; 4]; \
+                   k(i4, j4, j4, d); }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            !has_vectors(&shape, "k"),
+            "stores moved past an atomic add of a moved element"
+        );
+        let run = format!(
+            "{k} fn main() -> i32 {{ let ia: [i32; 4] = [1, 2, 3, 4]; \
+             let ib: [i32; 4] = [10, 20, 30, 40]; let mut io: [i32; 4] = [0; 4]; \
+             k(io, ia, ib, 0); let mut j: i64 = 0; \
+             while j < 4 {{ print(io[j]); j = j + 1; }} return 0; }}"
+        );
+        scalar_and_slp_agree(&run, &[]);
+        let elsewhere = "fn k(@noalias mut o: [i32; 4], @noalias mut c: [i32; 4], \
+                         @noalias a: [i32; 4], @noalias b: [i32; 4]) { \
+                         o[0] = a[0] + b[0]; o[1] = a[1] + b[1]; atomic_add(c[0], 100); \
+                         o[2] = a[2] + b[2]; o[3] = a[3] + b[3]; } \
+                         fn main() -> i32 { return 0; }";
+        assert!(
+            has_vectors(elsewhere, "k"),
+            "an atomic add on another object blocked packing"
+        );
     }
 
     /// `+`, `-`, `+`, `-` is not one operation: the root is a BUILD of four scalars with no vector
