@@ -14,6 +14,13 @@
 //!
 //! * [`mir_emission_is_deterministic_across_processes`] — `--emit=mir -O2`, the whole optimizer
 //!   including LICM, the pass whose loop-body iteration order was the one place this actually bit.
+//!   The three processes also run the optimizer on different thread counts
+//!   (`WUKONG_OPT_THREADS=1`, the automatic count, and `4`), so the same sweep is the corpus-wide
+//!   proof that the parallel per-function schedule (`wukong_opt::parallel`) emits the MIR one
+//!   thread does — an explicit count above one sends every batch of two or more functions to the
+//!   pool, however small. The object and `-g` arms vary the count the same way, and
+//!   [`o1_mir_does_not_depend_on_the_optimizer_thread_count`] repeats the comparison at `-O1`,
+//!   where nothing is inlined and the call-graph levels are at their widest.
 //! * [`object_emission_is_deterministic_across_processes`] — `--emit=obj -O2`, i.e. *codegen and
 //!   symbol emission*, which the MIR gate never reaches. The in-process object-byte tests in
 //!   `wukong_codegen_cranelift` compile several times inside ONE process, so all their emissions
@@ -103,11 +110,49 @@ fn emit_mir_o2(path: &Path) -> (bool, Vec<u8>) {
     (out.status.success(), out.stdout)
 }
 
+/// The optimizer thread counts the corpus sweeps rotate through, one per fresh process: the
+/// sequential schedule, the automatic count (`None`: the variable removed), and four threads,
+/// which sends every batch of two or more functions to the pool.
+const OPT_THREADS: [Option<&str>; 3] = [Some("1"), None, Some("4")];
+
+/// Pin `WUKONG_OPT_THREADS` for one child process (`None`: removed, the automatic count).
+fn with_opt_threads(cmd: &mut Command, threads: Option<&str>) {
+    match threads {
+        Some(n) => cmd.env("WUKONG_OPT_THREADS", n),
+        None => cmd.env_remove("WUKONG_OPT_THREADS"),
+    };
+}
+
+/// [`emit_mir_o2`] with the optimizer on `threads` threads (see [`OPT_THREADS`]).
+fn emit_mir_o2_threads(path: &Path, threads: Option<&str>) -> (bool, Vec<u8>) {
+    emit_mir_threads(path, "-O2", threads)
+}
+
+/// `--emit=mir <level>` for one program in a fresh process, the optimizer on `threads` threads.
+fn emit_mir_threads(path: &Path, level: &str, threads: Option<&str>) -> (bool, Vec<u8>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    with_opt_threads(&mut cmd, threads);
+    let out = cmd
+        .arg("--emit=mir")
+        .arg(level)
+        .arg(path)
+        .output()
+        .expect("failed to spawn wukongc");
+    (out.status.success(), out.stdout)
+}
+
 /// `--emit=obj -O2 -o <dst>` for one program in a fresh process; returns the object bytes, or
-/// `None` when the program does not lower (there is then nothing to compare).
-fn emit_obj_o2(path: &Path, dst: &Path, serial_codegen: bool) -> Option<Vec<u8>> {
+/// `None` when the program does not lower (there is then nothing to compare). `threads` is the
+/// optimizer's thread count (see [`OPT_THREADS`]).
+fn emit_obj_o2(
+    path: &Path,
+    dst: &Path,
+    serial_codegen: bool,
+    threads: Option<&str>,
+) -> Option<Vec<u8>> {
     let _ = std::fs::remove_file(dst);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    with_opt_threads(&mut cmd, threads);
     if serial_codegen {
         // The `WUKONG_PAR_CODEGEN=0` kill-switch forces the serial object path, so both codegen
         // paths are covered rather than whichever one the corpus happens to trigger.
@@ -134,7 +179,8 @@ fn emit_obj_o2(path: &Path, dst: &Path, serial_codegen: bool) -> Option<Vec<u8>>
 /// trip gate, and the four optimizer kill-switches gate vectorization, unrolling, the
 /// induction-variable ramp and straight-line SLP (`wukong_opt`). Pure tracing switches
 /// (`WUKONG_VEC_TRACE`, `WUKONG_SLP_TRACE`), the linker
-/// (`WUKONG_BUILD_RUSTC`) and the GPU-only variables are deliberately excluded: they do not alter
+/// (`WUKONG_BUILD_RUSTC`), the optimizer's thread count (`WUKONG_OPT_THREADS`, which the corpus
+/// sweeps vary on purpose) and the GPU-only variables are deliberately excluded: they do not alter
 /// the emitted MIR. A new kill-switch that does must be added here in the same change.
 const MIR_AFFECTING_ENV: &[&str] = &[
     "WUKONG_NO_RECOGNIZE",
@@ -304,14 +350,68 @@ fn representative_grad_emission_is_deterministic_across_processes() {
     }
 }
 
+/// The optimizer's parallel schedule at its widest. `-O1` inlines nothing, so every function the
+/// front end lowered — every helper, monomorph and outlined region — is a task of its call-graph
+/// level, where the `-O2` sweep above mostly sees what inlining left. One thread against four, over
+/// the whole corpus; the programs are spread over a few test threads to keep the arm cheap.
+#[test]
+fn o1_mir_does_not_depend_on_the_optimizer_thread_count() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let programs = collect_programs();
+    let next = AtomicUsize::new(0);
+    let compared = AtomicUsize::new(0);
+    let mismatched = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                while let Some(p) = programs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let (ok, one) = emit_mir_threads(p, "-O1", Some("1"));
+                    if !ok && one.is_empty() {
+                        continue; // does not lower: nothing to compare
+                    }
+                    let (_, four) = emit_mir_threads(p, "-O1", Some("4"));
+                    compared.fetch_add(1, Ordering::Relaxed);
+                    if one != four {
+                        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                        mismatched.lock().unwrap().push(name);
+                    }
+                }
+            });
+        }
+    });
+    let mut mismatched = mismatched.into_inner().unwrap();
+    mismatched.sort();
+    assert!(
+        mismatched.is_empty(),
+        "`--emit=mir -O1` differs between WUKONG_OPT_THREADS=1 and =4 for {} program(s) — a pass \
+         reads state another function's optimization changes, or the parallel schedule hands a \
+         function a different call-effect table than the sequential one:\n{}",
+        mismatched.len(),
+        mismatched.join("\n")
+    );
+    let compared = compared.into_inner();
+    assert!(
+        compared * 10 >= programs.len() * 9,
+        "the -O1 thread-count arm compared only {compared} of {} programs",
+        programs.len()
+    );
+    eprintln!(
+        "-O1 thread-count determinism: compared {compared} of {} programs, 1 vs 4 threads",
+        programs.len()
+    );
+}
+
 #[test]
 fn mir_emission_is_deterministic_across_processes() {
     let programs = collect_programs();
     let mut nondeterministic = Vec::new();
     let mut compared = 0usize;
     for p in &programs {
-        // Three separate processes → three independent hash seeds.
-        let (ok0, r0) = emit_mir_o2(p);
+        // Three separate processes → three independent hash seeds, and three optimizer thread
+        // counts.
+        let (ok0, r0) = emit_mir_o2_threads(p, OPT_THREADS[0]);
         if !ok0 {
             // A program that does not lower (e.g. an intentionally not-yet-supported construct) emits
             // nothing on stdout; skip it — there is no MIR to compare.
@@ -319,8 +419,8 @@ fn mir_emission_is_deterministic_across_processes() {
                 continue;
             }
         }
-        let (_, r1) = emit_mir_o2(p);
-        let (_, r2) = emit_mir_o2(p);
+        let (_, r1) = emit_mir_o2_threads(p, OPT_THREADS[1]);
+        let (_, r2) = emit_mir_o2_threads(p, OPT_THREADS[2]);
         compared += 1;
         if r0 != r1 || r1 != r2 {
             nondeterministic.push(p.file_name().unwrap().to_string_lossy().into_owned());
@@ -329,7 +429,8 @@ fn mir_emission_is_deterministic_across_processes() {
     assert!(
         nondeterministic.is_empty(),
         "`--emit=mir -O2` is nondeterministic across processes for {} program(s) — a HashMap/HashSet \
-         iteration order is leaking into the emitted MIR:\n{}",
+         iteration order is leaking into the emitted MIR, or the optimizer's output depends on its \
+         thread count (the processes ran WUKONG_OPT_THREADS={OPT_THREADS:?}):\n{}",
         nondeterministic.len(),
         nondeterministic.join("\n")
     );
@@ -342,7 +443,8 @@ fn mir_emission_is_deterministic_across_processes() {
         programs.len()
     );
     eprintln!(
-        "mir determinism: compared {compared} of {} programs x3 processes",
+        "mir determinism: compared {compared} of {} programs x3 processes \
+         (WUKONG_OPT_THREADS={OPT_THREADS:?})",
         programs.len()
     );
 }
@@ -378,10 +480,13 @@ fn object_emission_is_deterministic_across_processes() {
         let a = scratch.0.join("a.o");
         let b = scratch.0.join("b.o");
         let c = scratch.0.join("c.o");
-        let Some(o0) = emit_obj_o2(p, &a, false) else {
+        let Some(o0) = emit_obj_o2(p, &a, false, OPT_THREADS[0]) else {
             continue; // does not lower to an object — nothing to compare
         };
-        let (Some(o1), Some(o2)) = (emit_obj_o2(p, &b, false), emit_obj_o2(p, &c, false)) else {
+        let (Some(o1), Some(o2)) = (
+            emit_obj_o2(p, &b, false, OPT_THREADS[1]),
+            emit_obj_o2(p, &c, false, OPT_THREADS[2]),
+        ) else {
             nondeterministic.push(format!("{name}: emitted an object once but not again"));
             continue;
         };
@@ -395,7 +500,10 @@ fn object_emission_is_deterministic_across_processes() {
         if serial_subset.contains(p) {
             let s = scratch.0.join("s.o");
             let t = scratch.0.join("t.o");
-            match (emit_obj_o2(p, &s, true), emit_obj_o2(p, &t, true)) {
+            match (
+                emit_obj_o2(p, &s, true, OPT_THREADS[0]),
+                emit_obj_o2(p, &t, true, OPT_THREADS[2]),
+            ) {
                 (Some(s0), Some(s1)) => {
                     if s0 != s1 {
                         nondeterministic.push(format!(
@@ -415,7 +523,8 @@ fn object_emission_is_deterministic_across_processes() {
     assert!(
         nondeterministic.is_empty(),
         "`--emit=obj -O2` is nondeterministic across processes for {} program(s) — a HashMap/HashSet \
-         iteration order is leaking into codegen or symbol emission:\n{}",
+         iteration order is leaking into codegen or symbol emission, or the optimizer's output \
+         depends on its thread count:\n{}",
         nondeterministic.len(),
         nondeterministic.join("\n")
     );
@@ -441,9 +550,15 @@ fn object_emission_is_deterministic_across_processes() {
 }
 
 /// `--emit=obj -O2 -g -o <dst>` in a fresh process (see [`emit_obj_o2`]).
-fn emit_obj_o2_debug(path: &Path, dst: &Path, serial_codegen: bool) -> Option<Vec<u8>> {
+fn emit_obj_o2_debug(
+    path: &Path,
+    dst: &Path,
+    serial_codegen: bool,
+    threads: Option<&str>,
+) -> Option<Vec<u8>> {
     let _ = std::fs::remove_file(dst);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    with_opt_threads(&mut cmd, threads);
     if serial_codegen {
         cmd.env("WUKONG_PAR_CODEGEN", "0");
     }
@@ -489,12 +604,12 @@ fn debug_object_emission_is_deterministic_across_processes() {
     let mut compared = 0usize;
     for p in &slice {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        let plain = emit_obj_o2(p, &scratch.0.join("plain.o"), false);
+        let plain = emit_obj_o2(p, &scratch.0.join("plain.o"), false, OPT_THREADS[1]);
         let g = [
-            emit_obj_o2_debug(p, &scratch.0.join("a.o"), false),
-            emit_obj_o2_debug(p, &scratch.0.join("b.o"), false),
-            emit_obj_o2_debug(p, &scratch.0.join("c.o"), false),
-            emit_obj_o2_debug(p, &scratch.0.join("s.o"), true),
+            emit_obj_o2_debug(p, &scratch.0.join("a.o"), false, OPT_THREADS[0]),
+            emit_obj_o2_debug(p, &scratch.0.join("b.o"), false, OPT_THREADS[1]),
+            emit_obj_o2_debug(p, &scratch.0.join("c.o"), false, OPT_THREADS[2]),
+            emit_obj_o2_debug(p, &scratch.0.join("s.o"), true, OPT_THREADS[1]),
         ];
         match (plain, &g) {
             (None, [None, None, None, None]) => continue, // does not lower to an object
@@ -519,7 +634,8 @@ fn debug_object_emission_is_deterministic_across_processes() {
     }
     // The import fixture's line table names all three files it reads (DWARF 4 file names are
     // inline strings of `.debug_line`).
-    let multi_g = emit_obj_o2_debug(&multi, &scratch.0.join("m.o"), false).expect("import_multi");
+    let multi_g = emit_obj_o2_debug(&multi, &scratch.0.join("m.o"), false, OPT_THREADS[1])
+        .expect("import_multi");
     for file in ["import_multi.wk", "mathlib.wk", "deep.wk"] {
         assert!(
             multi_g.windows(file.len()).any(|w| w == file.as_bytes()),

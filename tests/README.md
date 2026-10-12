@@ -88,7 +88,8 @@ fixture must be too; `an_imported_files_parser_lint_carries_its_own_path` compil
 `imports/lint_semi_root.wk`.
 
 `crates/wukongc/tests/determinism.rs` — fresh-process byte identity for MIR, object, and diagnostic
-emission.
+emission; the MIR and object sweeps also vary the optimizer's thread count (`WUKONG_OPT_THREADS=1`,
+automatic, `4`), and an `-O1` arm compares 1 against 4 threads over the corpus.
 
 `crates/wukongc/tests/exe.rs` — AOT linked exe matches `--run` on four curated fixtures.
 
