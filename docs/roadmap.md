@@ -1377,11 +1377,17 @@ differences (f32 and f64) in `wukong_driver`'s `region_grad_tests` and `wukong_a
 backends at four thread counts and requires byte-identical weights;
 `tests/run/autodiff_train_parallel_region.wk` is a hand-derived trajectory. **Sharp edges**, each
 refused by name: an iteration with control flow (an inner loop the recognizers did not take, a slice
-index's run-time bounds check, a kernel builtin's overlap guard — so slice-based regions do not
-differentiate yet), a region that reads a buffer it also writes (in place), a buffer the region
-reads (or a kernel in it writes) that the loss writes again after it, a shared buffer of no fixed
-extent, and second order. An `f64` region's buffers must be parameters (the tape keeps local
-gradient buffers in `f32`). The backward's speed is not measured. **Second order**
+index's run-time bounds check, a kernel builtin's overlap guard), a store through a captured slice
+(straight-line under `@unchecked`, but its writes have no gradient the loss can key), a region that
+reads a buffer it also writes (in place, under one name or two: a slice and the array behind it), a
+buffer the region reads (or a kernel in it writes) that the loss writes again after it under any
+name (a store through a slice view, a later region, a kernel output, or a runtime or user call
+handed it, such as `rand_fill_f32` or a file read), a pointer whose target the alias model cannot
+place (a slice whose address escapes, a slice of slices), a written env slot that is a view into
+another buffer, a captured slice whose elements need a gradient, a shared buffer of no fixed extent,
+and second order. A region that reads an integer mask through a slice differentiates. An `f64`
+region's buffers must be parameters (the tape keeps local gradient buffers in `f32`). The
+backward's speed is not measured. **Second order**
 is supported for scalar-path losses: `wukong_autodiff::grad_dot` emits the single-block directional
 derivative `<v, ∇L>` and `hvp` its gradient, the Hessian-vector product; second order through
 recognized tensor kernels, and differentiating the emitted void `*_grad` itself, decline by name.

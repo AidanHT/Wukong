@@ -1985,8 +1985,18 @@ sized from the local array or the parameter's `ParamExtent`), which the loss add
 synthesized loop in chunk order after the call. `K` and the chunk boundaries depend on `N` only, so
 the interpreter (which runs the chunks in order) and the native pool at any width sum every float
 in one order. Recompute is sound only if what the iteration reads is unchanged at the end of the
-forward: `check_no_later_writes` declines a region whose read slots (or kernel-written ones, whose
-rules read the output back) the loss writes again after the call. `build_grad_full` in the driver
+forward and is not what it writes. `check_aliasing` resolves every pointer of the loss to the
+memories it may address (`Mem`: a buffer of its own — parameter, `alloca`, global, `wukong_rt_alloc`
+block — the caller's memory behind a parameter's pointers, or the scratch arena). A pointer loaded
+out of a local that never escapes addresses exactly what the loss stored into it, which is how a
+slice's data pointer resolves to its array. It then declines a region in which one slot writes what
+another reads (a slice and its array included), and a region whose read slots (or kernel-written
+ones, whose rules read the output back) the loss writes again after the call: by a store, a kernel
+output, a later region, or any other call handed the buffer (all of its pointer arguments, and the
+pointers they hold, count as written, except the read-only effect calls). A pointer it cannot place
+is refused on either side. `diff_region` also refuses a written slot whose base is not a parameter
+or an `alloca` of its own: the loss keys gradients by whole buffers, so a view's output adjoint would
+read as dead. `build_grad_full` in the driver
 optimizes the generated functions with the backward, verifies them in the whole program, and hands
 `--emit=grad`, the exported gradient and the training program every function the backward needs
 (the support functions and the outlined bodies the forward names).

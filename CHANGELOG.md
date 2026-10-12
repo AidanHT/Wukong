@@ -106,11 +106,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
   loop the rule takes apart. The forward then runs the `-O1` form of each region body, which computes
   the same bits. `--emit=grad` now also prints the region backward functions and the outlined bodies,
   and `--train` and `--emit=obj --grad-of` carry them.
+- **The recompute's alias facts are checked under every name.** The backward re-reads what the
+  region read, so `scan` resolves each of the loss's pointers to the buffers it may address,
+  following a slice's data pointer to the arrays the loss stored into the slice. A region that reads
+  an integer mask through a slice still differentiates when what changes after it is provably
+  elsewhere.
 - **Refused by name:**
   - an iteration with control flow: an inner loop no recognizer takes, a slice index's bounds check
-    or an overlap guard, so slice-based regions do not differentiate yet;
-  - a region that reads a buffer it also writes;
-  - a buffer the region reads, or a kernel in it writes, that the loss writes again after the loop;
+    or an overlap guard;
+  - a store through a captured slice, which `@unchecked` makes straight-line: its writes have no
+    gradient the loss can key;
+  - a region that reads a buffer it also writes, under one name or two (a slice and the array
+    behind it);
+  - a buffer the region reads, or a kernel in it writes, that the loss writes again after the loop,
+    under any name: a store through a slice view, a kernel output, a later region, or a runtime or
+    user call handed the buffer (`rand_fill_f32` redrawing a dropout mask, a `read_f32`);
+  - a pointer whose target the alias model cannot place (a slice whose address escapes into a call,
+    a slice of slices);
+  - a written env slot that is a view into another buffer, whose output adjoint the loss never keys;
+  - a captured slice whose elements need a gradient;
   - a shared buffer of no fixed extent;
   - second order.
 - `tests/run/autodiff_train_parallel_region.wk` trains through a region whose shared adjoint arrives
@@ -118,9 +132,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `wukong_driver`'s `region_grad_tests` cover elementwise and shared-weight regions, a kernel call in
   a region, a captured scalar, a spliced helper, 37 rows over 16 chunks and an `f64` region, each
   against closed forms and finite differences at `-O0`..`-O3` with and without the implicit grain.
-  They also cover byte-identical interpreter and native training, and the declines.
-  `wukong_autodiff`'s `tests/regions.rs` gates hand-built MIR in `f64`, and `autodiff_cli.rs` trains
-  through a 40-row region on both backends at four thread counts with byte-identical saved weights.
+  They also cover byte-identical interpreter and native training, a slice-mask region, and the
+  declines. `wukong_autodiff`'s `tests/regions.rs` gates hand-built MIR in `f64`, along with the
+  sub-view and escaped-slice declines, and `autodiff_cli.rs` trains through a 40-row region on both
+  backends at four thread counts with byte-identical saved weights.
 - Not measured: the backward's speed.
 
 ### `@parallel` regions over slices, run-time trip counts and kernel builtins (`gap6/outliner-slices-kernels`)

@@ -63,8 +63,11 @@ contribution accumulates; the replay never rewrites a captured buffer) — and t
 `{name}_grad$par<i>(cs, ce, benv)` the gradient hands to `wukong_parallel_for`. A buffer several
 iterations read gets `K = min(N, 16)` private zeroed adjoint copies, added back in chunk order; the
 chunks depend on `N` only, so the gradient's bits do not depend on the thread count or the backend.
-Declines (by name): control flow in the iteration, a region reading what it writes, a captured buffer
-the loss rewrites after the region, a shared buffer of unknown extent, second order.
+Declines (by name): control flow in the iteration, a store through a captured slice, a region reading
+what it writes (under one name or two: a slice and its array), a captured buffer the loss rewrites
+after the region under any name (a slice view, a later region, a kernel, a runtime or user call),
+a pointer the alias model (`check_aliasing`) cannot place, a written slot that is a view into
+another buffer, a shared buffer of unknown extent, second order.
 
 ## LANDMINE — the recognizer ↔ autodiff coupling
 

@@ -2657,8 +2657,12 @@ gradient is bit-identical on the interpreter and the native backend at every `--
 What a region's iteration may do to stay differentiable: scalar arithmetic, element reads and writes
 of captured arrays, and kernel builtins on whole arrays or body-local arrays — straight-line code.
 Refused by name: an iteration with control flow (an inner loop no recognizer takes, a slice index's
-bounds check), a region that reads an array it also writes (`h[i] = h[i] * x[i]`: write the result
-into a separate array), and an array the region reads that the loss changes after the loop.
+bounds check), a store through a slice in the iteration (straight-line under `@unchecked`, but
+refused: write into the array itself), a region that reads an array it also writes, under one name
+or two (`h[i] = h[i] * x[i]`, or through a slice of `h`: write the result into a separate array),
+and an array the region reads that the loss changes after the loop under any name, whether through
+a slice view or by a call such as `rand_fill_f32` or `read_f32` redrawing it. A region may read an
+integer mask through a slice.
 Fixture: `tests/run/autodiff_train_parallel_region.wk`.
 
 ```wukong
