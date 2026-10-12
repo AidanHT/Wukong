@@ -507,6 +507,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         closure_binds: Vec::new(),
         closure_refs: HashMap::default(),
         fn_value_arg: None,
+        range_counters: Vec::new(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -731,6 +732,9 @@ struct Sema<'a> {
     /// argument of a function-typed parameter): the one value position a closure-bound local may
     /// take (`closures.rs`).
     fn_value_arg: Option<NodeId>,
+    /// The `for` range counters in scope whose storage is not their type: `(scope index, name,
+    /// width)`, innermost last (`closures.rs`, [`Sema::enter_range_counter`]).
+    range_counters: Vec<(usize, Symbol, closures::CounterWidth)>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -3511,6 +3515,8 @@ impl<'a> Sema<'a> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                // A closure captures a range counter at the width it is stored at (`closures.rs`).
+                let counter = self.enter_range_counter(pat, iter);
                 // A destructuring head binds each element untested (`patterns.rs`).
                 if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
                     self.check_for_pattern(pat, iter, &elem);
@@ -3527,6 +3533,9 @@ impl<'a> Sema<'a> {
                 self.type_block(body);
                 self.loop_ctx.pop();
                 self.pop_scope();
+                if counter {
+                    self.range_counters.pop();
+                }
             }
         }
     }

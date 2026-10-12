@@ -147,7 +147,10 @@ vector or function-typed parameter cannot be captured (`E0418`). A write to a ca
 `atomic_add`, a `mut self` receiver, an aggregate argument of a `mut` parameter —
 `note_mut_arg_writes`, from the per-function positions `collect_methods` records — or a builtin's
 output operand) makes it a **by-reference** capture of every closure it crosses
-(`ClosureInfo::by_ref`). The **first**
+(`ClosureInfo::by_ref`). A capture is typed at the width its variable is stored at: a `for` range
+counter's type is its start's, but `lower_for` stores it at the wider bound's
+(`range_counter_type`), so `enter_range_counter` records that width per counter scope and the
+capture takes it (a bound of an enclosing generic type, whose width is per instance, is `E0418`). The **first**
 rewrite of `wukong_mir_build::lower_program` (`closures::lift_module`, before the method
 desugaring) lifts each literal, innermost first, to a registered top-level function
 `<fn>$closure$<k>` whose leading parameters are the captures, and replaces the literal by its

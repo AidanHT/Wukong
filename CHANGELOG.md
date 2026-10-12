@@ -28,9 +28,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `argsort_f32(x, idx)` or `sprintf(buf, ..)`) is captured by reference: the lifted function
   receives a pointer to it, and the enclosing function sees every write on interp and native alike;
   the variable's own mutability rules apply (`E0304` for an immutable binding), where every write to
-  a capture used to be `E0304`. A slice, `str`, tensor or vector still cannot be captured (`E0418`,
-  `tests/fail/closure_capture_slice.wk`; `tests/run/closure_captures.wk`,
-  `tests/run/closure_capture_out_params.wk`).
+  a capture used to be `E0304`. A `for` counter is captured at the width it is stored at, the wider
+  of its bounds' integer types, so `for i in 0..n` with `n: i64` gives the closure the 8-byte
+  counter, read or written (a 4-byte capture there was a MIR-verifier ICE by value, and by
+  reference left `4294967294` in the counter natively where the interpreter had `-2`); a bound of an
+  enclosing generic type, whose width each instance decides, makes the counter `E0418`. A slice,
+  `str`, tensor or vector still cannot be captured (`E0418`, `tests/fail/closure_capture_slice.wk`,
+  `tests/fail/closure_capture_generic_counter.wk`; `tests/run/closure_captures.wk`,
+  `tests/run/closure_capture_out_params.wk`, `tests/run/closure_wide_counter.wk`).
 - **Added: closure parameters inferred from the call's other arguments.** When the expected type
   names a callee generic, the other arguments bind it first (non-literals, then literals at their
   default type), so `fold3(|a, b| a * 10 + b, x, y, 3)` with `x: i64` types `a, b: i64` and

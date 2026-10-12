@@ -26,15 +26,18 @@
 //!   writes — assigns, takes `&mut` of, or passes as an aggregate to a `mut` parameter or as a
 //!   builtin's output operand — is captured BY REFERENCE ([`ClosureInfo::by_ref`],
 //!   [`Sema::note_capture_write`]): the closure and the enclosing function share it, and its own
-//!   mutability rules apply (`E0304` for an immutable binding, as outside the closure). A slice, `str`, tensor or vector, the enclosing
-//!   function's function-typed parameter, and a value whose type names an enclosing generic are
-//!   `E0418`, as is any use of an enclosing generic parameter (the lifted function is not generic).
-//!   A closure-bound local is captured through its closure ([`ClosureInfo::bound`]).
+//!   mutability rules apply (`E0304` for an immutable binding, as outside the closure). Either way
+//!   a capture has the type its variable is stored at: a `for` range counter's is its wider bound's
+//!   ([`Sema::enter_range_counter`]). A slice, `str`, tensor or vector, the enclosing function's
+//!   function-typed parameter, a value whose type names an enclosing generic and a range counter
+//!   whose width one decides are `E0418`, as is any use of an enclosing generic parameter (the
+//!   lifted function is not generic). A closure-bound local is captured through its closure
+//!   ([`ClosureInfo::bound`]).
 //! * **Control.** `return` leaves the closure; `break`/`continue` cannot cross it (`E0303`, the
 //!   enclosing loops are hidden while its body is checked). Nested closures are allowed: a name an
 //!   inner closure captures is captured by every closure it crosses.
 
-use wukong_ast::{Expr, ExprKind, NodeId, PatKind, Pattern, Stmt, TypeExpr};
+use wukong_ast::{Expr, ExprKind, ForIter, NodeId, PatKind, Pattern, Stmt, TypeExpr};
 use wukong_diag::Diagnostic;
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Span, Symbol};
 use wukong_types::{Dim, Ty};
@@ -87,6 +90,19 @@ enum NoCopy {
     /// A function-typed parameter: bound at compile time, it has no value to copy.
     FnParam,
     /// Its type names a generic parameter of the enclosing function.
+    Generic,
+    /// A `for` range counter stored at a width a generic of the enclosing function decides.
+    CounterWidth,
+}
+
+/// The storage of a `for` range counter whose type is not its storage (see
+/// [`Sema::enter_range_counter`]).
+#[derive(Clone)]
+pub(crate) enum CounterWidth {
+    /// Stored at this wider integer type, which a capture takes it at.
+    Wide(Ty),
+    /// Stored at a width the enclosing function's generic parameters decide, which a lifted
+    /// (non-generic) closure cannot take it at.
     Generic,
 }
 
@@ -303,6 +319,47 @@ impl Sema<'_> {
                 },
             );
         }
+    }
+
+    /// `for name in start..end` has just bound its counter (in the innermost scope). Its type is
+    /// the start's (`type_for_iter`), but `wukong_mir_build` stores it at the wider of the two
+    /// bounds' integer types (`range_counter_type`), and the loop body sees that wider value. A
+    /// closure capturing it must take it the same way — a copy of the wide value, or a pointer to
+    /// the wide slot — so the width is recorded here for [`Self::note_local_use`]: the wider type,
+    /// or [`CounterWidth::Generic`] when a bound's type names an enclosing generic (its width is
+    /// then decided per instance). Returns whether a record was pushed (popped with the scope).
+    pub(crate) fn enter_range_counter(&mut self, pat: &Pattern, iter: &ForIter) -> bool {
+        let (
+            PatKind::Ident(name),
+            ForIter::Range {
+                start,
+                end: Some(end),
+                ..
+            },
+        ) = (&pat.kind, iter)
+        else {
+            return false;
+        };
+        let (start_ty, end_ty) = (self.types.get(&start.id), self.types.get(&end.id));
+        let width = if [start_ty, end_ty]
+            .into_iter()
+            .flatten()
+            .any(|t| self.mentions_enclosing_generic(t))
+        {
+            CounterWidth::Generic
+        } else {
+            match (start_ty, end_ty) {
+                (Some(Ty::Scalar(s)), Some(Ty::Scalar(e)))
+                    if s.is_int() && e.is_int() && e.size() > s.size() =>
+                {
+                    CounterWidth::Wide(Ty::Scalar(*e))
+                }
+                _ => return false,
+            }
+        };
+        let depth = self.scopes.len().saturating_sub(1);
+        self.range_counters.push((depth, *name, width));
+        true
     }
 
     /// The closure literal the local `name` is bound to, if it is a closure-bound local (resolved
@@ -690,7 +747,19 @@ impl Sema<'_> {
             }
             return;
         }
-        let why = match self.capture_kind(&ty) {
+        // A range counter is captured at the width it is stored at, as the loop body sees it.
+        let counter = self
+            .range_counters
+            .iter()
+            .rev()
+            .find(|(d, n, _)| *d == depth && *n == name)
+            .map(|(_, _, w)| w.clone());
+        let (ty, why) = match counter {
+            Some(CounterWidth::Wide(wide)) => (wide, None),
+            Some(CounterWidth::Generic) => (ty, Some(NoCopy::CounterWidth)),
+            None => (ty, None),
+        };
+        let why = match why.map_or_else(|| self.capture_kind(&ty), Err) {
             Ok(()) => {
                 for i in crossed {
                     let c = &mut self.closure_ctx[i];
@@ -740,6 +809,20 @@ impl Sema<'_> {
                 "pass the function to the callee as a function-typed parameter of its own, or \
                  call it before the closure and capture the result",
             ),
+            NoCopy::CounterWidth => Diagnostic::error(format!(
+                "closure captures the loop counter `{nm}`, whose width depends on a generic \
+                 parameter of the enclosing function"
+            ))
+            .with_code("E0418")
+            .primary(span, "captured here")
+            .note(
+                "a range counter is stored at the wider of its bounds' integer types, and a bound \
+                 here is generic, while a closure is lifted to one non-generic function",
+            )
+            .help(format!(
+                "copy it to a local first (`let k = {nm};`) and capture that, or pass it to the \
+                 closure as an argument"
+            )),
             NoCopy::Generic => Diagnostic::error(format!(
                 "closure captures `{nm}`, whose type `{tys}` names a generic parameter of the \
                  enclosing function"
@@ -1643,6 +1726,57 @@ mod tests {
         assert_eq!(by_ref("print(peek(out));"), Vec::<String>::new());
         assert_eq!(by_ref("print(bump(n));"), Vec::<String>::new());
         assert_eq!(by_ref("print(peek(s.o) + x[0]);"), Vec::<String>::new());
+    }
+
+    /// A `for` counter is stored at the wider of its bounds' integer types, and a closure captures
+    /// it at that width, by value or by reference: `for i in 0..n` with `n: i64` is an `i64`
+    /// capture though `i` is an `i32`. A bound whose type names an enclosing generic leaves the
+    /// width to each instance, which the one lifted function cannot follow: `E0418`.
+    #[test]
+    fn a_range_counter_is_captured_at_its_storage_width() {
+        let each = "fn each(f: fn(i32), n: i32) { for j in 0..n { f(j); } } ";
+        let capture = |bounds: &str, body: &str| -> (Ty, bool) {
+            let got = infos(&format!(
+                "{each} fn main() -> i32 {{ let n: i64 = 3; let m: i8 = 2; let mut t = 0; \
+                 for i in {bounds} {{ each(|j| {{ t += j; {body} }}, 2); }} \
+                 return t + (m as i32) + (n as i32); }}"
+            ));
+            let (names, info) = &got[0];
+            let at = names
+                .iter()
+                .position(|n| n == "i")
+                .expect("`i` is captured");
+            let (sym, ty) = &info.captures[at];
+            (ty.clone(), info.by_ref.contains(sym))
+        };
+        let (i32_, i64_) = (Ty::Scalar(Scalar::I32), Ty::Scalar(Scalar::I64));
+        assert_eq!(capture("0..n", "print(i);"), (i64_.clone(), false));
+        assert_eq!(capture("0..n", "i = -2;"), (i64_.clone(), true));
+        assert_eq!(capture("0..3", "print(i);"), (i32_.clone(), false));
+        // The start's type is the counter's when it is the wider one.
+        assert_eq!(capture("n..10", "print(i);"), (i64_, false));
+        assert_eq!(capture("m..10", "print(i);"), (i32_, false));
+        // A nested closure takes the same width.
+        let got = infos(&format!(
+            "{each} fn main() -> i32 {{ let n: i64 = 3; for i in 0..n {{ \
+             each(|_j| {{ each(|_k| {{ print(i); }}, 1); }}, 1); }} return 0; }}"
+        ));
+        assert!(got
+            .iter()
+            .all(|(_, c)| c.captures[0].1 == Ty::Scalar(Scalar::I64)));
+        // An end bound of an enclosing generic type.
+        let generic = |body: &str| {
+            error_codes(&format!(
+                "{each} fn g<T>(n: T) -> i32 {{ let mut t = 0; \
+                 for i in 0..n {{ {body} }} return t; }} \
+                 fn main() -> i32 {{ let n: i64 = 3; return g(n); }}"
+            ))
+        };
+        assert_eq!(generic("each(|j| { t += i + j; }, 2);"), vec!["E0418"]);
+        assert_eq!(
+            generic("let k = i; each(|j| { t += k + j; }, 2);"),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]

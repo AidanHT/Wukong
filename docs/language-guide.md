@@ -230,8 +230,11 @@ fn main() -> i32 {
   of storage its copy would not carry), a tensor or vector, the enclosing function's function-typed
   parameter, and anything naming one of its generic parameters cannot be captured (`E0418`):
   capture a pointer instead (`let ps = &s;`, then `(*ps)[i]`), and bind a generic dimension to a
-  local first (`let n = N;`). A closure-bound local is captured through its closure: the inner
-  closure receives what the outer one captured.
+  local first (`let n = N;`). A `for` counter is captured at the width it is stored at, the wider
+  of its bounds' integer types (`for i in 0..n` with `n: i64` stores `i` in 8 bytes, and the
+  closure reads and writes all of them), so a bound of a generic type, whose width each instance
+  decides, makes the counter `E0418` too: copy it to a local first (`let k = i;`). A closure-bound
+  local is captured through its closure: the inner closure receives what the outer one captured.
 - **Control flow.** `return` returns from the closure; `break`/`continue` cannot cross it (`E0303`).
   Closures nest, and a name an inner closure captures is captured by every closure around it.
 - **Attributes.** A closure body is code of the function it is written in, so that function's
@@ -242,7 +245,7 @@ It costs nothing at run time: the closure is lifted to a function whose leading 
 captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
 function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
 direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
-`tests/run/{closures,closure_let,closure_method,closure_captures,closure_capture_out_params,closure_infer}.wk`.
+`tests/run/{closures,closure_let,closure_method,closure_captures,closure_capture_out_params,closure_wide_counter,closure_infer}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅
 

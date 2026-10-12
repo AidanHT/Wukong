@@ -42,7 +42,9 @@
 //! closure value is evaluated (`capture_value`; a `let`'s hidden local already is one). One the
 //! closure writes (`ClosureInfo::by_ref`) is the element `&mut c`: the lifted function's parameter
 //! is a `*mut T`, and `lower_fn` binds the name to the storage it points at (`bind_by_ref`), so the
-//! body reads and writes the enclosing variable itself.
+//! body reads and writes the enclosing variable itself. A capture's type is the width the variable
+//! is stored at, which for a `for` range counter is its wider bound's type rather than its own
+//! (`lower_for`'s `range_counter_type`; sema records it), so a copy and a pointer both match the slot.
 //!
 //! What closures add to lowering is the **environment ABI**:
 //!
@@ -764,7 +766,9 @@ impl<'a> FnLowerer<'a> {
     /// array, tuple, struct or data-carrying enum) is a base pointer, so its copy is a fresh buffer
     /// holding its contents: the closure must not see a later write to the original. A hidden
     /// `$cap$` local of a `let`-bound closure already is such a copy, made at the `let`, and nothing
-    /// writes it.
+    /// writes it. A scalar is passed as loaded: its capture type is the width it is stored at, which
+    /// for a `for` range counter is the wider bound's type, not the counter's own (sema's
+    /// `enter_range_counter`), so the value and the environment parameter agree.
     fn capture_value(&mut self, c: &Expr, ty: &Ty) -> ValueId {
         let v = self.lower_expr(c);
         let mty = self.mir_ty_of(ty);
