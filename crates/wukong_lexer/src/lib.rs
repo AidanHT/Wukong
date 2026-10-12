@@ -39,6 +39,31 @@ pub fn tokenize_with_comments(
     (tokens, comments, lx.diags)
 }
 
+/// The comments in `src[lo..hi]`, which must be a run of trivia — what the scan skips between two
+/// tokens of `src` (or before the first, or after the last). This is how the parser finds the doc
+/// comments before an item without a second token stream: it rescans only the gaps between its
+/// tokens, with the very scan [`tokenize`] used, so a `///` inside a string literal or a block
+/// comment is never mistaken for one. The spans are positions in `src`. Diagnostics the rescan
+/// would repeat (an unterminated block comment) are dropped: the first scan reported them.
+pub fn trivia_comments(src: &str, source: SourceId, lo: usize, hi: usize) -> Vec<Comment> {
+    let hi = hi.min(src.len());
+    let mut lx = Lexer::new(src, source, Some(Vec::new()));
+    lx.pos = lo.max(lx.pos);
+    while lx.pos < hi {
+        let before = lx.pos;
+        lx.skip_trivia();
+        if lx.pos == before {
+            // Not whitespace or a comment: confusable whitespace the first scan reported and
+            // skipped (`E0105`). Step over the whole character and keep going.
+            let c = lx.bytes[lx.pos];
+            for _ in 0..utf8_len(c) {
+                lx.bump();
+            }
+        }
+    }
+    lx.comments.take().unwrap_or_default()
+}
+
 /// Which spelling a [`Comment`] used.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommentKind {
@@ -793,6 +818,30 @@ mod tests {
         // An unterminated block comment runs to end of file.
         let (_, cs, _) = tokenize_with_comments("a /* open", SourceId(0));
         assert_eq!((cs[0].span.lo, cs[0].span.hi), (2, 9));
+    }
+
+    /// Rescanning every gap between tokens finds exactly the comments the full scan collected,
+    /// in order, with the same spans: a `///` inside a string or a block comment is not one, and
+    /// confusable whitespace in a gap is stepped over.
+    #[test]
+    fn trivia_comments_match_the_full_scan() {
+        let inputs = [
+            "/// doc\nfn f() { let s = \"/// no\"; /* /// no */ } // tail\n//! end",
+            "\u{FEFF}//! top\r\nfn g() {}\r\n",
+            "a\u{00A0}/// after nbsp\nb",
+            "x /* open /// still",
+            "",
+        ];
+        for src in inputs {
+            let (toks, want, _) = tokenize_with_comments(src, SourceId(2));
+            let mut got = Vec::new();
+            let mut prev = 0usize;
+            for t in &toks {
+                got.extend(trivia_comments(src, SourceId(2), prev, t.span.lo as usize));
+                prev = t.span.hi as usize;
+            }
+            assert_eq!(got, want, "{src:?}");
+        }
     }
 
     #[test]

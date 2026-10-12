@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0210
+// EXPECT-COUNT: 1
+module tests.fail.doc_comment_documents_nothing
+
+/// A doc comment documents the item, field, variant or method after it. Statements take none, so
+/// the one inside the body below documents nothing and is an error, not a comment silently lost.
+fn main() -> i32 {
+    let x: i32 = 1;
+    /// The answer.
+    //~^ E0210
+    return x;
+}

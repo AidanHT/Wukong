@@ -14,6 +14,7 @@ use wukong_span::{Interner, SourceId, Span, Symbol};
 
 use TokenKind as T;
 
+mod docs;
 mod items;
 pub use items::{
     parse_module, parse_module_tokens, parse_module_tokens_from, parse_module_tokens_with_lints,
@@ -73,6 +74,7 @@ pub fn parse_stmts_tokens_with_lints(
     let mut p = Parser::new(tokens, src, interner);
     p.next_node = first_node_id;
     let block = p.stmts_to_eof();
+    p.report_stray_docs();
     StmtsOutput {
         block,
         diags: std::mem::take(&mut p.diags),
@@ -124,6 +126,9 @@ pub(crate) struct Parser<'a> {
     /// A `>>` closed an inner type-argument list and the outer one's `>` with it: the outer list
     /// has been closed already (`Box<Mat<2>>`).
     split_gt: bool,
+    /// Every doc comment of the source, in order, with the token it precedes and whether a
+    /// construct has claimed it (see `docs.rs`).
+    doc_slots: Vec<docs::DocSlot>,
 }
 
 impl<'a> Parser<'a> {
@@ -144,6 +149,7 @@ impl<'a> Parser<'a> {
             delims: Vec::new(),
             expected: Vec::new(),
             lints: Vec::new(),
+            doc_slots: docs::scan(tokens, src),
         }
     }
 

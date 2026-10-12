@@ -176,6 +176,20 @@ static CATALOG: &[Explanation] = &[
          instance by introducing intermediate `let` bindings."
     ),
     entry!(
+        "E0210",
+        "doc comment documents nothing",
+        "A doc comment is attached to what follows it, and this one has nothing to attach to. A \
+         `///` comment documents the item, struct field, enum variant, trait or `impl` method, or \
+         `extern` declaration written after it (attributes and `pub` may come between); a `//!` \
+         comment documents the file and must come before its first item (after the `module` \
+         header, if there is one). Here it is followed by a `}` or the end of the file, or sits \
+         before a statement or inside an expression, or is a `//!` after an item. Doc comments \
+         are what `--emit=doc` publishes and `--doctest` runs, so one that documents nothing is \
+         an error rather than silently lost (rustc's E0585). Write `//` for a plain comment, or \
+         move the comment onto the item it describes. One error is reported per run of \
+         consecutive doc lines, and none when the file already has a syntax error."
+    ),
+    entry!(
         "E0300",
         "duplicate definition",
         "A name was defined more than once in the same scope. Rename one of the definitions. The \
@@ -1273,7 +1287,7 @@ fn main() -> i32 {
          The parse is the same either way, but an optional terminator is what lets a `(`, `[` or \
          `-` on the next line silently continue the statement (see W0031), so write the `;`. Not \
          reported for a statement that already has a parse error, or that a rejected character cut \
-         short. Reserved: E0210, should a missing `;` ever become an error."
+         short."
     ),
     entry!(
         "W0031",
