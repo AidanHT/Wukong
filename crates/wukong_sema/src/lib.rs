@@ -330,9 +330,16 @@ pub struct SemaResult {
     /// nothing may also be used as a function value; its uses are recorded the same way.
     pub closure_refs: HashMap<NodeId, NodeId>,
     /// Every single-name `Path` that reads a LOCAL of function type (a run-time function value, or
-    /// a function-typed parameter) — never a top-level function of the same name. `wukong_mir_build`
-    /// tells a run-time value passed to a function-typed parameter from a named function by it.
+    /// a function-typed parameter), as a value or as the callee of a call `f(..)` — never a
+    /// top-level function of the same name. `wukong_mir_build` tells a run-time value passed to a
+    /// function-typed parameter from a named function by it.
     pub fn_value_locals: HashSet<NodeId>,
+    /// The reads in [`Self::fn_value_locals`] whose local is NOT a parameter (of the function or of
+    /// a closure): a `let`, a pattern or a `for` binding, or a closure's capture of one. Such a
+    /// local always holds a run-time function value, even where it shadows a function-typed
+    /// parameter that an instance binds at compile time (`let f = cube;` in `fn outer(f: fn(i32)
+    /// -> i32)`): `wukong_mir_build` never resolves one through the instance's binding.
+    pub fn_value_lets: HashSet<NodeId>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -532,6 +539,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         range_counters: Vec::new(),
         negated_literal: None,
         fn_value_locals: HashSet::default(),
+        fn_value_lets: HashSet::default(),
         bodyless_fns: HashSet::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
@@ -597,6 +605,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         closures: s.closures,
         closure_refs: s.closure_refs,
         fn_value_locals: s.fn_value_locals,
+        fn_value_lets: s.fn_value_lets,
     };
     // `str` does not leave sema: every published type is erased to its `[]u8` layout (`strs.rs`).
     strs::erase_published(&mut result);
@@ -779,6 +788,8 @@ struct Sema<'a> {
     negated_literal: Option<NodeId>,
     /// Published as [`SemaResult::fn_value_locals`].
     fn_value_locals: HashSet<NodeId>,
+    /// Published as [`SemaResult::fn_value_lets`].
+    fn_value_lets: HashSet<NodeId>,
     /// The functions declared without a body (`extern` ones): no Wukong address (`E0429`).
     bodyless_fns: HashSet<Symbol>,
 }

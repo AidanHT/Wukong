@@ -187,8 +187,14 @@ exception, by choice: a function type is an ordinary value type (`Ty::Fn` lays o
 a closure literal in any other value position is typed by `type_closure_value` (one that captures is
 `E0427`), and a closure-bound local whose closure captures nothing may be used as a value (its
 `closure_refs` entry rewrites to the bare `L`). Sema publishes `SemaResult::fn_value_locals`, the
-`Path`s that read a *local* of function type, so lowering never mistakes a run-time value for the
-top-level function of the same name. Lowering a function's name as a value is `func_addr`
+`Path`s that read a *local* of function type (as a value or as a callee), so lowering never
+mistakes a run-time value for the top-level function of the same name, and its subset
+`SemaResult::fn_value_lets`, the reads whose local is not a parameter (a `let`, pattern or `for`
+binding: the scope it lives in is neither the function's outermost one nor a closure's parameter
+scope, `Sema::is_param_binding`). `methods::fn_value_of`, the instance collector's `handle_call`,
+`note_fn_value` and its static-argument filter consult that set *before* the instance's binding of
+a function-typed parameter (`bound_fn`), because a `let` may shadow the parameter: by name alone,
+`let f = cube;` in `outer$sq` read as `sq`. Lowering a function's name as a value is `func_addr`
 (`lower_fn_value`; for a function with function-typed parameters, the address of the instance that
 takes them all at run time, `methods::dynamic_subst`), and a call through anything of function type
 that is not a statically bound parameter is `Op::CallIndirect` (`lower_indirect_call`, with the

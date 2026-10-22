@@ -819,15 +819,15 @@ impl Sema<'_> {
     }
 
     /// A use of the name `name` (of type `t`) as the value `e`, at `span`. A local holding a
-    /// function value is recorded for `wukong_mir_build` ([`crate::SemaResult::fn_value_locals`]);
-    /// a top-level function is checked to have one address ([`Self::reject_fn_item_value`]).
+    /// function value is recorded for `wukong_mir_build` ([`Self::note_fn_local_read`]); a
+    /// top-level function is checked to have one address ([`Self::reject_fn_item_value`]).
     /// Returns the use's type.
     pub(crate) fn fn_value_use(&mut self, e: &Expr, name: Symbol, span: Span, t: Ty) -> Ty {
         if !matches!(t, Ty::Fn { .. }) {
             return t;
         }
         if self.lookup_local(name).is_some() {
-            self.fn_value_locals.insert(e.id);
+            self.note_fn_local_read(e, name);
             return t;
         }
         if !self.in_fn_body && self.reject_fn_value_outside_body(name, span) {
@@ -871,6 +871,27 @@ impl Sema<'_> {
             );
         }
         true
+    }
+
+    /// The single-name path `e` reads the local `name` of function type, as a value or as a
+    /// callee: recorded in [`crate::SemaResult::fn_value_locals`], and in
+    /// [`crate::SemaResult::fn_value_lets`] too unless the local is a parameter.
+    pub(crate) fn note_fn_local_read(&mut self, e: &Expr, name: Symbol) {
+        self.fn_value_locals.insert(e.id);
+        if !self.is_param_binding(name) {
+            self.fn_value_lets.insert(e.id);
+        }
+    }
+
+    /// Whether the local `name` resolves (innermost scope first) to a parameter: of the function
+    /// being checked (bound in the outermost scope, `check_fn_pass`) or of a closure being checked
+    /// (bound in the scope at its context's `base`, [`Self::type_closure`]). Every other local —
+    /// a `let`, a pattern or a `for` binding — lives in a scope a block or an arm pushed.
+    pub(crate) fn is_param_binding(&self, name: Symbol) -> bool {
+        match self.lookup_local_depth(name) {
+            Some((depth, _)) => depth == 0 || self.closure_ctx.iter().any(|c| c.base == depth),
+            None => false,
+        }
     }
 
     /// A top-level function `name` used as a run-time function value at `span`: a generic one has

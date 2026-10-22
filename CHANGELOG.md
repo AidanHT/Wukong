@@ -63,6 +63,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   struct fields, `if`/`match`/`break` merges and call arguments — and an aggregate of functions
   against one of anything else (`ops = [1, 2]` for an array of functions).
   `tests/fail/fn_value_array_signatures.wk`.
+- **Fixed: a `let` shadowing a function-typed parameter was taken for the parameter.**
+  Passed on to another function-typed parameter in the instance specialized for the parameter's
+  function, `let f = cube;` in `fn outer(f: fn(i32) -> i32)` called `apply_twice` specialized for
+  the *parameter's* function: `outer(sq, 2)` printed 16, not `cube(cube(2))` = 512, on both
+  backends. Sema now publishes which reads of a function-typed local are not parameters
+  (`SemaResult::fn_value_lets`: `let`, pattern and `for` bindings, and captures of them), and
+  lowering and the instance collector never resolve one through the instance's binding. A shadowed
+  callee also no longer registers an instance of the parameter's function, or keeps an argument
+  from being noted as a value (`forward` in `tests/run/fn_values_shadowing.wk` called a function
+  that was never compiled).
 - **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
   lowered again at each use, so a function named there escaped the whole-program analyses (a
   recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the

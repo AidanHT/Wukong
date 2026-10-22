@@ -151,10 +151,17 @@ pub(crate) fn fn_value_of(
     sema: &SemaResult,
     interner: &Interner,
 ) -> Option<Symbol> {
-    let ExprKind::Path(p) = &crate::closures::closure_code(arg).kind else {
+    let code = crate::closures::closure_code(arg);
+    let ExprKind::Path(p) = &code.kind else {
         return None;
     };
     if !p.is_single() {
+        return None;
+    }
+    // A `let`, pattern or `for` binding holds a run-time function value — even where it shadows a
+    // function-typed parameter this instance binds at compile time (`let f = cube;` in
+    // `outer$sq`), so the parameter's binding must not be asked first.
+    if sema.fn_value_lets.contains(&code.id) {
         return None;
     }
     let name = p.first().sym;
@@ -162,10 +169,7 @@ pub(crate) fn fn_value_of(
         return Some(f);
     }
     // A local holding a run-time function value — even one named like a top-level function.
-    if sema
-        .fn_value_locals
-        .contains(&crate::closures::closure_code(arg).id)
-    {
+    if sema.fn_value_locals.contains(&code.id) {
         return None;
     }
     matches!(
@@ -938,6 +942,30 @@ mod tests {
         );
         assert!(dynamic.contains("call_indirect"), "{dynamic}");
         assert!(body(&funcs, "apply$square").contains("call square("));
+    }
+
+    /// A `let` shadowing a function-typed parameter holds a run-time value in every instance,
+    /// including the one specialized for the parameter's function: passed on, it is a pointer.
+    #[test]
+    fn a_let_shadowing_a_bound_parameter_is_a_run_time_value() {
+        let funcs = lower(
+            "fn sq(x: i32) -> i32 { return x * x; } \
+             fn cube(x: i32) -> i32 { return x * x * x; } \
+             fn apply_twice(f: fn(i32) -> i32, x: i32) -> i32 { return f(f(x)); } \
+             fn outer(f: fn(i32) -> i32, x: i32) -> i32 { \
+                 let f: fn(i32) -> i32 = cube; return apply_twice(f, x); } \
+             fn main() -> i32 { return outer(sq, 2); }",
+        );
+        let outer = body(&funcs, "outer$sq");
+        assert!(outer.contains("func_addr cube"), "{outer}");
+        assert!(
+            outer.contains("call apply_twice$fn1$i32$to$i32("),
+            "{outer}"
+        );
+        assert!(
+            !funcs.iter().any(|(n, _)| n == "apply_twice$sq"),
+            "{funcs:?}"
+        );
     }
 
     /// The address of a function with a function-typed parameter is its instance taking that

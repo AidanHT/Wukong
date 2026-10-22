@@ -489,9 +489,18 @@ impl MonoCollector<'_> {
         if !p.is_single() {
             return;
         }
-        // A call through a function-typed parameter is a call of the function this instance binds.
-        let name =
-            methods::bound_fn(p.first().sym, outer, self.interner).unwrap_or_else(|| p.first().sym);
+        // A call through a `let`-bound function value (even one shadowing a function-typed
+        // parameter) is a call through a pointer: no instance to register.
+        if self.sema.fn_value_lets.contains(&callee.id) {
+            return;
+        }
+        // A call through a function-typed parameter is a call of the function this instance binds
+        // — and one bound to a run-time value is a call through a pointer.
+        let name = match methods::bound_fn(p.first().sym, outer, self.interner) {
+            Some(f) => f,
+            None if self.sema.fn_value_locals.contains(&callee.id) => return,
+            None => p.first().sym,
+        };
         self.handle_named_call(name, args, outer);
     }
 
@@ -562,6 +571,10 @@ impl MonoCollector<'_> {
     /// parameters (directly, or through this instance's binding of one), the function's address is
     /// the instance that takes every such parameter at run time (`methods::dynamic_subst`).
     fn note_fn_value(&mut self, e: &Expr, sym: Symbol, subst: &HashMap<Symbol, Ty>) {
+        // A `let`-bound local holds a run-time value, even where it shadows a parameter.
+        if self.sema.fn_value_lets.contains(&e.id) {
+            return;
+        }
         let target = match methods::bound_fn(sym, subst, self.interner) {
             Some(f) => f,
             None if self.sema.fn_value_locals.contains(&e.id) => return,
@@ -685,10 +698,16 @@ impl MonoCollector<'_> {
                 let dispatched = methods::dispatch_in_instance(e, callee, args, subst, self.sema);
                 let statics = match (&dispatched, &callee.kind) {
                     (Some((target, full)), _) => self.static_fn_args(*target, full, subst),
+                    // A call through a run-time function value specializes nothing.
+                    (None, ExprKind::Path(_)) if self.sema.fn_value_lets.contains(&callee.id) => {
+                        Vec::new()
+                    }
                     (None, ExprKind::Path(p)) if p.is_single() => {
-                        let n = methods::bound_fn(p.first().sym, subst, self.interner)
-                            .unwrap_or_else(|| p.first().sym);
-                        self.static_fn_args(n, args, subst)
+                        match methods::bound_fn(p.first().sym, subst, self.interner) {
+                            Some(n) => self.static_fn_args(n, args, subst),
+                            None if self.sema.fn_value_locals.contains(&callee.id) => Vec::new(),
+                            None => self.static_fn_args(p.first().sym, args, subst),
+                        }
                     }
                     _ => Vec::new(),
                 };

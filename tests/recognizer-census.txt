@@ -191,6 +191,7 @@ fn_params.wk:
 fn_values.wk:
 fn_values_devirt.wk:
 fn_values_dispatch.wk:
+fn_values_shadowing.wk:
 for_array.wk:
 for_continue.wk:
 for_destructure.wk:

@@ -223,7 +223,9 @@ fn main() -> i32 {
   so is giving one where a number, pointer or aggregate is expected — inside an aggregate too, so
   an array literal mixing signatures (`[inc, add]`), or an array, tuple or struct of functions of
   another signature given for one, is `E0401` as well. A local of function type cannot be named
-  after a builtin (`E0411`).
+  after a builtin (`E0411`). A `let` (or a pattern or `for` binding) that shadows a function-typed
+  parameter is a value of its own, even in the instance specialized for the function the
+  parameter is bound to.
 - **What it costs.** A call through a value is one indirect call (`call_indirect` in
   `--emit=mir`). Where the optimizer can see which function a value holds — a `let` of a named
   function, a value passed into a function it inlined — the call becomes a direct call again
@@ -231,7 +233,7 @@ fn main() -> i32 {
   `--backend=gpu-native` (the function is declined, an `UNSUPPORTED` skip) and automatic
   differentiation of a loss that calls through one (refused by name) are not supported.
 
-`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt}.wk`.
+`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt,fn_values_shadowing}.wk`.
 
 ### Closures ✅
 

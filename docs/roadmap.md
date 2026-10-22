@@ -127,7 +127,8 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   for comparing two, `E0429` for a generic or `extern` one; `E0411` is now only an `extern`
   signature, a `mut` or builtin-named function-typed parameter or local, and a closure or function
   value outside a function body (a `const` cannot hold one). Function types inside aggregates are
-  compared (`[inc, add]` is `E0401`).
+  compared (`[inc, add]` is `E0401`); a `let` shadowing a function-typed parameter is a run-time
+  value of its own (`tests/run/fn_values_shadowing.wk`).
   Every optimizer pass asks one exhaustive effect classification
   (`wukong_mir::Effects`) instead of its own opcode list, and a call whose callee is a visible
   `func_addr` is devirtualized (`-O1`, then inlined at `-O2`) — a program step between pipeline

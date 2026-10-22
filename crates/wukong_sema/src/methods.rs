@@ -690,8 +690,8 @@ impl Sema<'_> {
         }
     }
 
-    /// A call `f(..)` where `f` is a local of function type — a function-typed parameter. `None`
-    /// when `name` is not one.
+    /// A call `f(..)` where `f` is a local of function type — a function-typed parameter, a local
+    /// holding a run-time function value, or a closure-bound local. `None` when `name` is not one.
     pub(crate) fn type_fn_param_call(
         &mut self,
         name: Symbol,
@@ -708,6 +708,7 @@ impl Sema<'_> {
         // (a closure-bound local can: `closures.rs`).
         self.note_local_use(name, callee.span);
         self.note_closure_call(name, callee);
+        self.note_fn_local_read(callee, name);
         self.types.insert(
             callee.id,
             Ty::Fn {
@@ -1538,6 +1539,38 @@ mod tests {
         ] {
             assert_eq!(codes(&bad), vec!["E0411"], "{bad}");
         }
+    }
+
+    /// Which reads of a function-typed local are not parameters: a `let`, a `for` binding and a
+    /// capture of one are; the function's own parameter and a closure's parameter are not.
+    #[test]
+    fn reads_of_let_bound_function_values_are_published() {
+        let src = format!(
+            "{APPLY} fn with_sq(h: fn(fn(f32) -> f32, f32) -> f32) -> f32 {{ \
+                 return h(square, 1.0); }} \
+             fn outer(f: fn(f32) -> f32, x: f32) -> f32 {{ \
+                 let a = apply(f, x); \
+                 let f: fn(f32) -> f32 = square; \
+                 let fs: [fn(f32) -> f32; 1] = [square]; \
+                 let mut t = a + apply(f, x); \
+                 for h in fs {{ t = t + apply(h, x); }} \
+                 return t + apply(|y: f32| f(y), x) \
+                     + with_sq(|g: fn(f32) -> f32, y: f32| g(y)); }} \
+             fn main() -> i32 {{ return outer(square, 1.0) as i32; }}"
+        );
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = crate::check(&module, &interner);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // Seven reads of a function-typed local: `f` called in `apply` and `h` in `with_sq` (their
+        // parameters), `f` in the first `apply(f, x)` (`outer`'s parameter), `f` after the `let`,
+        // `h` the `for` binding, `f` called in a closure (a capture of the `let`), and `g` called
+        // in a closure (that closure's own parameter). The `let`, `for` and captured reads are the
+        // three "let" reads.
+        let (locals, lets) = (&res.fn_value_locals, &res.fn_value_lets);
+        assert!(lets.is_subset(locals), "{locals:?} / {lets:?}");
+        assert_eq!((locals.len(), lets.len()), (7, 3), "{locals:?} / {lets:?}");
     }
 
     #[test]
