@@ -83,6 +83,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`with(|a, y| a(|x| x + k, y), 5)`) got the instance taking `a` at run time instead of the one
   specialized for `apply`. The collector now skips the environment, binding a captured function
   value as the run-time value it always is. `tests/run/fn_values_captured.wk`.
+- **Fixed: a closure that captures, given to a call through a function value, compiled into a
+  jump through stack memory.** Its argument was typed like one of a call to a named function
+  (captures allowed), but an indirect call specializes nothing, and the closure value
+  `(L, captures..)` was lowered as an uninitialized 8-byte buffer whose address was passed as the
+  function: `let g = apply; g(|x| x + k, 3)` crashed natively and failed on the interpreter
+  ("indirect call through a pointer that is not a function address"), and so did the instance of
+  `fn run(g: fn(fn(i32) -> i32, i32) -> i32, k: i32) { g(|x| x + k, 3) }` that receives `g` at run
+  time. Both are `E0427` now — from sema when the callee is a `let`-bound local (a closure-bound
+  local that captures included), from lowering in such an instance; a closure that captures
+  nothing still works. `tests/fail/{closure_indirect_call_captures,closure_dynamic_call_captures}.wk`.
 - **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
   lowered again at each use, so a function named there escaped the whole-program analyses (a
   recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the

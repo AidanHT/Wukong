@@ -1762,7 +1762,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   at compile time — called through its `let`, or passed directly to a function-typed parameter —
   and cannot be returned, stored, reassigned or used as an operand (`E0421`/`E0422`/`E0427`; there
   is no heap environment). A function-typed parameter bound to such a closure cannot be used as a
-  value inside the callee either (`E0427` from lowering). A closure argument of a call through a
+  value inside the callee either (`E0427` from lowering), and such a closure cannot be given to a
+  call through a function value — a `let` of function type, or a function-typed parameter in the
+  instance that receives it at run time (`E0427`, from sema and from lowering respectively), since
+  nothing is specialized for what an indirect call receives. A closure argument of a call through a
   trait bound is not supported (a trait method cannot declare a function-typed parameter). A
   tensor or vector cannot be captured (`E0418`; read the element first, or capture a pointer — a
   slice or `str` is captured as its fat pointer since `gap7/fn-values`), nor the enclosing

@@ -209,7 +209,10 @@ fn main() -> i32 {
   or an element), or a closure-bound local whose closure captures nothing. A closure that
   captures is not a value — the value is only a code address, with no room for what the closure
   captured (`E0427`; such a closure can still be called through its `let` and passed directly to
-  a function-typed parameter); neither is a generic function, nor one with a tensor parameter of
+  a function-typed parameter). That includes a closure given to a call through a function value
+  (`g(|x| x + k, 3)` with `g` a `let`, or a function-typed parameter bound to a run-time value in
+  the instance that calls it): nothing is specialized for what such a call receives, so the
+  closure is passed as a value. Neither is a generic function, nor one with a tensor parameter of
   run-time extent (`?`), nor an `extern` one (`E0429`). A function that itself takes
   function-typed parameters is a value too: its address is the instance that takes each of them
   at run time. A value is made in a function body: a `const` cannot hold one (`E0411`), because a
@@ -256,7 +259,9 @@ fn main() -> i32 {
 
 - **Where.** As an argument of a function-typed parameter — of a call to a function, a method
   (`v.map(|a| a * k)`, `V::make(|i| ..)`), a function-typed parameter or a closure-bound local — or
-  as the initializer of a `let`. A **closure-bound local** (`let f = |x: f32| x * k;`) can be called
+  as the initializer of a `let`. Given to a call through a function value instead (a `let` of
+  function type, a field, an element, or a function-typed parameter bound to a run-time value), a
+  closure is a function value, so it must capture nothing (`E0427`). A **closure-bound local** (`let f = |x: f32| x * k;`) can be called
   (`f(2.0)`) and passed to a function-typed parameter (`apply(f, 3.0)`); every use is resolved to
   the closure at compile time. When the closure captures, that is all: copying, returning, storing,
   printing or computing with it is `E0421`, because a [function value](#function-values-) has no

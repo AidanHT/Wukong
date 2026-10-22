@@ -205,6 +205,12 @@ of a `Ty::Named` (`fn_arg_binding`): that instance declares a `Ptr` parameter fo
 an instance itself (the capture's key bound to its own `Ty::Fn`: a captured function value is
 always a run-time one), and a call through a parameter bound to it passes the environment first, so
 the instance collector lines the call's own arguments up after it (`MonoCollector::env_len`).
+A call through a run-time value specializes nothing for a closure argument, which is therefore a
+value as well: sema types the closure arguments of a call through a `let`-bound local as values
+(`Sema::type_args_of_value_call`; one that captures, or a capturing closure-bound local, is
+`E0427`), and `lower_indirect_call` refuses a closure value with an environment at any
+`CallIndirect` (`reject_closure_env_arg`, once per closure) — the case sema cannot see, a
+function-typed parameter that one instance binds at compile time and another at run time.
 Every function used as a value is
 `dispatch_taint`ed (a call through a pointer may pass it any arguments). A function value is made
 only in a function body (`E0411` in a `const`: its initializer is lowered at each use, past

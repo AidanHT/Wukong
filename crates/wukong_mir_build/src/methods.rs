@@ -745,6 +745,7 @@ impl FnLowerer<'_> {
             matches!(ret_mir, MirType::Array(..)).then(|| self.builder.alloca(ret_mir.clone()));
         argv.extend(sret);
         for (a, pty) in args.iter().zip(&params) {
+            let a = self.reject_closure_env_arg(a, pty);
             let v = self.lower_arg_coerced(a, Some(pty));
             argv.push(v);
         }
@@ -772,6 +773,54 @@ impl FnLowerer<'_> {
                 ret: ret_mir,
             },
         ))
+    }
+
+    /// The argument `a` of a function-typed parameter `pty` of a call through a run-time function
+    /// value. Nothing is specialized for what such a call is given, so a closure value with an
+    /// environment — `(L, captures..)`, from a literal or a closure-bound local — would have to be
+    /// a code address alone: `E0427`. Sema refuses one where the callee is a `let`-bound value;
+    /// this catches the instance that binds a function-typed parameter to a run-time value, where
+    /// the same call through the parameter is a direct call in every other instance. Returns the
+    /// expression to lower: the closure's code after a refusal (the build has failed; the MIR
+    /// stays well formed), `a` itself otherwise.
+    fn reject_closure_env_arg<'e>(&mut self, a: &'e Expr, pty: &Ty) -> &'e Expr {
+        let ExprKind::TupleLit(xs) = &a.kind else {
+            return a;
+        };
+        let code = crate::closures::closure_code(a);
+        let lifted = match &code.kind {
+            ExprKind::Path(p) if p.is_single() => self.closure_env(p.first().sym).is_some(),
+            _ => false,
+        };
+        if !matches!(pty, Ty::Fn { .. }) || xs.len() < 2 || !lifted {
+            return a;
+        }
+        // One report per closure, however many instances lower the call.
+        let reported = self
+            .diags
+            .iter()
+            .any(|d| d.code == Some("E0427") && d.primary_span() == Some(a.span));
+        if reported {
+            return code;
+        }
+        self.diags.push(
+            Diagnostic::error(
+                "a closure that captures variables cannot be passed to a call through a run-time \
+                 function value",
+            )
+            .with_code("E0427")
+            .primary(a.span, "this closure captures variables")
+            .note(
+                "the function-typed parameter called here is bound to a run-time function value \
+                 in this instance, so the closure would be passed as the address of its code \
+                 alone; the values it captures have nowhere to live in it",
+            )
+            .help(
+                "pass the captured values as ordinary parameters, or pass a closure that captures \
+                 nothing",
+            ),
+        );
+        code
     }
 
     /// A function used as a value (`let f = add1;`, a function-typed parameter of this instance

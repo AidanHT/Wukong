@@ -121,6 +121,11 @@ impl Sema<'_> {
         let target = if self.args_need_params(args) {
             match &callee.kind {
                 ExprKind::Path(p) if p.is_single() => match self.lookup_local(p.first().sym) {
+                    // A call through a run-time function value: nothing is specialized for a
+                    // closure given to it, so the closure is a run-time value too.
+                    Some(Ty::Fn { params, .. }) if self.holds_run_time_fn(p.first().sym) => {
+                        return self.type_args_of_value_call(args, &params);
+                    }
                     Some(Ty::Fn { params, .. }) => Some((params, Vec::new())),
                     Some(_) => None,
                     None => match self.defs.lookup(p.first().sym).map(|d| &d.kind) {
@@ -137,6 +142,58 @@ impl Sema<'_> {
             Some((params, generics)) => self.type_args_against(args, &params, &generics),
             None => args.iter().map(|a| self.type_expr(a)).collect(),
         }
+    }
+
+    /// Whether the local `name` of function type always holds a run-time function value: a `let`,
+    /// pattern or `for` binding that is not bound to a closure. A call through one is an
+    /// `Op::CallIndirect` in every instance. A parameter (of the function or of a closure) may be
+    /// bound at compile time instead, and a call through a closure-bound local is a direct call of
+    /// the lifted closure.
+    pub(crate) fn holds_run_time_fn(&self, name: Symbol) -> bool {
+        !self.is_param_binding(name) && self.closure_bound(name).is_none()
+    }
+
+    /// Type the arguments `args` of a call through a run-time function value whose parameter types
+    /// are `params`. A closure argument of a function-typed parameter becomes the value the callee
+    /// receives — the lifted function's address — so it is typed by
+    /// [`Self::type_closure_value`] (one that captures is `E0427`), and a closure-bound local
+    /// passed there must capture nothing either.
+    pub(crate) fn type_args_of_value_call(&mut self, args: &[Expr], params: &[Ty]) -> Vec<Ty> {
+        let mut tys = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let want = params.get(i).filter(|t| matches!(t, Ty::Fn { .. }));
+            let t = match (want, &a.kind) {
+                (Some(want), ExprKind::Closure { .. }) => {
+                    let t = self.type_closure_value(a, Some(want));
+                    self.types.insert(a.id, t.clone());
+                    t
+                }
+                (Some(_), ExprKind::Path(p)) if p.is_single() => {
+                    let captures: Vec<Symbol> = self
+                        .closure_bound(p.first().sym)
+                        .and_then(|lit| self.closures.get(&lit))
+                        .map(|info| info.captures.iter().map(|(n, _)| *n).collect())
+                        .unwrap_or_default();
+                    // Typed as an argument of a function-typed parameter, so the use is recorded
+                    // without `E0421`'s "only called or passed" (it is passed).
+                    let outer = self.fn_value_arg.replace(a.id);
+                    let t = self.type_expr(a);
+                    self.fn_value_arg = outer;
+                    if captures.is_empty() || !matches!(t, Ty::Fn { .. }) {
+                        t
+                    } else {
+                        if self.inst_subst.is_empty() {
+                            self.report_capturing_value(a.span, &captures);
+                        }
+                        self.types.insert(a.id, Ty::Error);
+                        Ty::Error
+                    }
+                }
+                _ => self.type_expr(a),
+            };
+            tys.push(t);
+        }
+        tys
     }
 
     /// Whether typing `args` needs the callee's parameter types: an argument is a closure literal,

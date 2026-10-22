@@ -790,8 +790,11 @@ fn main() -> i32 {
          time it runs, and the value has no room to carry it: there is no environment to allocate, \
          keep alive or free. Such a closure can still be called through the `let` that binds it, or \
          passed directly to a function-typed parameter the callee only calls or passes on (the \
-         callee is then specialized for it and receives the captured values). To store it, take \
-         the captured values as ordinary parameters, or capture nothing.",
+         callee is then specialized for it and receives the captured values). A call through a \
+         function value specializes nothing, so a closure given to one — through a `let` of \
+         function type, or through a function-typed parameter in the instance that receives it at \
+         run time — is a value too. To store it, take the captured values as ordinary \
+         parameters, or capture nothing.",
         bad: "module ex.e0427\nfn main() -> i32 {\n    let k: i32 = 3;\n    let mut f: fn(i32) -> i32 = |x| x;\n    f = |x| x + k;\n    return f(1);\n}\n",
         good: "module ex.e0427\nfn main() -> i32 {\n    let mut f: fn(i32) -> i32 = |x| x;\n    f = |x| x + 3;\n    return f(1);\n}\n"
     ),
