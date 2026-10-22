@@ -1290,6 +1290,11 @@ impl<'a> Proof<'a> {
             return None;
         }
         let entries = self.table_entries(b, at, *ptrs, k.streams as usize)?;
+        // Only the plain `Store`/`Load` count, deliberately not `VecOp::stored_stream`: an f16
+        // stream (`StoreF16`/`LoadF16`) has two-byte elements, not the lane's four, so `bytes`
+        // below would overstate its extent. `validate` keeps a stream to one width, so a stream
+        // with a plain `Store` is a lane-width stream; an f16 stream is never write-only here and
+        // kills nothing.
         let write_only = (0..entries.len())
             .map(|s| {
                 let stores = k

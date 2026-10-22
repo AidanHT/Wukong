@@ -546,6 +546,9 @@ enum VecCall {
     Aliased,
     /// Both streams name the output and both are only stored: `out[i] = 2`, twice.
     TwoOutputs,
+    /// `out[i] = src[i] * 2` stored as f16 (`StoreF16`) over 64 elements: the vector part writes
+    /// 128 of the slot's 256 bytes, though 64 lanes of the `f32` lane would be 256.
+    HalfStores,
 }
 
 /// `s` and `t` are written at the top, then each is filled through a vector kernel and read. Do they
@@ -585,6 +588,11 @@ fn vec_scratch(how: VecCall) -> bool {
             VecOp::Store { stream: 1, val: 2 },
         ]
     } else {
+        let store = if how == VecCall::HalfStores {
+            VecOp::StoreF16 { stream: 1, val: 2 }
+        } else {
+            VecOp::Store { stream: 1, val: 2 }
+        };
         vec![
             VecOp::Load { stream: 0 },
             VecOp::Splat { scalar: 0 },
@@ -593,7 +601,7 @@ fn vec_scratch(how: VecCall) -> bool {
                 a: 0,
                 b: 1,
             },
-            VecOp::Store { stream: 1, val: 2 },
+            store,
         ]
     };
     let kernel = b.add_vec_kernel(VecKernel {
@@ -657,13 +665,19 @@ fn vec_scratch(how: VecCall) -> bool {
 /// A vector kernel that stores a stream it never loads, over a vector part as long as the slot the
 /// stream's table entry names, overwrites that slot, even when a second write-only stream names it
 /// too; one that accumulates into the stream, covers part of it, or also reaches the slot through
-/// a stream it loads does not.
+/// a stream it loads does not. Nor does an f16 output stream measured at the `f32` lane's width:
+/// its elements are two bytes, so 64 of them leave half of a 256-byte slot unwritten.
 #[test]
 fn a_vector_kernel_output_stream_is_a_full_overwrite() {
     for how in [VecCall::Overwrites, VecCall::TwoOutputs] {
         assert!(!vec_scratch(how), "{how:?} must end the lifetime");
     }
-    for how in [VecCall::Accumulates, VecCall::Short, VecCall::Aliased] {
+    for how in [
+        VecCall::Accumulates,
+        VecCall::Short,
+        VecCall::Aliased,
+        VecCall::HalfStores,
+    ] {
         assert!(vec_scratch(how), "{how:?} must not end the lifetime");
     }
 }
