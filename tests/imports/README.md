@@ -1,6 +1,6 @@
 # `tests/imports/` — loader unit-test fixtures
 
-**17** flat `.wk` files for `crates/wukong_driver/src/loader.rs` unit tests (and one root that
+**18** flat `.wk` files for `crates/wukong_driver/src/loader.rs` unit tests (and one root that
 `crates/wukongc/tests/warn.rs` compiles):
 
 - `cycle_a.wk`, `cycle_b.wk` — an import cycle (each file loads once)
@@ -10,6 +10,8 @@
   and `{x, y}` selection
 - `ns_leak.wk` — calls a root item it never imported (imports are per file, not transitive)
 - `ns_ext.wk` — repeats the root's `extern "C"` declaration (identical declarations merge)
+- `ns_ext_docs.wk` — repeats it before a documented declaration: the merge drops the repeat's doc
+  comment with it, so each kept declaration keeps its own (`ExternBlock::item_docs`)
 - `ns_meth.wk`, `ns_meth_ext.wk` — a type and, in another module, its `impl`: an import used only
   to call a method is not unused (W0008)
 - `ns_meth_prelude.wk` — a module that only imports `ns_meth_ext.wk`: its import is kept when ANY

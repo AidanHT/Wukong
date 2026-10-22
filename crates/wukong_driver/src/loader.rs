@@ -1143,4 +1143,28 @@ mod tests {
             "both files call the C symbol by its own name: {paths:?}"
         );
     }
+
+    /// A merged extern declaration takes its doc comment with it: `ExternBlock::item_docs` stays
+    /// index-aligned with `items`, so the imported `sin` keeps its own docs, not the dropped `cos`'s.
+    #[test]
+    fn merging_extern_declarations_keeps_their_docs_aligned() {
+        let (module, sink, interner, _) = load_src(
+            "virtual_root.wk",
+            "import ns_ext_docs;\nextern \"C\" { fn cos(x: f64) -> f64; }\n\
+             fn main() -> i32 { return sin_plus_cos(0.0) as i32; }\n",
+        );
+        assert!(!sink.has_errors(), "{:?}", sink.diagnostics());
+        let sin = interner.get("sin").expect("interned");
+        let blk = module
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ItemKind::Extern(blk) if blk.items.iter().any(|f| f.name.sym == sin) => Some(blk),
+                _ => None,
+            })
+            .expect("the imported extern block");
+        assert_eq!(blk.items.len(), 1, "the repeated `cos` must be merged");
+        assert_eq!(blk.item_docs.len(), blk.items.len(), "{:?}", blk.item_docs);
+        assert_eq!(blk.item_docs[0].text(), "The sine, in radians.");
+    }
 }
