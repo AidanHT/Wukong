@@ -2841,6 +2841,18 @@ fn aot_runtime_artifact(flavor: aot_cache::Flavor) -> &'static str {
 /// collide with the two symbols fat LTO leaves global (`rust_eh_personality` and
 /// `std::panicking::EMPTY_PANIC`). A `no_std` binary must name a panic handler; nothing calls this
 /// one (the archive's code panics through its own internalized `std`).
+///
+/// **Why the shim rlib links although the driver references none of its symbols.** rustc appends
+/// `-C link-arg` objects after every upstream rlib, so the Cranelift object - the only code that
+/// calls the shim - reaches the linker after the shim's archive, and a positional linker (GNU
+/// `ld`) extracts an archive member only for a symbol already undefined. It works because rustc
+/// puts a synthetic `symbols.o` *first* on every executable link, holding an undefined reference
+/// to each `#[no_mangle]` export of each statically linked upstream crate: the shim's `wukong_rt_*`
+/// entries and the runtime's `wukong_*` kernels alike (the kernels relied on it before the cache
+/// too, when the shim was the main crate). Checked with GNU ld 2.43.1 via
+/// `--target x86_64-pc-windows-gnu`: an empty `#![no_main]` driver over a shim rlib, with a late
+/// object calling the shim and a kernel, links and runs; the same link line without `symbols.o`
+/// fails with `undefined reference` to all three symbols.
 fn aot_driver_source(flavor: aot_cache::Flavor) -> &'static str {
     match flavor {
         aot_cache::Flavor::RustLto => {

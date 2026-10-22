@@ -1612,6 +1612,15 @@ internalized `std`). A dev-profile runtime cannot be LTO'd (cargo builds it with
 `-C embed-bitcode=no`), and a non-LTO static library would leave all of `std` global, so that flavour
 keeps the rlib-based link instead.
 
+**Why that rlib-based link holds under GNU `ld`.** The `rust-native` driver references nothing in
+the shim rlib, and rustc places the Cranelift object (`-C link-arg`) after every rlib, so a
+positional linker sees the shim's archive before the only object that calls it. It still extracts
+the shim because rustc puts a synthetic `symbols.o` first on every executable link, with an
+undefined reference to each `#[no_mangle]` export of each statically linked upstream crate (the
+same mechanism that already pulled the runtime's kernels in when the shim was the main crate).
+Checked with GNU ld 2.43.1 (`--target x86_64-pc-windows-gnu`): the shape links and runs, and the
+same link line minus `symbols.o` fails with `undefined reference` to the shim and kernel symbols.
+
 **Key.** An entry's name is its flavour plus a 128-bit hash of its *key material*, which is stored in
 the entry (`material.txt`) and compared byte for byte on every hit: the format version, the host,
 the toolchain (`rustc -vV` — release, commit, host triple, LLVM; or `$CC` and its `--version` text),
