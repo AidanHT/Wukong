@@ -503,6 +503,7 @@ spelling_usize_dims.wk: veckernel*1 wukong_sum_bf16 wukong_velem_f32 wukong_vele
 spelling_value_bindings.wk: wukong_velem_f32 wukong_vmath_f32 wukong_vmath_f32*2
 sret_diverging_arms.wk:
 sroa_aggregate_locals.wk:
+stack_color_kills.wk: veckernel*2 wukong_sgemm wukong_velem_f32
 stack_color_phases.wk: wukong_velem_f32 wukong_velem_f32*2
 str_array_elems.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*8 wukong_rt_fmt_str wukong_rt_fmt_str*8
 str_basics.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*10 wukong_rt_fmt_str wukong_rt_fmt_str*16

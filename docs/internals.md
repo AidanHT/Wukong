@@ -1857,13 +1857,23 @@ and the exit code diverges from the oracle.
 one Cranelift stack slot, so a frame holds the largest set of simultaneously live slots rather than
 every slot the function declares; the JIT and the object path share the lowering, so both get it.
 Lifetimes come from `wukong_opt::slot_lifetime`, a pure MIR analysis — no lifetime-marker op exists:
-a slot is live at a point that is reachable from one of its uses and can reach one (so a slot used
-inside a loop is live around the whole loop), where a use is any instruction that handles its
-address or a pointer derived from it (`gep`, `select`, block parameters, pointer casts, a value
-loaded back out of a slot the address was stored into). The backward half stops on entry to a
-counted loop that writes every byte of the slot before anything reads it — the `[v; N]`
-initializer of a `let` inside a loop body — so per-iteration scratch arrays declared one after
-another stop overlapping. An address the analysis loses (stored to untracked memory, returned,
+a slot is live at a point that is reachable from one of its uses and can reach a *read* of it (so a
+slot read inside a loop is live around the whole loop), and at every point that uses it, where a use
+is any instruction that handles its address or a pointer derived from it (`gep`, `select`, block
+parameters, pointer casts, a value loaded back out of a slot the address was stored into) and a read
+is any use but a store into it or an address computation. The backward half stops at a **full
+overwrite** — a point after which the old contents can never be read (`slot_lifetime/kills.rs`): a
+region of counted loops, run one after another, that only write the slot and between them write
+every byte of it (the `[v; N]` initializer of a `let`, a `for` over the whole array, a nest whose
+iteration space tiles it in either loop order — a mixed-radix coverage proof whose index arithmetic
+is range-checked against its integer types — and the vector bodies, unrolled bodies, row vector
+kernels and remainder loops the vectorizers and the unroller leave; induction variables are block
+parameters or, at `-O0`, the counter slots `for` loops keep their variable in), a runtime kernel call
+that overwrites its output (from `wukong_runtime::OVERWRITES`, a per-symbol contract table checked
+against the kernels by its own test: a GEMM with `beta = 0`, GEMV, the elementwise maps, norms, bias,
+transpose, cumsum, column reductions, attention), and a synthesized vector kernel's write-only
+stream. So per-iteration scratch arrays stop overlapping, and so do arrays zeroed at the top of a
+kernel and rewritten later. An address the analysis loses (stored to untracked memory, returned,
 `ptrtoint`, passed to an `extern "C"` function, to a user function whose parameter may retain it —
 `CaptureSummary`, a bottom-up greatest fixpoint over the call graph — or to a call that also takes a
 function address, i.e. an outlined `@parallel` region's environment) keeps its slot live for the
@@ -1872,17 +1882,15 @@ into another's memory. The coloring is greedy (largest slot first, layout order 
 whose members it does not interfere with); a shared slot is as large and aligned as its largest and
 most aligned member, and an over-aligned member still rounds its own address up inside it. At
 `-O1`+ a color holds only private stack slots (Cranelift's `Vmctx` alias region) or only non-private
-ones, because Cranelift's alias analysis requires one location to be accessed under one region; at
+ones, because Cranelift's IR contract requires one location to be accessed under one region; at
 `-O0` Cranelift runs no alias analysis, so colors mix and a private member is demoted to the default
-region. A function in which nothing shares lowers to byte-identical code. The interpreter keeps one
-slot per alloca — it is the oracle, and `native_matches_interpreter` over the run corpus is what
+region (mixing at `-O1`+ would save 0.2% more of the `-O2` corpus — `stack_color.rs` explains why it
+is not done). A function in which nothing shares lowers to byte-identical code. The interpreter keeps
+one slot per alloca — it is the oracle, and `native_matches_interpreter` over the run corpus is what
 would see a wrong coloring. `WUKONG_STACK_COLOR=0` turns coloring off (a kill switch that can only
-change frame sizes). Over `tests/run` (557 programs) the static slot bytes drop 5.8% at `-O0` and
-4.8% at `-O2`; `cargo test -p wukong_codegen_cranelift --lib corpus_frame_bytes -- --ignored
---nocapture` prints the report. Kernels that declare and zero all their scratch at the top of the
-function (`examples/llama_block.wk`) gain almost nothing: their slots are live from the top, because
-the later full overwrites are 2-D loop nests, runtime kernels or, at `-O2`, unrolled and fused loops
-the kill test does not recognize.
+change frame sizes). Over `tests/run` (609 programs) the static slot bytes drop 6.5% at `-O0` and
+5.2% at `-O2`, and `examples/llama_block.wk`'s kernel frame by 27.5%; `cargo test -p
+wukong_codegen_cranelift --lib corpus_frame_bytes -- --ignored --nocapture` prints the report.
 
 SIMD **auto-vectorization** happens in `wukong_mir_build` while lowering a `for` loop: a
 straight-line elementwise body over unit-stride array accesses (plus loop-invariant splats, and

@@ -3669,7 +3669,7 @@ fn populate_module<M: Module>(
     // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
     // Stack-slot coloring needs to know which calls may retain a pointer (`stack_color`).
-    let captures = stack_color::enabled().then(|| wukong_opt::CaptureSummary::analyze(program));
+    let captures = stack_color::enabled().then(|| stack_color::capture_summary(program, interner));
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 

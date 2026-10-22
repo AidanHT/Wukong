@@ -5,7 +5,11 @@
 //!
 //! The lifetimes come from [`wukong_opt::SlotLifetimes`] (see that module for what "live" means and
 //! why sharing storage between two slots that are never live together cannot be observed). The
-//! interpreter is the language's oracle and keeps one slot per alloca, so the run corpus's
+//! analysis ends a lifetime at a full overwrite, and part of what it needs for that is a fact about
+//! the runtime, not the program: which kernel calls overwrite their output completely. That comes
+//! from `wukong_runtime`'s own table ([`wukong_runtime::OVERWRITES`], held to the kernels by a test
+//! there), handed to the analysis keyed by the program's interned symbols ([`capture_summary`]).
+//! The interpreter is the language's oracle and keeps one slot per alloca, so the run corpus's
 //! interpreter-versus-native differential checks every coloring this makes.
 //!
 //! # The coloring
@@ -30,6 +34,18 @@
 //! then **demoted** — its accesses carry the default region like every other member's — so the
 //! one-region-per-location rule still holds literally ([`SlotPlan::demotes`]).
 //!
+//! Mixing at `-O1` and up without demoting was weighed and left out. Cranelift 0.124 reads alias
+//! regions only in its alias analysis, whose facts are keyed by the last store *of the same region*:
+//! a stale fact could only be reused across another slot's access if the reusing slot had no
+//! store or call between — and every stretch of a slot's lifetime that ends in a load begins at one
+//! of its own stores or at a call (a full overwrite is a run of its stores or a kernel call, and a
+//! call is a fence). So it would compute the same values; but it breaks the IR contract Cranelift
+//! states ("it is forbidden for a load or store to access memory under one category and a later
+//! load or store to access the same memory under a different category"), which a later Cranelift
+//! may start relying on, and measured on the run corpus at `-O2` it would save 0.2% of slot bytes
+//! more (`corpus_frame_bytes` reports it). Demoting instead costs the private slot its load
+//! forwarding, where speed is asked for.
+//!
 //! A member computes its address from the shared slot exactly as it would from a slot of its own
 //! (an over-aligned one still rounds its base up inside the slot), so a function in which nothing
 //! shares lowers to the same instructions and the same frame as without coloring.
@@ -39,9 +55,10 @@
 
 use std::collections::HashMap;
 
-use wukong_mir::{Function, MirType, Op, ValueId};
+use wukong_mir::{Function, MirType, Op, Program, ValueId};
 use wukong_opt::slot_lifetime::{ranges_intersect, ranges_union};
-use wukong_opt::{AliasInfo, CaptureSummary, SlotLifetimes};
+use wukong_opt::{AliasInfo, CaptureSummary, KernelOverwrite, SlotLifetimes};
+use wukong_span::Interner;
 
 use crate::{align_shift, over_aligned_slot_bytes, size_of, FRAME_ALIGN};
 
@@ -110,6 +127,29 @@ pub(crate) fn with_coloring<T>(on: bool, f: impl FnOnce() -> T) -> T {
     let out = f();
     FORCE.with(|c| c.set(prev));
     out
+}
+
+/// The capture summary coloring works from: which calls of `program` may retain a pointer, and which
+/// runtime kernels overwrite an output completely — `wukong_runtime`'s [`wukong_runtime::OVERWRITES`]
+/// table, keyed by the symbols `program` interns (a kernel the program never names has no symbol and
+/// cannot be called). The lifetime analysis consults an entry only for a call that resolves to the
+/// runtime, never to a user or `extern "C"` function of the same name.
+pub(crate) fn capture_summary(program: &Program, interner: &Interner) -> CaptureSummary {
+    let overwrites = wukong_runtime::OVERWRITES.iter().filter_map(|o| {
+        let sym = interner.get(o.symbol)?;
+        Some((
+            sym,
+            KernelOverwrite {
+                arity: o.arity,
+                out: o.out,
+                elem_bytes: o.elem_bytes,
+                extent: o.extent,
+                positive: o.positive,
+                fixed: o.fixed,
+            },
+        ))
+    });
+    CaptureSummary::analyze(program).with_overwrites(overwrites)
 }
 
 /// What coloring needs to know about the program and the code generator.
@@ -254,12 +294,23 @@ fn padded(spec: SlotSpec) -> u64 {
 
 /// [`FrameBytes`] of every function of `program` as the native backend lays it out for source
 /// optimization level `opt_level` (see [`crate::BackendOpt`]), summed — the static frame reduction
-/// coloring buys (allocas whose size does not fit the layout are left out).
-pub fn frame_bytes(program: &wukong_mir::Program, opt_level: u8) -> FrameBytes {
-    let calls = CaptureSummary::analyze(program);
+/// coloring buys (allocas whose size does not fit the layout are left out). `interner` is the one
+/// `program` was lowered with (it names the runtime kernels whose overwrites end a lifetime).
+pub fn frame_bytes(program: &Program, interner: &Interner, opt_level: u8) -> FrameBytes {
+    frame_bytes_mixing(program, interner, opt_level == 0)
+}
+
+/// [`frame_bytes`] with private and non-private slots allowed to share (`mix_regions`) or not,
+/// whatever the level — what the report measures the alias-region rule's cost with.
+pub(crate) fn frame_bytes_mixing(
+    program: &Program,
+    interner: &Interner,
+    mix_regions: bool,
+) -> FrameBytes {
+    let calls = capture_summary(program, interner);
     let cfg = ColorConfig {
         calls: &calls,
-        mix_regions: opt_level == 0,
+        mix_regions,
     };
     let mut total = FrameBytes::default();
     for f in &program.funcs {

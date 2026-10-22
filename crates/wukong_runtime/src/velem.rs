@@ -127,7 +127,7 @@ const VCHUNK: usize = 8192;
 /// bandwidth on its own — so the call runs the serial kernel instead. Env-overridable
 /// (`WUKONG_VELEM_PAR_MIN`, read once) so the crossover stays A/B-measurable on other machines;
 /// default ~256 Ki elements (a ~1 MiB output), to be tuned centrally later.
-fn velem_par_min() -> usize {
+pub(crate) fn velem_par_min() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {

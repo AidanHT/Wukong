@@ -187,7 +187,7 @@ const PAR_MIN_MACS: u64 = 1 << 23;
 /// overrides [`PAR_MIN_MACS`] so the serial↔parallel crossover — e.g. whether 256³ (~17M MACs)
 /// pays for threads under the work-scaled 2D grid — can be swept without rebuilds. Gate-only:
 /// which path runs never changes the bits (serial == parallel bit-for-bit).
-fn par_min_macs() -> u64 {
+pub(crate) fn par_min_macs() -> u64 {
     use std::sync::OnceLock;
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {

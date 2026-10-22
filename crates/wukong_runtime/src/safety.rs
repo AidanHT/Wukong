@@ -637,6 +637,7 @@ mod entry_law {
         ("norm.rs", include_str!("norm.rs")),
         ("npy.rs", include_str!("npy.rs")),
         ("nt_policy.rs", include_str!("nt_policy.rs")),
+        ("overwrite.rs", include_str!("overwrite.rs")),
         ("par.rs", include_str!("par.rs")),
         ("pool2d.rs", include_str!("pool2d.rs")),
         ("process.rs", include_str!("process.rs")),
