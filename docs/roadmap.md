@@ -126,7 +126,8 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   function-typed parameters is that instance. `E0427` for a capturing closure as a value, `E0428`
   for comparing two, `E0429` for a generic or `extern` one; `E0411` is now only an `extern`
   signature, a `mut` or builtin-named function-typed parameter or local, and a closure outside a
-  function body. Every optimizer pass asks one exhaustive effect classification
+  function body. Function types inside aggregates are compared (`[inc, add]` is `E0401`).
+  Every optimizer pass asks one exhaustive effect classification
   (`wukong_mir::Effects`) instead of its own opcode list, and a call whose callee is a visible
   `func_addr` is devirtualized (`-O1`, then inlined at `-O2`) — a program step between pipeline
   runs, so the call-effect table never depends on the schedule

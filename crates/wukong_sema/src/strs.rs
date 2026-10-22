@@ -720,6 +720,21 @@ impl Sema<'_> {
                 .unwrap_or(first)
         };
         for (it, t) in items.iter().zip(tys) {
+            // Function values hold one signature (`fn_value_type_clash`): `[inc, add]` is no
+            // array a call through an element could use.
+            if self.fn_value_type_clash(&elem, t) {
+                let (want, found) = (elem.display(self.interner), t.display(self.interner));
+                self.error(
+                    it.span,
+                    "E0401",
+                    format!(
+                        "type mismatch: this array element is a `{found}`, but the array's \
+                         elements are `{want}` (every element of an array literal has the one \
+                         element type, and function values meet only at the same signature)"
+                    ),
+                );
+                continue;
+            }
             if !self.aggregate_type_clash(&elem, t) {
                 continue;
             }

@@ -53,6 +53,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Fixed: inlining a call that discards a value-returning callee's result** branched every `ret v`
   of the copy to a continuation with no parameter (legal MIR the inliner mishandled; a devirtualized
   result-less indirect call produced it). The continuation now takes the value and drops it.
+- **Fixed: function signatures inside aggregates were never compared.** The layout checks
+  treat a function type as an open leaf, so `[inc, add]` (`fn(i32) -> i32` beside
+  `fn(i32, i32) -> i32`) took the first element's type and `ops[1](5)` called `add` with one
+  argument: native read a register the caller never wrote, the interpreter a stale value, and
+  `-O2` failed the verifier once it saw the callee. `E0401` now compares function types at every
+  position of an array, slice, tuple or pointer — array-literal elements, assignment, `return`,
+  struct fields, `if`/`match`/`break` merges and call arguments — and an aggregate of functions
+  against one of anything else (`ops = [1, 2]` for an array of functions).
+  `tests/fail/fn_value_array_signatures.wk`.
 - **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
   value; a closure that captures still has no run-time value (no heap environment).
 

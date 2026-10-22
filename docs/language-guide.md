@@ -218,8 +218,10 @@ fn main() -> i32 {
   closure (copied like a pointer). Comparing two (`==`, `<`) is `E0428`: which functions share an
   address is the compiler's choice, so keep a tag beside the function and compare that. A value
   has exactly its type: assigning, returning or storing one of another signature is `E0401`, and
-  so is giving one where a number, pointer or aggregate is expected. A local of function type
-  cannot be named after a builtin (`E0411`).
+  so is giving one where a number, pointer or aggregate is expected — inside an aggregate too, so
+  an array literal mixing signatures (`[inc, add]`), or an array, tuple or struct of functions of
+  another signature given for one, is `E0401` as well. A local of function type cannot be named
+  after a builtin (`E0411`).
 - **What it costs.** A call through a value is one indirect call (`call_indirect` in
   `--emit=mir`). Where the optimizer can see which function a value holds — a `let` of a named
   function, a value passed into a function it inlined — the call becomes a direct call again

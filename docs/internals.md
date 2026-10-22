@@ -196,7 +196,9 @@ direct call's ABI: an `sret` destination first, aggregates by pointer). A functi
 `methods::fn_value_of` cannot name binds the parameter's pseudo-generic to its own `Ty::Fn` instead
 of a `Ty::Named` (`fn_arg_binding`): that instance declares a `Ptr` parameter for it
 (`methods::is_dynamic_fn`) and calls through it. Every function used as a value is
-`dispatch_taint`ed (a call through a pointer may pass it any arguments).
+`dispatch_taint`ed (a call through a pointer may pass it any arguments). Sema compares
+function types structurally inside arrays, slices, tuples and pointers (`fn_value_type_clash`),
+since the layout checks treat `Ty::Fn` as an open leaf.
 **Methods**: the
 parser flattens each `impl` method into a top-level function `Type.method` (receiver desugared to a
 `self: Type` parameter) beside an `ItemKind::Impl` marker; `wukong_sema::methods` builds the method

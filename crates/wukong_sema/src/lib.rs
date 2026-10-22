@@ -2400,19 +2400,11 @@ impl<'a> Sema<'a> {
     }
 
     /// A function value given where `want` is expected (or anything given where a function value
-    /// is): the two must be one type (`E0401`). A call through a value of the wrong signature would
-    /// pass arguments the callee does not read and read a result it does not produce. A bare
-    /// generic type variable stays lenient: it is bound at the call, not checked here.
+    /// is), at the top level or inside an aggregate: the two must be one type (`E0401`, see
+    /// [`Self::fn_value_type_clash`]). A call through a value of the wrong signature would pass
+    /// arguments the callee does not read and read a result it does not produce.
     fn check_fn_value_type(&mut self, want: &Ty, got: &Ty, span: Span) {
-        if !matches!(want, Ty::Fn { .. }) && !matches!(got, Ty::Fn { .. }) {
-            return;
-        }
-        let lenient = |t: &Ty| {
-            t.is_unknown()
-                || t.is_error()
-                || matches!(t, Ty::Named(n) if !self.is_declared_named_ty(*n))
-        };
-        if want == got || lenient(want) || lenient(got) {
+        if !self.fn_value_type_clash(want, got) {
             return;
         }
         self.error(
@@ -2424,6 +2416,40 @@ impl<'a> Sema<'a> {
                 got.display(self.interner)
             ),
         );
+    }
+
+    /// Whether `want` and `got` disagree about a function value: both are function types of
+    /// different signatures, or exactly one is a function type — at the top level, or at the same
+    /// position inside each (an array, slice or pointer element, a tuple field). Function types
+    /// meet only by equality: no conversion turns one signature into another. The layout checks
+    /// (`aggregate_type_clash`) treat a function type as an open leaf, so without this an array
+    /// literal `[inc, add]` mixing `fn(i32) -> i32` and `fn(i32, i32) -> i32` took the first
+    /// element's type, and `ops[1](5)` called `add` with one argument. A position either side
+    /// leaves open (`Unknown`, `Error`, a bare generic type variable) is lenient: it is bound at a
+    /// call, not checked here.
+    pub(crate) fn fn_value_type_clash(&self, want: &Ty, got: &Ty) -> bool {
+        let lenient = |t: &Ty| {
+            t.is_unknown()
+                || t.is_error()
+                || matches!(t, Ty::Named(n) if !self.is_declared_named_ty(*n))
+        };
+        if lenient(want) || lenient(got) {
+            return false;
+        }
+        match (want, got) {
+            (Ty::Fn { .. }, Ty::Fn { .. }) => want != got,
+            (Ty::Fn { .. }, _) | (_, Ty::Fn { .. }) => true,
+            (Ty::Array { elem: a, .. }, Ty::Array { elem: b, .. })
+            | (Ty::Slice(a), Ty::Slice(b) | Ty::Array { elem: b, .. })
+            | (Ty::Ptr { pointee: a, .. }, Ty::Ptr { pointee: b, .. })
+            | (Ty::Ref { pointee: a, .. }, Ty::Ref { pointee: b, .. }) => {
+                self.fn_value_type_clash(a, b)
+            }
+            (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() => {
+                a.iter().zip(b).any(|(x, y)| self.fn_value_type_clash(x, y))
+            }
+            _ => false,
+        }
     }
 
     /// Whether the named type `sym` is a **data-carrying** (tagged-union) enum — a declared enum with
@@ -2651,6 +2677,14 @@ impl<'a> Sema<'a> {
     /// interpreter and `1065353216` on native.
     fn check_merge_shapes(&mut self, l: &Ty, r: &Ty, incoming: Option<&Expr>, span: Span) {
         self.check_binop_shapes(l, r, span);
+        // Two aggregates of function values meeting hold one signature at each position (two
+        // function values were compared just above).
+        if !matches!(l, Ty::Fn { .. })
+            && !matches!(r, Ty::Fn { .. })
+            && (holds_fn(l) || holds_fn(r))
+        {
+            self.check_fn_value_type(l, r, span);
+        }
         if self.aggregate_merge_clash(l, r, incoming) {
             self.error(
                 span,
@@ -5483,6 +5517,19 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::Slice(ea), Ty::Slice(eb)) | (Ty::Slice(ea), Ty::Array { elem: eb, .. }) => {
             compatible(ea, eb)
         }
+        _ => false,
+    }
+}
+
+/// Whether a value of type `t` holds a function value: `t` is a function type, or an array,
+/// slice, tuple or pointer whose element, field or pointee holds one (the positions
+/// [`Sema::fn_value_type_clash`] compares).
+pub(crate) fn holds_fn(t: &Ty) -> bool {
+    match t {
+        Ty::Fn { .. } => true,
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => holds_fn(pointee),
+        Ty::Array { elem, .. } => holds_fn(elem),
+        Ty::Tuple(ts) => ts.iter().any(holds_fn),
         _ => false,
     }
 }

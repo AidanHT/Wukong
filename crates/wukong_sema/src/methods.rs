@@ -669,6 +669,22 @@ impl Sema<'_> {
                         );
                     }
                 }
+                // Function values inside an aggregate argument (`[fn(i32) -> i32; 2]`) hold the
+                // parameter's signatures too: the call's `unify` only binds through them. (A bare
+                // function value given for another kind of parameter is `check_fn_call`'s.)
+                (_, Ty::Fn { .. }) => {}
+                _ if crate::holds_fn(pty) || crate::holds_fn(aty) => {
+                    let want = crate::shape::apply_subst(pty, &dims, &tys);
+                    let unresolved = sig.generics.iter().any(|g| mentions(&want, *g));
+                    if !unresolved && self.fn_value_type_clash(&want, aty) {
+                        let (w, f) = (want.display(self.interner), aty.display(self.interner));
+                        self.error(
+                            a.span,
+                            "E0401",
+                            format!("type mismatch: expected `{w}`, found `{f}`"),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -1474,6 +1490,41 @@ mod tests {
         }
     }
 
+    /// Function types meet only at one signature, inside aggregates too: an array literal, an
+    /// assignment, a `return`, a struct field, a merge and a call argument each compare the
+    /// function types at every element position (`E0401`).
+    #[test]
+    fn function_types_inside_aggregates_are_compared() {
+        let two = "fn add(a: f32, b: f32) -> f32 { return a + b; }";
+        for bad in [
+            format!("{APPLY} {two} fn main() -> i32 {{ let t = [square, add]; return 0; }}"),
+            format!("{APPLY} {two} fn main() -> i32 {{ let t = [square, 1.0]; return 0; }}"),
+            format!(
+                "{APPLY} {two} fn main() -> i32 {{ let mut t = [square, square]; \
+                 t = [add, add]; return 0; }}"
+            ),
+            format!("{APPLY} {two} fn get() -> [fn(f32) -> f32; 1] {{ let t = [add]; return t; }}"),
+            format!(
+                "{APPLY} {two} struct S {{ fs: [fn(f32) -> f32; 1] }} \
+                 fn main() -> i32 {{ let t = [add]; let _s = S {{ fs: t }}; return 0; }}"
+            ),
+            format!(
+                "{APPLY} {two} fn main() -> i32 {{ let c = 1; let a = [square]; let b = [add]; \
+                 let _m = if c > 0 {{ a }} else {{ b }}; return 0; }}"
+            ),
+            format!(
+                "{APPLY} {two} fn run(fs: [fn(f32) -> f32; 1]) -> f32 {{ return fs[0](1.0); }} \
+                 fn main() -> i32 {{ let b = [add]; return run(b) as i32; }}"
+            ),
+        ] {
+            assert_eq!(codes(&bad), vec!["E0401"], "{bad}");
+        }
+        let ok = format!(
+            "{APPLY} {two} fn main() -> i32 {{ let t = (square, add); \
+             let u: [fn(f32) -> f32; 2] = [square, |x: f32| x]; return (t.1(t.0(1.0), u[1](2.0))) as i32; }}"
+        );
+        assert!(codes(&ok).is_empty(), "{:?}", codes(&ok));
+    }
     #[test]
     fn a_function_parameter_is_neither_mut_nor_a_builtin_name() {
         let m = "fn apply(mut f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }";
