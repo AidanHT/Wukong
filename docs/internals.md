@@ -1636,12 +1636,19 @@ its length and content hash and ends with an `end` line; a hit re-validates all 
 shim rlib is ~140 KB, the release archive ~8 MB) plus the key material, so a truncated, edited or
 foreign entry is reported and rebuilt in place. A build that fails publishes nothing (no negative
 caching). At most 8 entries are kept; publishing evicts the least recently used beyond that (the
-manifest's mtime is touched on every hit) but never one used in the last ten minutes, and removes
-`.tmp-*` directories abandoned for an hour.
+manifest's mtime is the "last used" stamp) but never one used in the last ten minutes, and removes
+`.tmp-*` directories abandoned for an hour. Use and eviction are ordered so a concurrent link keeps
+its entry: a hit stamps the manifest *before* validating the entry (stamping after left the stamp
+stale for the whole validation, and a publish in another process could delete an entry a link had
+just validated); eviction re-reads a victim's stamp immediately before acting, keeps it if it was
+used since the plan was made, and renames it to `.tmp-evicted-*` before deleting it, so readers see
+an entry whole or not at all; and a link whose cached entry vanished anyway (that race, or a
+`--clear-cache`) obtains it again — rebuilding it — and links once more instead of failing.
 
 **Observing it.** `WUKONG_CACHE_TRACE=1` prints one `wukongc: runtime cache: …` line per decision
 (`miss`, `hit`, `invalid entry … (why); rebuilding it`, `built <key> in <ms> ms`, `published`,
-`adopted`, `not cached (why)`, `evicted`) on stderr, and `--time-passes` splits the old `link`
+`adopted`, `not cached (why)`, `evicted`, `kept … (used since eviction began)`, `… vanished during
+the link`) on stderr, and `--time-passes` splits the old `link`
 stage into `runtime-cache` (rlib selection, `rustc -vV`, entry validation or build) and `link`.
 Debug-build indication on the development host (rustc 1.97.1, not a measurement): a dev-profile
 runtime links in ~0.5 s cold or warm (cold adds the ~0.2 s shim rlib build; there was never an LTO
@@ -3187,8 +3194,10 @@ measurement reports retain the corpus sizes used for those runs.
   `runtime_cache_concurrent_links_into_an_empty_cache_both_succeed` (two compilers at once: both
   link, one entry, no build directory left), `runtime_cache_rebuilds_a_corrupted_entry` (a truncated
   artifact and a deleted manifest are each detected and rebuilt) and
-  `an_empty_cache_dir_disables_the_runtime_cache`; the key mechanism, eviction and the in-process
-  race are unit tests in `aot_cache.rs`, and `aot_material_tests.rs` pins that the *production* key
+  `an_empty_cache_dir_disables_the_runtime_cache`; the key mechanism, eviction (including
+  `eviction_rechecks_the_stamp_before_removing_an_entry`, a hit landing between the eviction's plan
+  and its removal), the vanished-entry link retry and the in-process race are unit tests in
+  `aot_cache.rs`, and `aot_material_tests.rs` pins that the *production* key
   builders (`aot_runtime_material`, `cc_runtime_material`) put every input into the key - the
   toolchain text, the rlib's path, length and mtime, the shim or C runtime source hash and the
   recipe - so dropping one from a builder fails a test instead of reusing a stale entry.

@@ -26,7 +26,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   every hit, and a manifest of every file's length and content hash is validated too, so a
   truncated or edited entry is detected and rebuilt. Entries are built in a private directory and
   published with one `rename`, so concurrent compilers both succeed (the loser adopts the winner's
-  entry); at most 8 entries are kept, least recently used evicted.
+  entry); at most 8 entries are kept, least recently used evicted. A hit marks the entry used
+  before validating it and eviction re-checks that mark right before removing an entry, so one
+  compiler's eviction cannot delete the entry another has just validated; if a cached entry still
+  vanishes mid-link, the link rebuilds it and retries once.
 - **Added: `--print=runtime-cache` and `--clear-cache`.** The cache lives in
   `WUKONG_CACHE_DIR` (empty: no cache, a private build per link), else `%LOCALAPPDATA%\wukong\cache`
   on Windows and `$XDG_CACHE_HOME/wukong` or `~/.cache/wukong` elsewhere, under `aot-runtime/`;

@@ -44,10 +44,14 @@
 //!
 //! **Size.** At most [`MAX_ENTRIES`] entries are kept; publishing a new one evicts the least
 //! recently used beyond that, but never one used in the last ten minutes (a concurrent link may be
-//! reading it).
+//! reading it). Use and eviction are ordered so that a concurrent link is not left without its
+//! entry: a hit stamps the entry as used *before* validating it, eviction re-reads that stamp
+//! immediately before removing an entry and renames it away whole first, and a link whose cached
+//! entry vanished anyway is retried once against a freshly obtained one
+//! ([`RuntimeCache::obtain_and_use`]).
 //!
 //! **Tracing.** `WUKONG_CACHE_TRACE=1` prints one `wukongc: runtime cache: ...` line per decision
-//! (hit, miss, invalid, built, published, adopted, private, evicted) on stderr.
+//! (hit, miss, invalid, built, published, adopted, private, evicted, kept, vanished) on stderr.
 
 use std::fs;
 use std::io::{self, Read};
@@ -386,6 +390,14 @@ impl Entry {
     pub(crate) fn file(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
+
+    /// Is this cached entry gone from the cache, so a link that read it may have found nothing?
+    /// Another process evicted it, or `--clear-cache` removed it, after this one validated it (an
+    /// eviction renames an entry away whole, so its manifest disappears with it). A private entry
+    /// belongs to this process alone and never vanishes.
+    pub(crate) fn vanished(&self) -> bool {
+        self.cached && !self.dir.join(MANIFEST).is_file()
+    }
 }
 
 /// A parsed `manifest`.
@@ -524,6 +536,29 @@ fn unique_suffix() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{}-{nanos}-{n}", std::process::id())
+}
+
+/// Record a use of the entry in `dir`: its manifest's modification time is the "last used" time
+/// eviction ranks on and spares for [`EVICTION_GRACE`]. Never creates a manifest (an entry without
+/// one is invalid and is rebuilt anyway).
+fn mark_used(dir: &Path) {
+    let _ = fs::File::options()
+        .write(true)
+        .open(dir.join(MANIFEST))
+        .and_then(|f| f.set_modified(SystemTime::now()));
+}
+
+/// When the entry in `dir` was last used ([`mark_used`]); `UNIX_EPOCH` when that cannot be read.
+fn last_used(dir: &Path) -> SystemTime {
+    fs::metadata(dir.join(MANIFEST))
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Was `used` within [`EVICTION_GRACE`] of `now`? A stamp in the future (a clock step) counts as
+/// recent, so a skewed clock can only keep an entry, never evict one early.
+fn recently(used: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(used).unwrap_or_default() < EVICTION_GRACE
 }
 
 fn age(path: &Path, now: SystemTime) -> Duration {
@@ -686,13 +721,15 @@ impl RuntimeCache {
         };
         let entry_dir = dir.join(&key);
         if entry_dir.exists() {
+            // Stamp the entry as used BEFORE validating it, never after: eviction spares anything
+            // stamped within `EVICTION_GRACE` and re-reads the stamp just before removing an entry
+            // (`evict_victim`), so from here until this link has finished no other process's
+            // eviction removes it. Stamping after validation left the stamp stale for the whole
+            // validation, and a publish elsewhere could delete the entry this link had just
+            // validated and was about to hand to the linker.
+            mark_used(&entry_dir);
             match validate(&entry_dir, material, required) {
                 Ok(manifest) => {
-                    // The manifest's mtime is the entry's last use, which eviction ranks on.
-                    let _ = fs::File::options()
-                        .write(true)
-                        .open(entry_dir.join(MANIFEST))
-                        .and_then(|f| f.set_modified(SystemTime::now()));
                     self.trace(format!("hit {}", entry_dir.display()));
                     return Obtained::Ready(Entry {
                         dir: entry_dir,
@@ -795,12 +832,54 @@ impl RuntimeCache {
         }
     }
 
+    /// [`obtain`](Self::obtain) the entry for `material` and run `link` against it; `linked` says
+    /// whether that run succeeded. When it failed and the cached entry it used has
+    /// [vanished](Entry::vanished) meanwhile (another process evicted it, or `--clear-cache`
+    /// removed it, after this one validated it), the entry is obtained again (rebuilt) and `link`
+    /// runs once more: losing that race costs a rebuild, not a failed link. Any other failure is
+    /// the link's own and comes back as it is. `Err` carries why no entry could be obtained, and is
+    /// never [`Obtained::Ready`].
+    pub(crate) fn obtain_and_use<R>(
+        &self,
+        flavor: Flavor,
+        material: &str,
+        required: &[&str],
+        build: &mut dyn FnMut(&Path, bool) -> io::Result<Built>,
+        link: &mut dyn FnMut(&Entry) -> R,
+        linked: &dyn Fn(&R) -> bool,
+    ) -> Result<R, Obtained> {
+        let mut retried = false;
+        loop {
+            let entry = match self.obtain(flavor, material, required, build) {
+                Obtained::Ready(entry) => entry,
+                failed => return Err(failed),
+            };
+            let result = link(&entry);
+            if retried || linked(&result) || !entry.vanished() {
+                return Ok(result);
+            }
+            self.trace(format!(
+                "{} vanished during the link (removed by another process); obtaining it again",
+                entry.dir.display()
+            ));
+            retried = true;
+        }
+    }
+
     /// Keep at most [`MAX_ENTRIES`] entries (never evicting `keep`, nor anything used within
     /// [`EVICTION_GRACE`]), and remove build directories abandoned by a process that died.
     fn evict(&self, dir: &Path, keep: &str) {
-        let now = SystemTime::now();
+        for victim in self.eviction_plan(dir, keep, SystemTime::now()) {
+            self.evict_victim(dir, &victim);
+        }
+    }
+
+    /// The entries [`evict`](Self::evict) would remove as of `now`: the least recently used beyond
+    /// [`MAX_ENTRIES`] (counting `keep`, which is never one of them), less any used within
+    /// [`EVICTION_GRACE`]. Abandoned `.tmp-*` build directories are removed on the way.
+    fn eviction_plan(&self, dir: &Path, keep: &str, now: SystemTime) -> Vec<PathBuf> {
         let Ok(children) = fs::read_dir(dir) else {
-            return;
+            return Vec::new();
         };
         let mut entries: Vec<(SystemTime, PathBuf)> = Vec::new();
         for child in children.flatten() {
@@ -815,20 +894,39 @@ impl RuntimeCache {
             if name == keep || !is_entry_name(&name) {
                 continue;
             }
-            let used = fs::metadata(path.join(MANIFEST))
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            entries.push((used, path));
+            entries.push((last_used(&path), path));
         }
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        for (used, path) in entries.into_iter().skip(MAX_ENTRIES.saturating_sub(1)) {
-            if now.duration_since(used).unwrap_or_default() < EVICTION_GRACE {
-                continue;
-            }
-            if fs::remove_dir_all(&path).is_ok() {
-                self.trace(format!("evicted {}", path.display()));
-            }
+        entries
+            .into_iter()
+            .skip(MAX_ENTRIES.saturating_sub(1))
+            .filter(|(used, _)| !recently(*used, now))
+            .map(|(_, path)| path)
+            .collect()
+    }
+
+    /// Remove one entry the plan chose, unless it has been used since. The stamp is re-read here,
+    /// immediately before acting: a link in another process stamps an entry before it validates
+    /// it ([`obtain`](Self::obtain)), so an entry stamped after the plan was made is in use and is
+    /// kept. The entry is first renamed out of its key's name, so readers see it whole or not at
+    /// all (never half deleted), and on Windows a file still open in it fails the rename and keeps
+    /// the entry. A removal that then fails leaves a `.tmp-*` directory a later eviction (or
+    /// `--clear-cache`) sweeps up.
+    fn evict_victim(&self, dir: &Path, victim: &Path) -> bool {
+        if recently(last_used(victim), SystemTime::now()) {
+            self.trace(format!(
+                "kept {} (used since eviction began)",
+                victim.display()
+            ));
+            return false;
         }
+        let doomed = dir.join(format!(".tmp-evicted-{}", unique_suffix()));
+        if fs::rename(victim, &doomed).is_err() {
+            return false;
+        }
+        let _ = fs::remove_dir_all(&doomed);
+        self.trace(format!("evicted {}", victim.display()));
+        true
     }
 }
 
@@ -1182,6 +1280,220 @@ mod tests {
         expected.push(format!("rust-lto-{:032x}", 7));
         expected.sort();
         assert_eq!(left, expected);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `MAX_ENTRIES + 2` entries last used an hour ago, in `<root>/aot-runtime`; oldest first.
+    fn old_entries(root: &Path) -> (PathBuf, Vec<PathBuf>) {
+        let dir = root.join(RUNTIME_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let entries = (0..MAX_ENTRIES + 2)
+            .map(|i| {
+                let entry = dir.join(format!("cc-{i:032x}"));
+                fs::create_dir_all(&entry).unwrap();
+                fs::write(entry.join(MANIFEST), "x").unwrap();
+                fs::write(entry.join("artifact.bin"), "y").unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(entry.join(MANIFEST))
+                    .unwrap()
+                    .set_modified(old + Duration::from_secs(i as u64))
+                    .unwrap();
+                entry
+            })
+            .collect();
+        (dir, entries)
+    }
+
+    /// The race the eviction must not lose: process B plans an eviction while entry X's stamp is
+    /// old, then process A hits X (stamping it before it validates), then B acts on its plan. B
+    /// re-reads the stamp, keeps X, and removes only the entries still unused. What is removed
+    /// goes whole (renamed away first), and no `.tmp-evicted-*` directory is left behind.
+    #[test]
+    fn eviction_rechecks_the_stamp_before_removing_an_entry() {
+        let root = scratch("evict-race");
+        let (dir, entries) = old_entries(&root);
+        let cache = RuntimeCache::at(&root);
+        let mut plan = cache.eviction_plan(&dir, "rust-native-new", SystemTime::now());
+        plan.sort();
+        // `keep` counts as one of the MAX_ENTRIES: the three oldest are planned for eviction.
+        assert_eq!(plan, entries[..3].to_vec());
+        mark_used(&entries[0]); // a concurrent link hits the oldest after the plan was made
+        let removed: Vec<bool> = plan.iter().map(|v| cache.evict_victim(&dir, v)).collect();
+        assert_eq!(removed, [false, true, true]);
+        assert!(
+            entries[0].join(MANIFEST).is_file() && entries[0].join("artifact.bin").is_file(),
+            "the entry used since the plan was made is intact"
+        );
+        assert!(!entries[1].exists() && !entries[2].exists());
+        assert!(entries[3..].iter().all(|e| e.join(MANIFEST).is_file()));
+        let stray: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A hit records the use on the entry (the stamp eviction ranks on and spares).
+    #[test]
+    fn a_hit_stamps_the_entry_as_used() {
+        let root = scratch("stamp");
+        let cache = RuntimeCache::at(&root);
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let material = Material::new(Flavor::Cc).line("x", "stamp").finish();
+        let first = ready(cache.obtain(
+            Flavor::Cc,
+            &material,
+            &["artifact.bin"],
+            &mut fake_build(&runs, b"payload"),
+        ));
+        let dir = first.dir.clone();
+        drop(first);
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(dir.join(MANIFEST))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!recently(last_used(&dir), SystemTime::now()));
+        let hit = ready(cache.obtain(
+            Flavor::Cc,
+            &material,
+            &["artifact.bin"],
+            &mut fake_build(&runs, b"payload"),
+        ));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "a hit");
+        assert!(recently(last_used(&hit.dir), SystemTime::now()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A link that fails because its cached entry was removed underneath it (another process's
+    /// eviction, or `--clear-cache`) obtains the entry again - rebuilding it - and links once more.
+    #[test]
+    fn a_link_whose_entry_vanished_is_retried_against_a_rebuilt_entry() {
+        let root = scratch("vanish");
+        let cache = RuntimeCache::at(&root);
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let material = Material::new(Flavor::Cc).line("x", "vanish").finish();
+        let mut links = 0;
+        let linked = cache.obtain_and_use(
+            Flavor::Cc,
+            &material,
+            &["artifact.bin"],
+            &mut fake_build(&runs, b"payload"),
+            &mut |entry: &Entry| {
+                links += 1;
+                assert!(!entry.vanished(), "a just-obtained entry is present");
+                if links == 1 {
+                    // Evicted between validation and the linker reading it.
+                    let away = entry.dir.with_file_name(".tmp-evicted-by-another-process");
+                    fs::rename(&entry.dir, &away).unwrap();
+                    fs::remove_dir_all(&away).unwrap();
+                    assert!(entry.vanished());
+                    return false;
+                }
+                fs::read(entry.file("artifact.bin")).unwrap() == b"payload"
+            },
+            &|ok: &bool| *ok,
+        );
+        assert!(matches!(linked, Ok(true)));
+        assert_eq!(links, 2, "one retry");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the vanished entry was rebuilt"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Only a vanished entry earns a retry, and only one: a link that fails on its own is reported
+    /// as is, a private entry never vanishes, and a build failure never reaches the link.
+    #[test]
+    fn other_link_failures_are_not_retried() {
+        let root = scratch("no-retry");
+        let cache = RuntimeCache::at(&root);
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let material = Material::new(Flavor::Cc).line("x", "no-retry").finish();
+
+        // The link itself fails; the entry is intact.
+        let mut links = 0;
+        let linked = cache.obtain_and_use(
+            Flavor::Cc,
+            &material,
+            &["artifact.bin"],
+            &mut fake_build(&runs, b"payload"),
+            &mut |_: &Entry| {
+                links += 1;
+                false
+            },
+            &|ok: &bool| *ok,
+        );
+        assert!(matches!(linked, Ok(false)));
+        assert_eq!(links, 1);
+
+        // The entry vanishes on every attempt: retried once, then the failure is reported.
+        let mut links = 0;
+        let linked = cache.obtain_and_use(
+            Flavor::Cc,
+            &material,
+            &["artifact.bin"],
+            &mut fake_build(&runs, b"payload"),
+            &mut |entry: &Entry| {
+                links += 1;
+                fs::remove_dir_all(&entry.dir).unwrap();
+                false
+            },
+            &|ok: &bool| *ok,
+        );
+        assert!(matches!(linked, Ok(false)));
+        assert_eq!(links, 2);
+
+        // A private entry is this process's own: removing it is not a race to retry.
+        let mut links = 0;
+        let linked = RuntimeCache::disabled().obtain_and_use(
+            Flavor::Cc,
+            &material,
+            &["artifact.bin"],
+            &mut fake_build(&runs, b"payload"),
+            &mut |entry: &Entry| {
+                links += 1;
+                assert!(!entry.cached);
+                fs::remove_dir_all(&entry.dir).unwrap();
+                assert!(!entry.vanished());
+                false
+            },
+            &|ok: &bool| *ok,
+        );
+        assert!(matches!(linked, Ok(false)));
+        assert_eq!(links, 1);
+
+        // No entry at all: the build's failure comes back and the link never runs.
+        let other = Material::new(Flavor::Cc).line("x", "fails").finish();
+        let mut links = 0;
+        let linked = cache.obtain_and_use(
+            Flavor::Cc,
+            &other,
+            &["artifact.bin"],
+            &mut |_: &Path, _: bool| {
+                Ok(Built::Failed(Output {
+                    status: failing_status(),
+                    stdout: Vec::new(),
+                    stderr: b"cc: error".to_vec(),
+                }))
+            },
+            &mut |_: &Entry| {
+                links += 1;
+                true
+            },
+            &|ok: &bool| *ok,
+        );
+        assert!(matches!(linked, Err(Obtained::BuildFailed(_))));
+        assert_eq!(links, 0);
         let _ = fs::remove_dir_all(&root);
     }
 

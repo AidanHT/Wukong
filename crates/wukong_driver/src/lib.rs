@@ -2235,14 +2235,24 @@ fn cc_link(
             link_args: Vec::new(),
         })
     };
-    let entry = match cache.obtain(
+    // A cached entry another process evicts mid-link is rebuilt and the link retried once
+    // (`obtain_and_use`); `cc` inherits stderr, so a retried link's first diagnostics stay above.
+    let linked = cache.obtain_and_use(
         aot_cache::Flavor::Cc,
         &material,
         &[CC_RUNTIME_OBJECT],
         &mut build,
-    ) {
-        aot_cache::Obtained::Ready(entry) => entry,
-        aot_cache::Obtained::BuildFailed(compiled) => {
+        &mut |entry| {
+            timer.begin("link");
+            Command::new(&cc)
+                .args(cc_link_args(obj_path, &entry.file(CC_RUNTIME_OBJECT), out))
+                .status()
+        },
+        &|status| matches!(status, Ok(s) if s.success()),
+    );
+    let status = match linked {
+        Ok(status) => status,
+        Err(aot_cache::Obtained::BuildFailed(compiled)) => {
             use std::io::Write;
             let _ = std::io::stdout().write_all(&compiled.stdout);
             let _ = std::io::stderr().write_all(&compiled.stderr);
@@ -2252,16 +2262,15 @@ fn cc_link(
             );
             return exit::COMPILE_ERROR;
         }
-        aot_cache::Obtained::Spawn(_) => return cc_unavailable(&cc, stem, obj_path),
-        aot_cache::Obtained::Io(msg) => {
+        Err(aot_cache::Obtained::Spawn(_)) => return cc_unavailable(&cc, stem, obj_path),
+        Err(aot_cache::Obtained::Io(msg)) => {
             emit_driver_error(opts, msg);
             return exit::IO_ERROR;
         }
+        Err(aot_cache::Obtained::Ready(_)) => {
+            unreachable!("obtain_and_use hands a ready entry to the link, never back")
+        }
     };
-    timer.begin("link");
-    let status = Command::new(&cc)
-        .args(cc_link_args(obj_path, &entry.file(CC_RUNTIME_OBJECT), out))
-        .status();
     match status {
         Ok(s) if s.success() => {
             eprintln!("wrote {}", out.display());
@@ -3019,81 +3028,89 @@ fn rustc_link_in(
                 return Err(e);
             }
         };
-        let entry = match cache.obtain(
+        // A cached entry another process evicts between its validation and the linker reading it
+        // is rebuilt and the link retried once (`obtain_and_use`); the first attempt's captured
+        // output is then discarded. A private entry's directory lives until the link has run.
+        let used = cache.obtain_and_use(
             flavor,
             &material,
             &[aot_runtime_artifact(flavor)],
             &mut |entry_dir, cached| {
                 build_aot_runtime(flavor, &rustc, rlib, &deps, entry_dir, cached)
             },
-        ) {
-            aot_cache::Obtained::Ready(entry) => entry,
-            aot_cache::Obtained::BuildFailed(output) => {
+            &mut |entry| {
+                step = AotLinkStep::Link;
+                cached_entry = entry.cached;
+                timer.begin("link");
+                if let Err(e) = std::fs::write(&driver, aot_driver_source(flavor)) {
+                    io_failure = Some(format!("could not write `{}`: {e}", driver.display()));
+                    return Err(e);
+                }
+                let mut cmd = Command::new(&rustc);
+                cmd.arg(&driver)
+                    .args([
+                        "--crate-type",
+                        "bin",
+                        "--crate-name",
+                        "wukong_aot_main",
+                        "--edition",
+                        "2021",
+                        "-C",
+                        "panic=abort",
+                        "--cap-lints",
+                        "allow",
+                    ])
+                    .args(&debug_args);
+                if flavor == aot_cache::Flavor::RustLto {
+                    cmd.arg("-C")
+                        .arg(format!("link-arg={}", obj_path.display()))
+                        .arg("-C")
+                        .arg(format!(
+                            "link-arg={}",
+                            entry.file(AOT_RUNTIME_STATICLIB).display()
+                        ));
+                    // After the archive: a positional linker (GNU ld) resolves left to right.
+                    for arg in &entry.link_args {
+                        cmd.arg("-C").arg(format!("link-arg={arg}"));
+                    }
+                } else {
+                    cmd.arg("--extern")
+                        .arg(format!(
+                            "wukong_aot_shim={}",
+                            entry.file(AOT_SHIM_RLIB).display()
+                        ))
+                        .arg("--extern")
+                        .arg(format!("wukong_runtime={}", rlib.display()))
+                        .arg("-L")
+                        .arg(format!("dependency={}", deps.display()))
+                        .arg("-C")
+                        .arg(format!("link-arg={}", obj_path.display()));
+                }
+                // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ
+                // rustc's diagnostics to know whether to print itself. Everything rustc writes
+                // still reaches the same descriptor, forwarded immediately after it exits - but it
+                // arrives as one block, and uncoloured (rustc sees a pipe). The link is a single
+                // short-lived child at the end of compilation, so neither is something the user
+                // can act on.
+                cmd.arg("-o").arg(&out_arg).output()
+            },
+            &|linked| matches!(linked, Ok(o) if o.status.success()),
+        );
+        match used {
+            Ok(linked) => linked,
+            Err(aot_cache::Obtained::BuildFailed(output)) => {
                 step = AotLinkStep::Runtime;
-                return Ok(output);
+                Ok(output)
             }
-            aot_cache::Obtained::Spawn(e) => return Err(e),
-            aot_cache::Obtained::Io(msg) => {
+            Err(aot_cache::Obtained::Spawn(e)) => Err(e),
+            Err(aot_cache::Obtained::Io(msg)) => {
                 io_failure = Some(msg.clone());
-                return Err(std::io::Error::other(msg));
+                Err(std::io::Error::other(msg))
             }
-        };
-        step = AotLinkStep::Link;
-        cached_entry = entry.cached;
-        timer.begin("link");
-        if let Err(e) = std::fs::write(&driver, aot_driver_source(flavor)) {
-            io_failure = Some(format!("could not write `{}`: {e}", driver.display()));
-            return Err(e);
-        }
-        let mut cmd = Command::new(&rustc);
-        cmd.arg(&driver)
-            .args([
-                "--crate-type",
-                "bin",
-                "--crate-name",
-                "wukong_aot_main",
-                "--edition",
-                "2021",
-                "-C",
-                "panic=abort",
-                "--cap-lints",
-                "allow",
-            ])
-            .args(&debug_args);
-        if flavor == aot_cache::Flavor::RustLto {
-            cmd.arg("-C")
-                .arg(format!("link-arg={}", obj_path.display()))
-                .arg("-C")
-                .arg(format!(
-                    "link-arg={}",
-                    entry.file(AOT_RUNTIME_STATICLIB).display()
-                ));
-            // After the archive: a positional linker (GNU ld) resolves left to right.
-            for arg in &entry.link_args {
-                cmd.arg("-C").arg(format!("link-arg={arg}"));
+            Err(aot_cache::Obtained::Ready(_)) => {
+                unreachable!("obtain_and_use hands a ready entry to the link, never back")
             }
-        } else {
-            cmd.arg("--extern")
-                .arg(format!(
-                    "wukong_aot_shim={}",
-                    entry.file(AOT_SHIM_RLIB).display()
-                ))
-                .arg("--extern")
-                .arg(format!("wukong_runtime={}", rlib.display()))
-                .arg("-L")
-                .arg(format!("dependency={}", deps.display()))
-                .arg("-C")
-                .arg(format!("link-arg={}", obj_path.display()));
         }
-        // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ rustc's
-        // diagnostics to know whether to print itself. Everything rustc writes still reaches the
-        // same descriptor, forwarded immediately after it exits - but it arrives as one block, and
-        // uncoloured (rustc sees a pipe). The link is a single short-lived child at the end of
-        // compilation, so neither is something the user can act on.
-        let linked = cmd.arg("-o").arg(&out_arg).output();
-        // `entry` (a private entry's directory) must outlive the link that reads it.
-        drop(entry);
-        linked
     });
     let _ = std::fs::remove_file(&driver);
     if let Some(msg) = io_failure {
