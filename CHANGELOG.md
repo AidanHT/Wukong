@@ -28,6 +28,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   one. Their low bits move where the old per-chunk half partitions rounded differently (the sum of
   the first 100 bf16 values of `parallel_reduce_order_lowp.wk` was 2615542.25 and is 2615542.5); the
   serial half kernels outside `@parallel` are unchanged.
+- **A product addend keeps the rounding the source gives it.** `s = s + a * b` contracts in the
+  source — one `f32` fused multiply-add of the widened factors, whatever the product's own type — so
+  the tree folds it as `fma(a, b, acc)`: a `bf16 * bf16`, `f16 * f16`, `bf16 * i8` or `f32 * i16`
+  product is never rounded on its own. (The first cut of this change rounded such a product to its
+  own type and summed it: a one-element `@parallel` bf16 dot of 1.0078125 * 1.0078125 printed
+  1.515625 after a 0.5 seed instead of 1.51568603515625, and the uncast f16 dot of
+  `parallel_reduce_order_lowp.wk`'s data overflowed 126 f16 products to +-inf and returned a NaN.)
+  The compound `s += a * b` fuses an `f32` product, as the kernel does, and rounds a half product to
+  its half type first, as the source does. A narrow-integer addend (`i8`/`u8`/`i16`/`u16`, which sema
+  promotes into the `f32` fold exactly) takes the tree too, converted with its own signedness,
+  instead of the source's left fold.
 - **Fixed: a reduction kernel no longer fires on a range whose end reads the accumulator**
   (`for k in 0..(s as i64) { s += x[k] }`): the source re-evaluates the end every iteration, the kernel
   read it once.

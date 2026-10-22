@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use wukong_mir::verify::verify_function;
-use wukong_mir::{Function, MirType, Op, Program};
+use wukong_mir::{CastKind, Function, MirType, Op, Program};
 use wukong_span::{Interner, SourceId};
 
 use crate::par_reduce::{self, TreePath};
@@ -168,6 +168,68 @@ fn recognition_off_still_takes_the_tree() {
     let f = func(&prog, &it, "r");
     assert_eq!(calls(f, &it, "wukong_sreduce_f32"), 2);
     assert_eq!(calls(f, &it, "wukong_sreduce_f32_parallel"), 0);
+}
+
+/// The op code of every `wukong_sreduce_f32` call in `f` (its fourth argument, a constant).
+fn sreduce_ops(f: &Function, interner: &Interner) -> Vec<i128> {
+    let insts = || f.blocks.iter().flat_map(|b| b.insts.iter());
+    insts()
+        .filter_map(|i| match &i.op {
+            Op::Call { func, args } if interner.resolve(*func) == "wukong_sreduce_f32" => insts()
+                .find_map(|d| match &d.op {
+                    Op::ConstInt(v, _) if d.result == Some(args[3]) => Some(*v),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A product addend keeps the rounding the source gives the product. `s = s + a * b` (either
+/// operand order) contracts in the source at the `f32` of the `+` whatever the product's own type,
+/// so the fallback fuses the widened factors (`RED_DOT`) — a `bf16 * bf16` product used to be
+/// rounded to bf16 first, and an `f32 * i16` one to f32. The compound `s += a * b` fuses an `f32`
+/// product, as the kernel does, but a half product is rounded to its half type by the source before
+/// the `+`, so it stays a plain addend (`RED_SUM`). A narrow-integer addend widens into the fold
+/// too, an unsigned one unsigned. Values: `tests/run/parallel_reduce_order_lowp.wk`.
+#[test]
+fn a_product_addend_keeps_the_sources_rounding() {
+    let (dot, sum) = (i128::from(crate::RED_DOT), i128::from(crate::RED_SUM));
+    let cases: &[(&str, &str, i128)] = &[
+        ("x: []bf16, y: []bf16", "s = s + x[i] * y[i];", dot),
+        ("x: []f16, y: []f16", "s = x[i] * y[i] + s;", dot),
+        ("x: []bf16, c: i8", "s = s + x[i] * c;", dot),
+        ("x: []f32, c: i16", "s = s + x[i] * c;", dot),
+        ("x: []f32, c: i16", "s += x[i] * c;", dot),
+        ("x: []bf16, y: []bf16", "s += x[i] * y[i];", sum),
+        ("x: []f16, y: []f16", "s += x[i] * y[i];", sum),
+        ("q: []i16", "s += q[i];", sum),
+        ("u: []u16", "s = s + u[i];", sum),
+    ];
+    for &(params, body, op) in cases {
+        let src = format!(
+            "@parallel\nfn r({params}, n: i64) -> f32 {{\n    let mut s: f32 = 0.5;\n    for i in 0..n {{ {body} }}\n    return s;\n}}\n"
+        );
+        let (prog, it, trace) = lower(&src);
+        assert_eq!(trace, [TreePath::Fallback], "{params}: {body}");
+        let f = func(&prog, &it, "r");
+        assert_eq!(sreduce_ops(f, &it), [op, op], "{params}: {body}");
+        assert!(!has_f32_vectors(f), "{params}: {body}");
+    }
+    // The `u16` addend is converted unsigned, never sign-extended.
+    let src = "@parallel\nfn r(u: []u16, n: i64) -> f32 {\n    let mut s: f32 = 0.5;\n    for i in 0..n { s += u[i]; }\n    return s;\n}\n";
+    let (prog, it, _) = lower(src);
+    let casts: Vec<CastKind> = func(&prog, &it, "r")
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match &i.op {
+            Op::Cast(k, _, MirType::F32) => Some(*k),
+            _ => None,
+        })
+        .collect();
+    assert!(casts.contains(&CastKind::UiToFp), "{casts:?}");
+    assert!(!casts.contains(&CastKind::SiToFp), "{casts:?}");
 }
 
 /// The chunk buffer is one chunk, or the whole trip when that is a smaller constant: an inner

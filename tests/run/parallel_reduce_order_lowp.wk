@@ -16,6 +16,20 @@
 // EXPECT-OUT: 1261115948
 // EXPECT-OUT: 1243587548
 // EXPECT-OUT: 1243587548
+// EXPECT-OUT: 1323437249
+// EXPECT-OUT: 1323441090
+// EXPECT-OUT: 1261115948
+// EXPECT-OUT: 1194730096
+// EXPECT-OUT: 1194730168
+// EXPECT-OUT: 1069679104
+// EXPECT-OUT: 1069679104
+// EXPECT-OUT: 1317617012
+// EXPECT-OUT: 1293695073
+// EXPECT-OUT: 1293695073
+// EXPECT-OUT: 1310472614
+// EXPECT-OUT: 1310472614
+// EXPECT-OUT: 1186453323
+// EXPECT-OUT: 1186453323
 module tests.run.parallel_reduce_order_lowp
 
 // P13.7 for half-precision storage: a `@parallel` reduction over `bf16`/`f16` data has the value of
@@ -38,6 +52,27 @@ module tests.run.parallel_reduce_order_lowp
 //   xf[i] = s * ldexp((37i mod 101) + 0.5, (13i mod 19) - 12)   (f16)
 //   y[i]  = t * ldexp((11i mod 9) + 0.5, (7i mod 5) - 2)        (both; t = -1 when i mod 4 = 1)
 // so the addends span 2^-15 .. 1.6e6 and the running sums round at every scale.
+//
+// A product addend keeps the source's own rounding of the product. `s = s + x[k] * y[k]` contracts
+// in the source (one fused multiply-add at the `f32` of the `+`, each factor widened exactly), so
+// its tree element is `fma(x, y, acc)` over the widened factors, whatever the product's own type:
+// the uncast half dot equals the cast kernel above, and a lone 1.0078125 * 1.0078125 contributes
+// 1.01568603515625, not that product rounded to the bf16 grid (1.015625). Rounding the f16 products
+// of xf * y to f16 overflows 126 of them to +-inf, so a tree of the rounded products is a NaN where
+// the source's contraction is finite. The compound `s += x[k] * y[k]` with half operands rounds the
+// product to its half type first, in the source and in the tree alike: 1323441090 for bf16 below
+// (1323437249 fused), and, on f16 data that cannot overflow,
+//   zf[i] = (1024 + (29i mod 1024)) / 1024     (f16, in [1, 2))
+// 1194730168 against the fused 1194730096.
+// The narrow integers sema promotes into the `f32` fold widen exactly too: an `i16`/`u16` addend
+// (`u16` read unsigned) sums to the tree of its converted values, which is the `f32` kernel's value
+// on a converted copy, and an integer factor of an `f32` product fuses like a float one:
+//   q[i]  = (7919i mod 49152) - 16384     (i16)
+//   u[i]  = 40503i mod 65536              (u16)
+//   wq[i] = sw * f32((7919i mod 10007) / 10007)   (sw = -1 when floor(i / 64) is odd)
+// For these the strict left fold gives 1293695632 (q), 1310472764 (u) and 1186453306 (wq * 1001);
+// rounding each wq * 1001 before the tree gives 1186453326, and an i8 factor of a bf16 product
+// (x * 3) rounded to bf16 first gives 1317617100.
 
 @parallel
 fn bsum_kernel(x: []bf16, n: i64) -> f32 {
@@ -156,6 +191,87 @@ fn hdot_commuted(x: []f16, y: []f16, n: i64, off: i64) -> f32 {
     return s;
 }
 
+@parallel
+fn bdot_uncast(x: []bf16, y: []bf16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s = s + x[k] * y[k];
+    }
+    return s;
+}
+
+@parallel
+fn bdot_uncast_compound(x: []bf16, y: []bf16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s += x[k] * y[k];
+    }
+    return s;
+}
+
+@parallel
+fn hdot_uncast(x: []f16, y: []f16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s = x[k] * y[k] + s;
+    }
+    return s;
+}
+
+@parallel
+fn hdot_uncast_compound(x: []f16, y: []f16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s += x[k] * y[k];
+    }
+    return s;
+}
+
+@parallel
+fn bscale_i8(x: []bf16, c: i8, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s = s + x[k] * c;
+    }
+    return s;
+}
+
+@parallel
+fn isum(q: []i16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s += q[k];
+    }
+    return s;
+}
+
+@parallel
+fn usum(u: []u16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s = s + u[k];
+    }
+    return s;
+}
+
+@parallel
+fn wscale_i16(w: []f32, c: i16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s = s + w[k] * c;
+    }
+    return s;
+}
+
+@parallel
+fn wscale_i16_compound(w: []f32, c: i16, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for k in 0..n {
+        s += w[k] * c;
+    }
+    return s;
+}
+
 fn main() -> i32 {
     let n: i64 = 20000;
     let mut xb: []bf16 = alloc_bf16(n);
@@ -211,6 +327,61 @@ fn main() -> i32 {
     // One chunk: the half kernel's former flat partition differed from the tree here.
     print(bits(bsum_kernel(xb, 100)));
     print(bits(bsum_uncast(xb, 100)));
+
+    // Uncast half products: fused over the widened factors when the source contracts, rounded to
+    // the half grid first when it does not.
+    print(bits(bdot_uncast(xb, yb, n)));
+    print(bits(bdot_uncast_compound(xb, yb, n)));
+    print(bits(hdot_uncast(xf, yf, n)));
+    let mut zf: []f16 = alloc_f16(n);
+    i = 0;
+    while i < n {
+        zf[i] = ((((i * 29) % 1024) + 1024) as f32 / 1024.0) as f16;
+        i = i + 1;
+    }
+    print(bits(hdot_uncast(zf, zf, n)));
+    print(bits(hdot_uncast_compound(zf, zf, n)));
+    let mut eb: []bf16 = alloc_bf16(1);
+    let mut eh: []f16 = alloc_f16(1);
+    eb[0] = 1.0078125 as bf16;
+    eh[0] = 1.0078125 as f16;
+    print(bits(bdot_uncast(eb, eb, 1)));
+    print(bits(hdot_uncast(eh, eh, 1)));
+    print(bits(bscale_i8(xb, 3, n)));
+
+    // Narrow integers: an addend, against the f32 kernel on a converted copy, and a product factor.
+    let mut q: []i16 = alloc_i16(n);
+    let mut u: []u16 = alloc_u16(n);
+    let mut qf: []f32 = alloc_f32(n);
+    let mut uf: []f32 = alloc_f32(n);
+    let mut wq: []f32 = alloc_f32(n);
+    i = 0;
+    while i < n {
+        q[i] = (((i * 7919) % 49152) - 16384) as i16;
+        u[i] = ((i * 40503) % 65536) as u16;
+        qf[i] = q[i] as f32;
+        uf[i] = u[i] as f32;
+        let mut sw: f32 = 1.0;
+        if (i / 64) % 2 == 1 {
+            sw = -1.0;
+        }
+        wq[i] = sw * ((((i * 7919) % 10007) as f32) / 10007.0);
+        i = i + 1;
+    }
+    print(bits(isum(q, n)));
+    print(bits(wsum(qf, n)));
+    print(bits(usum(u, n)));
+    print(bits(wsum(uf, n)));
+    print(bits(wscale_i16(wq, 1001, n)));
+    print(bits(wscale_i16_compound(wq, 1001, n)));
+    free(zf);
+    free(eb);
+    free(eh);
+    free(q);
+    free(u);
+    free(qf);
+    free(uf);
+    free(wq);
     free(xb);
     free(yb);
     free(xf);

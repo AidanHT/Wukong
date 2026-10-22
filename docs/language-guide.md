@@ -1451,7 +1451,8 @@ The same holds for a **reduction** — the one place `@parallel` changes arithme
 `@parallel` function in fast mode, an `f32` reduction loop — a `for` over any range whose body is the
 single fold `s += e`, `s = s + e`, a `+` chain holding `s` once, or a running `fmax`/`fmin`, with an
 `f32` accumulator and an addend built from arithmetic, casts, indexing, fields, math intrinsics and
-`if` — is evaluated with **the parallel reduction tree** (see [Floating-point
+`if` (an `f32` value, a `bf16`/`f16` one, or an `i8`/`u8`/`i16`/`u16` one, which sema promotes into
+the accumulator exactly) — is evaluated with **the parallel reduction tree** (see [Floating-point
 semantics](#floating-point-semantics-)) over its addends in iteration order, and *only* with it. The
 multicore kernel, its single-threaded twin, and the compiler's own lowering of a spelling no kernel
 matches (an `..=` range, a `step`, an offset index, an addend no kernel has, a loop inside an
@@ -1462,7 +1463,7 @@ reduction, cast or uncast, is the same tree over the exactly widened values
 
 | the reduction | its order |
 |---|---|
-| an `f32` reduction loop in a fast `@parallel` function (`bf16`/`f16` data included) | the parallel reduction tree |
+| an `f32` reduction loop in a fast `@parallel` function (`bf16`/`f16` and narrow-integer addends included) | the parallel reduction tree |
 | the same loop without `@parallel` | the vectorizer's tree if the vectorizer takes it, else the source's left fold; a `bf16`/`f16` one read through `as f32` runs the half kernel's own order |
 | an `f64`, integer or `bf16`/`f16`-accumulator reduction, `@parallel` or not | as without `@parallel`: the vectorizer's tree where it applies (integer folds are exact in any order) |
 | any reduction in a `@strict_fp` function | the source's left fold |
@@ -2230,7 +2231,10 @@ rounded once (`tests/run/fp_contract_rules.wk` pins every clause):
   compound `s += y*z` outside a vectorized float reduction, which rounds the product first (the
   spelling `s = s + y*z` contracts).
 - A vectorized float reduction accumulates `s += x[i]*y[i]` (either spelling) with one FMA per
-  lane — part of the reduction tree below.
+  lane — part of the reduction tree below. The `@parallel` tree fuses the same way: either spelling
+  of an `f32` product, and `s = s + a*b` whatever the product's own type (a `bf16 * bf16` product
+  there is never rounded to bf16, because the source contracts it in `f32`); only a compound
+  `s += a*b` of a half or integer product is rounded to that type first.
 - A vectorized loop body, its 256-bit recipe and its scalar remainder apply the identical rule, so
   every lane of one loop agrees.
 
@@ -2254,8 +2258,10 @@ whole rule) — never whether a kernel fired, a thread count, a backend or an `-
 - **The `@parallel` reduction tree** (every `f32` reduction loop of a fast `@parallel` function, and
   `bf16`/`f16` ones on their exactly widened values): the addends, in iteration order, are cut into
   **fixed 8,192-element chunks**; within a chunk, 64-element blocks feed eight independent eight-lane
-  accumulators (block element `8·t + j` folds into accumulator `t`, lane `j`; one FMA per element when
-  the addend is a product `a * b`), the `< 64` remainder folds in 8-element steps into accumulator 0,
+  accumulators (block element `8·t + j` folds into accumulator `t`, lane `j`; a product addend
+  `a * b` folds as one FMA of its two factors, each converted to `f32` as the source converts it —
+  except a compound `s += a * b` whose product is a `bf16`/`f16` or integer value, which the source
+  rounds to that type first and which is then an ordinary addend), the `< 64` remainder folds in 8-element steps into accumulator 0,
   the accumulators combine by the fixed halving tree `acc[t] = acc[t + h] ⊕ acc[t]` for `h = 4, 2, 1`,
   the `< 8` tail folds into the low lanes, the lanes combine as `((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`,
   the chunk partials fold in ascending chunk order from the identity, and the seed folds in once (and

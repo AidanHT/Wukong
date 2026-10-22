@@ -23,11 +23,19 @@
 //! only when both operands are), so `t + (0.0 + p)` equals `t + p` even for `p = -0.0`; for the
 //! max/min folds `ident ⊕ p` is `p` exactly.
 //!
-//! An element contributes as the kernel's ops do: a product addend `a * b` (the `RED_DOT` form —
-//! `x[k] * y[k]`, `(x[k] - y[k]) * (x[k] - y[k])`, `a * b * c` as `(a * b) * c`) as one fused
-//! multiply-add of its two factors, which is what FMA contraction makes of `s + a * b` in every
-//! other reduction lowering too; any other addend is rounded first and added. A running
-//! `fmax`/`fmin` folds with the `maxps`/`minps` rule, and `fmax(m, abs(e))` is the absmax.
+//! An element contributes as the kernel's ops do, and keeps the rounding the source gives it before
+//! the fold. A product addend `a * b` (the `RED_DOT` form — `x[k] * y[k]`, `(x[k] - y[k]) *
+//! (x[k] - y[k])`, `a * b * c` as `(a * b) * c`) is one fused multiply-add of its two factors, each
+//! converted to `f32` exactly as the source converts it: always in `s = s + a * b` / `s = a * b + s`,
+//! where the source itself contracts the product at the `f32` of the `+` whatever the product's own
+//! type (`try_contract_fma`), so a `bf16 * bf16` or `f32 * i16` product is never rounded on its own;
+//! and in the compound `s += a * b` when the product is an `f32`, as the kernel and the vectorizer's
+//! tree fuse it. A compound product of another type (`bf16 * bf16`, `i16 * i16`) is rounded to that
+//! type by the source before the `+` sees it, so it is a plain addend here too. Any other addend is
+//! evaluated as written — an `f32`, a half widened exactly, or one of the narrow integers sema
+//! promotes into the `f32` fold (`i8`/`u8`/`i16`/`u16`, converted with its own signedness) — and
+//! added. A running `fmax`/`fmin` folds with the `maxps`/`minps` rule, and `fmax(m, abs(e))` is the
+//! absmax.
 //!
 //! What it does **not** cover, and keeps in the order it had: a strict function (`@strict_fp`, the
 //! source-order fold), a non-`f32` accumulator (an `f64` or integer reduction keeps the vectorizer's
@@ -255,20 +263,25 @@ impl FnLowerer<'_> {
             return None;
         };
         let is_s = |e: &Expr| single_path(e) == Some(s);
-        let (addend, fold): (Cow<'_, Expr>, Fold) = match op {
-            ast::AssignOp::Add => (Cow::Borrowed(value), Fold::Add),
+        // `contracts`: the addend is a direct operand of the accumulator's own `+` in an assignment
+        // (`s = s + e` / `s = e + s`) — the one place `try_contract_fma` fuses a product addend into
+        // the fold, at that `+` node's type. A compound `s += a * b` lowers the product on its own.
+        let (addend, fold, contracts): (Cow<'_, Expr>, Fold, bool) = match op {
+            ast::AssignOp::Add => (Cow::Borrowed(value), Fold::Add, false),
             ast::AssignOp::Assign => match &value.kind {
                 ExprKind::Binary {
                     op: ast::BinOp::Add,
                     lhs,
                     rhs,
-                } if is_s(lhs) => (Cow::Borrowed(&**rhs), Fold::Add),
+                } if is_s(lhs) => (Cow::Borrowed(&**rhs), Fold::Add, true),
                 ExprKind::Binary {
                     op: ast::BinOp::Add,
                     lhs,
                     rhs,
-                } if is_s(rhs) => (Cow::Borrowed(&**lhs), Fold::Add),
-                ExprKind::Binary { .. } => (Cow::Owned(strip_accumulator(value, s)?), Fold::Add),
+                } if is_s(rhs) => (Cow::Borrowed(&**lhs), Fold::Add, true),
+                ExprKind::Binary { .. } => {
+                    (Cow::Owned(strip_accumulator(value, s)?), Fold::Add, false)
+                }
                 ExprKind::Call { callee, args, .. } if args.len() == 2 => {
                     let fold = match self.vectorizable_intrinsic(callee) {
                         Some(MathIntrinsic::Fmax) => Fold::Max,
@@ -276,9 +289,9 @@ impl FnLowerer<'_> {
                         _ => return None,
                     };
                     if is_s(&args[0]) {
-                        (Cow::Borrowed(&args[1]), fold)
+                        (Cow::Borrowed(&args[1]), fold, false)
                     } else if is_s(&args[1]) {
-                        (Cow::Borrowed(&args[0]), fold)
+                        (Cow::Borrowed(&args[0]), fold, false)
                     } else {
                         return None;
                     }
@@ -297,18 +310,22 @@ impl FnLowerer<'_> {
         {
             return None;
         }
-        // The addend's value is an `f32`, or a half that widens to one exactly, as the source's
-        // assignment widens it.
-        let lane_ok = |e: &Expr| {
-            matches!(
-                self.expr_mir(e),
-                MirType::F32 | MirType::F16 | MirType::BF16
-            )
+        // A value the source converts into the `f32` fold: an `f32`, a half (exactly), or — for a
+        // sum — one of the narrow integers sema promotes into `f32` (`i8`/`u8`/`i16`/`u16`, also
+        // exactly; `fmax`/`fmin` refuse an integer operand, E0445). The fallback converts it with
+        // the source's own cast, signedness included (`tree_store_element`).
+        let widens = |e: &Expr| {
+            let t = self.expr_mir(e);
+            matches!(t, MirType::F32 | MirType::F16 | MirType::BF16)
+                || (t.is_int() && t != MirType::I1)
         };
-        if !lane_ok(&addend) {
-            return None;
-        }
-        // The fused-multiply-add form: a top-level product of two `f32` factors.
+        // The fused-multiply-add form, `RED_DOT` over the product's two factors widened to `f32`. A
+        // product addend contributes `fma(a, b, acc)` when the source fuses it — `s = s + a * b`,
+        // whatever the product's own type (`try_contract_fma` widens each factor to the `f32` of the
+        // `+` and rounds once) — and, as every reduction kernel and the vectorizer's tree do, in the
+        // compound `s += a * b` when the product is itself an `f32`. Only a compound product of
+        // another type (`bf16 * bf16`, `i16 * i16`) is the source's rounded product, a plain addend
+        // below: the source rounds it to its own type before the `+` ever sees it.
         if let (
             Fold::Add,
             ExprKind::Binary {
@@ -318,7 +335,12 @@ impl FnLowerer<'_> {
             },
         ) = (&fold, &addend.kind)
         {
-            if self.expr_mir(&addend) == MirType::F32 && lane_ok(lhs) && lane_ok(rhs) {
+            let fused_at = if contracts {
+                self.expr_mir(value)
+            } else {
+                self.expr_mir(&addend)
+            };
+            if fused_at == MirType::F32 && widens(lhs) && widens(rhs) {
                 return Some(TreePlan {
                     s_slot,
                     op: RED_DOT,
@@ -326,6 +348,16 @@ impl FnLowerer<'_> {
                     q: Some((**rhs).clone()),
                 });
             }
+        }
+        let lane_ok = match fold {
+            Fold::Add => widens(&addend),
+            Fold::Max | Fold::Min => matches!(
+                self.expr_mir(&addend),
+                MirType::F32 | MirType::F16 | MirType::BF16
+            ),
+        };
+        if !lane_ok {
+            return None;
         }
         let op = match fold {
             Fold::Add => RED_SUM,
@@ -559,11 +591,14 @@ impl FnLowerer<'_> {
         trip.map_or(TREE_CHUNK, |t| t.clamp(1, TREE_CHUNK))
     }
 
-    /// Evaluate one addend factor in the current iteration and store it, as `f32`, at `buf[at]`.
+    /// Evaluate one addend (or product factor) in the current iteration and store it, as `f32`, at
+    /// `buf[at]` — converted exactly as the source converts it into the fold (`coerce_to` with the
+    /// operand's own signedness, so a `u16` is not read as an `i16`).
     fn tree_store_element(&mut self, e: &Expr, buf: ValueId, at: ValueId) {
         let v = self.lower_expr(e);
         let from = self.operand_mir(v, e);
-        let v = self.coerce_to(v, &from, &MirType::F32, true);
+        let signed = self.signed(e);
+        let v = self.coerce_to(v, &from, &MirType::F32, signed);
         let ptr = self.builder.build(
             MirType::Ptr,
             Op::Gep {

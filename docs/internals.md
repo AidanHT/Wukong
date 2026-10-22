@@ -1887,9 +1887,16 @@ the tree. Four lowerings compute it:
 
 The chunk-buffer lowering keeps the source loop's control exactly (the start once, the end at every
 header, `i += step` in the latch) and replaces the body: it stores the addend — or, for a top-level
-product, its two factors, which the kernel fuses as `RED_DOT` — into a stack buffer of one chunk (or of
-the trip, when that is a smaller constant), and each full buffer and the final partial one go to
-`wukong_sreduce_f32`. A single-chunk call returns `ident ⊕ partial`, and folding those into a total
+product the source fuses, its two factors, which the kernel fuses as `RED_DOT` — into a stack buffer
+of one chunk (or of the trip, when that is a smaller constant), and each full buffer and the final
+partial one go to `wukong_sreduce_f32`. Each stored value is converted to `f32` exactly as the source
+converts it into the fold (`coerce_to` with the operand's own signedness, `tree_store_element`). The
+source fuses `s = s + a * b` / `s = a * b + s` whatever the product's own type (`try_contract_fma`
+widens both factors to the `f32` of the `+`), so a `bf16 * bf16` or `f32 * i16` product goes in as two
+factors there; the compound `s += a * b` lowers its product on its own, so only an `f32` product is
+fused (as the kernel fuses `s += x[k] * y[k]`) and a half or integer product is one addend, rounded to
+its type as the source rounds it. An `i8`/`u8`/`i16`/`u16` addend, which sema promotes into the `f32`
+accumulator exactly, is an addend like any other. A single-chunk call returns `ident ⊕ partial`, and folding those into a total
 from `ident` is the kernel's `ident ⊕ p0 ⊕ p1 ⊕ …` bit for bit: the running `+` total is never `-0.0`,
 so `t + (0.0 + p)` equals `t + p` even for `p = -0.0`, and `ident ⊕ p` is `p` for max/min. The tree is
 therefore implemented once, in the runtime, and the compiler never imitates it. It declines (the loop
