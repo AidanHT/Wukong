@@ -211,6 +211,9 @@ value as well: sema types the closure arguments of a call through a `let`-bound 
 `E0427`), and `lower_indirect_call` refuses a closure value with an environment at any
 `CallIndirect` (`reject_closure_env_arg`, once per closure) — the case sema cannot see, a
 function-typed parameter that one instance binds at compile time and another at run time.
+A function type does not carry `mut`, so inside a closure an aggregate given to a call through a
+function value is a possible in-place write and is captured by reference
+(`Sema::note_value_call_writes`, the indirect-call twin of `note_mut_arg_writes`).
 Every function used as a value is
 `dispatch_taint`ed (a call through a pointer may pass it any arguments). A function value is made
 only in a function body (`E0411` in a `const`: its initializer is lowered at each use, past

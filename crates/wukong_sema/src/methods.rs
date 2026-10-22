@@ -730,6 +730,11 @@ impl Sema<'_> {
             ret: *ret,
         };
         self.check_fn_value_args(&sig, args, arg_tys);
+        // Whatever function `name` holds may write an aggregate argument in place (`closures.rs`);
+        // a closure-bound local's closure cannot (a closure parameter is never `mut`).
+        if self.closure_bound(name).is_none() {
+            self.note_value_call_writes(args);
+        }
         let site = CallSite::new(None, None, args);
         Some(self.check_fn_call(&sig, &[], arg_tys, span, callee.id, &site))
     }
@@ -763,6 +768,8 @@ impl Sema<'_> {
             ret: *ret,
         };
         self.check_fn_value_args(&sig, args, arg_tys);
+        // The function the value holds may write an aggregate argument in place (`closures.rs`).
+        self.note_value_call_writes(args);
         let site = CallSite::new(None, None, args);
         self.check_fn_call(&sig, &[], arg_tys, span, callee.id, &site)
     }

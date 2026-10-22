@@ -1293,6 +1293,29 @@ impl Sema<'_> {
         }
     }
 
+    /// The arguments `args` of a call through a function value — a function-typed parameter or
+    /// `let`, a field, an element, a call's result. A function type does not say which parameters
+    /// are `mut`, and an aggregate is passed by reference, so the function the value holds may
+    /// write any aggregate argument in place: a closure passing a variable it captures there
+    /// shares it, as it would at a direct call of a function whose parameter is `mut`
+    /// ([`Self::note_mut_arg_writes`]). Conservative: a callee that only reads sees the variable
+    /// itself rather than a copy, the same value unless the enclosing code writes it between
+    /// creating a `let`-bound closure and calling it.
+    pub(crate) fn note_value_call_writes(&mut self, args: &[Expr]) {
+        if self.closure_ctx.is_empty() {
+            return;
+        }
+        for a in args {
+            let by_reference = self
+                .types
+                .get(&a.id)
+                .is_some_and(|t| self.is_aggregate_ty(t) && !matches!(t, Ty::Slice(_) | Ty::Str));
+            if by_reference {
+                self.note_capture_write(a);
+            }
+        }
+    }
+
     /// The variable whose own storage a write to `e` changes, if `e` is a name or a field / element
     /// projection of one that does not pass through a pointer or reference, or a tensor view of
     /// one (`out as Tensor[f32, 2, 3]`, a zero-copy reshape of its storage).
@@ -2178,6 +2201,57 @@ mod tests {
             by_ref("print(sum(out as Tensor[f32, 4]));"),
             Vec::<String>::new()
         );
+    }
+
+    /// A function type does not say which parameters are `mut`, so a call through a function value
+    /// — a captured `let`, a field, an element, a call's result, the closure's own function-typed
+    /// parameter — may write an aggregate argument in place: a closure passing a variable it
+    /// captures there captures it by reference, as for `fill(out, ..)` above. A scalar is a copy
+    /// whatever the callee, and a closure-bound local's closure cannot write its arguments (a
+    /// closure parameter is never `mut`).
+    #[test]
+    fn an_aggregate_a_call_through_a_function_value_gets_is_captured_by_reference() {
+        let by_ref = |body: &str| -> Vec<String> {
+            let src = format!(
+                "fn each(f: fn(i32), n: i32) {{ for i in 0..n {{ f(i); }} }} \
+                 fn each2(f: fn(fn([f32; 4]), i32), n: i32) {{ f(fill, n); }} \
+                 fn fill(mut o: [f32; 4]) {{ for i in 0..4 {{ o[i] = 1.0; }} }} \
+                 fn pick() -> fn([f32; 4]) {{ return fill; }} \
+                 fn inc(k: i32) -> i32 {{ return k + 1; }} \
+                 struct S {{ op: fn([f32; 4]) }} \
+                 fn main() -> i32 {{ let mut out: [f32; 4] = [0.0; 4]; let n = 2; \
+                 let f: fn([f32; 4]) = fill; let g: fn(i32) -> i32 = inc; \
+                 let s = S {{ op: fill }}; let ops: [fn([f32; 4]); 1] = [fill]; \
+                 let peek = |o: [f32; 4]| o[0]; \
+                 each(|i| {{ {body} print(i); }}, 1); \
+                 each2(|h: fn([f32; 4]), i: i32| {{ h(out); print(i); }}, 1); \
+                 f(out); s.op(out); ops[0](out); pick()(out); \
+                 return out[0] as i32 + n + g(1) + peek(out) as i32; }}"
+            );
+            let (_m, res, diags, interner) = check(&src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{body}: {diags:?}");
+            // The `each` closure: one parameter and no result (`peek` returns an `f32`, and the
+            // `each2` closure takes two).
+            let info = res
+                .closures
+                .values()
+                .find(|c| c.params.len() == 1 && c.ret == Ty::Unit)
+                .expect("the `each` closure");
+            let mut names: Vec<String> = info
+                .by_ref
+                .iter()
+                .map(|s| interner.resolve(*s).to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(by_ref("f(out);"), vec!["out"]);
+        assert_eq!(by_ref("pick()(out);"), vec!["out"]);
+        assert_eq!(by_ref("s.op(out);"), vec!["out"]);
+        assert_eq!(by_ref("ops[0](out);"), vec!["out"]);
+        // A scalar is copied into any callee; a closure-bound local's closure only reads.
+        assert_eq!(by_ref("print(g(n));"), Vec::<String>::new());
+        assert_eq!(by_ref("print(peek(out));"), Vec::<String>::new());
     }
 
     /// A `for` counter is stored at the wider of its bounds' integer types, and a closure captures

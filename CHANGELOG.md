@@ -93,6 +93,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   time. Both are `E0427` now — from sema when the callee is a `let`-bound local (a closure-bound
   local that captures included), from lowering in such an instance; a closure that captures
   nothing still works. `tests/fail/{closure_indirect_call_captures,closure_dynamic_call_captures}.wk`.
+- **Fixed: a closure lost a write through a call through a function value.** An aggregate a
+  closure captures and passes to a `mut` parameter is captured by reference, but a call through a
+  function value never applied the rule (a function type does not carry `mut`), so
+  `apply(|x| { pick()(arr); x }, 7)` with `pick` returning `fill1(mut a: [i32; 4])` wrote the
+  closure's private copy and `arr` stayed 0, while `fill1(arr)` in the closure, or `pick()(arr)`
+  outside it, wrote `arr` — on both backends. Inside a closure, an aggregate given to any call
+  through a function value (a captured `let`, a field, an element, a call's result, the closure's
+  own function-typed parameter) is now captured by reference, conservatively.
+  `tests/run/closure_capture_indirect_write.wk`.
 - **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
   lowered again at each use, so a function named there escaped the whole-program analyses (a
   recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the

@@ -290,7 +290,9 @@ fn main() -> i32 {
   (including `bool` and `char`), an enum, a raw pointer or reference, a fixed-size array, a tuple or
   a struct, the last four copied whole. One it **writes** — `c = ..`, `c += ..`, `&mut c`, an element
   or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method, an aggregate passed
-  to a `mut` parameter (`relu6(x, out)`, which writes `out` in place), or a builtin's output operand
+  to a `mut` parameter (`relu6(x, out)`, which writes `out` in place) or to any parameter of a call
+  through a function value (`f(out)`, `s.op(out)`, `pick()(out)`: a function type does not say
+  which parameters are `mut`, so the function it holds may write `out`), or a builtin's output operand
   (`relu(x, out)`, `argsort_f32(x, idx)`, `sprintf(buf, ..)`), directly or through a tensor view
   of it (`relu(x, out as Tensor[f32, 2, 3])`; a view bound by `let` counts as a write, since it can
   be written through) — is captured **by reference**: the closure and the enclosing function share
