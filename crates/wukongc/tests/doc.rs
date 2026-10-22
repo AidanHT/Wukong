@@ -240,6 +240,42 @@ fn doctest_needs_a_clean_parse() {
     assert!(err.contains("error[E0210]"), "{err}");
 }
 
+/// A file that parses but does not compile on its own runs no example either: its errors, exit 1,
+/// nothing on stdout. Otherwise a `compile_fail` example would pass for the file's error rather
+/// than its own — the fixture's one compiles once the file does, and is then reported as such.
+#[test]
+fn doctest_needs_a_file_that_compiles() {
+    for backend in ["--backend=interp", "--backend=native"] {
+        let (code, out, err) = wukongc(&["--doctest", backend, "tests/doc/doctest_broken_file.wk"]);
+        assert_eq!(code, 1, "{backend}: {out}");
+        assert!(out.is_empty(), "{backend}: {out}");
+        // `let b: bool = x;` is the statement at line 10, indented 4.
+        assert!(
+            err.contains("error[E0401]")
+                && err.contains("--> tests/doc/doctest_broken_file.wk:10:5"),
+            "{backend}: {err}"
+        );
+    }
+
+    let src =
+        std::fs::read_to_string(repo_root().join("tests/doc/doctest_broken_file.wk")).unwrap();
+    let fixed = src.replace("let b: bool = x;", "let b: bool = x > 0;");
+    assert_ne!(fixed, src);
+    let dir = std::env::temp_dir().join(format!("wukong-doctest-broken-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("doctest_broken_file.wk");
+    std::fs::write(&path, fixed).unwrap();
+    let (code, out, err) = wukongc(&["--doctest", path.to_str().unwrap()]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("... FAILED"), "{out}");
+    assert!(
+        err.contains("compiled, but it is marked `compile_fail`"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What `--doctest` cannot honour is refused by name (exit 2), not ignored.
 #[test]
 fn doctest_refuses_flags_it_cannot_honour() {

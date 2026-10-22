@@ -37,7 +37,9 @@
 //! On stdout, `cargo test`-style: one `doctest <file>:<line> (<what it documents>) ... ok` line per
 //! example (`FAILED`, `ignored`), the failures' names, then
 //! `doctest result: ok. P passed; F failed; I ignored`. The exit status is `0` when nothing failed
-//! and `1` otherwise; a file that does not parse is reported like any compile and runs nothing.
+//! and `1` otherwise. A file that does not compile on its own (front end through lowering, its own
+//! `fn main` included) is reported like any compile and runs nothing: a `compile_fail` example
+//! must fail for its own error, not the file's.
 
 use wukong_ast::{
     Block, Docs, Expr, ExprKind, Item, ItemKind, Module, Stmt, StmtKind, VariantData,
@@ -129,6 +131,13 @@ pub fn run(opts: &Options) -> i32 {
             &sm,
         );
         emit_summary(n + denied, opts, &renderer);
+        return exit::COMPILE_ERROR;
+    }
+
+    // ... and compile on its own, or no example is checked (see `check_file`).
+    if let Err((errors, sm)) = check_file(opts, &src, &name) {
+        let n = emit_diags(&errors, opts, &renderer, &sm);
+        emit_summary(n, opts, &renderer);
         return exit::COMPILE_ERROR;
     }
 
@@ -464,7 +473,7 @@ fn compile(
     let out =
         wukong_parser::parse_doctest_tokens(&tokens, sm.source(example), &mut interner, next_node);
     next_node = out.next_node;
-    let mut errors: Vec<Diagnostic> = lex_diags
+    let errors: Vec<Diagnostic> = lex_diags
         .into_iter()
         .chain(out.diags)
         .filter(|d| d.is_error())
@@ -522,39 +531,82 @@ fn compile(
         }
     }
     let span = Span::new(SourceId(example.0), 0, 0);
-    let mut module = Module {
+    let module = Module {
         name: parsed.module.name,
         docs: Docs::default(),
         items,
         span,
     };
+    let mut program = match lower(opts, module, &mut sm, &mut interner, &mut next_node) {
+        Ok(p) => p,
+        Err(errors) => return Err((errors, sm)),
+    };
+    let main = interner.intern("main");
+    prune::retain_reachable(&mut program, &[main]);
+    wukong_opt::optimize_preserving_with(
+        &mut program,
+        opts.opt_level,
+        &[],
+        optimize_options_for(opts, &lower_options_for(opts)),
+    );
+    Ok(Built {
+        program,
+        interner,
+        sm,
+    })
+}
 
-    // The front end, as `compile` runs it: imports (relative to the file), aliases, sema.
+/// The documented file on its own, through lowering, as `wukongc --run` compiles it (its `fn main`
+/// included). Its examples are only checked when it compiles: otherwise every `compile_fail`
+/// example would pass for the file's error rather than its own. (rustdoc does not run the doctests
+/// of a crate that does not build either.) `Err` carries the errors, with their source map.
+fn check_file(opts: &Options, src: &str, name: &str) -> Result<(), (Vec<Diagnostic>, SourceMap)> {
+    let mut sm = SourceMap::new();
+    let mut interner = Interner::new();
+    let file = sm.add(name.to_string(), src.to_string());
+    let (tokens, _) = wukong_lexer::tokenize(sm.source(file), file);
+    let parsed =
+        wukong_parser::parse_module_tokens_with_lints(&tokens, sm.source(file), &mut interner, 0);
+    let mut next_node = parsed.next_node;
+    match lower(opts, parsed.module, &mut sm, &mut interner, &mut next_node) {
+        Ok(_) => Ok(()),
+        Err(errors) => Err((errors, sm)),
+    }
+}
+
+/// The front end and lowering, as `compile` runs them for a `--run`: imports (relative to the
+/// documented file), type aliases, sema, lowering. `Err` carries the errors.
+fn lower(
+    opts: &Options,
+    mut module: Module,
+    sm: &mut SourceMap,
+    interner: &mut Interner,
+    next_node: &mut u32,
+) -> Result<wukong_mir::Program, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let mut lints = Vec::new();
     let _unused_imports = loader::load_imports(
         &mut module,
         &opts.input,
-        &mut sm,
-        &mut interner,
+        sm,
+        interner,
         &mut sink,
-        &mut next_node,
+        next_node,
         &mut lints,
     );
     if !sink.has_errors() {
-        loader::expand_type_aliases(&mut module, &mut interner, &mut sink, &mut next_node);
+        loader::expand_type_aliases(&mut module, interner, &mut sink, next_node);
     }
     if sink.has_errors() {
-        errors = sink.take().into_iter().filter(|d| d.is_error()).collect();
-        return Err((errors, sm));
+        return Err(sink.take().into_iter().filter(|d| d.is_error()).collect());
     }
-    let (sema, sema_diags) = wukong_sema::check(&module, &interner);
-    errors = sema_diags.into_iter().filter(|d| d.is_error()).collect();
+    let (sema, sema_diags) = wukong_sema::check(&module, interner);
+    let errors: Vec<Diagnostic> = sema_diags.into_iter().filter(|d| d.is_error()).collect();
     if !errors.is_empty() {
-        return Err((errors, sm));
+        return Err(errors);
     }
 
-    // Lowering, as for a `--run`.
+    let sm: &SourceMap = sm;
     let locate = |span: Span| -> String {
         let id = span.source;
         if span.is_dummy()
@@ -566,28 +618,18 @@ fn compile(
         let loc = sm.span_location(span);
         format!("{}:{}:{}", sm.name(id), loc.line, loc.col)
     };
-    let lower_opts = lower_options_for(opts);
-    let (mut program, lower_diags) =
-        wukong_mir_build::lower_program_located(&module, &sema, &mut interner, lower_opts, &locate);
-    errors = lower_diags.into_iter().filter(|d| d.is_error()).collect();
-    if !errors.is_empty() {
-        return Err((errors, sm));
-    }
-    drop(module);
-    drop(sema);
-    let main = interner.intern("main");
-    prune::retain_reachable(&mut program, &[main]);
-    wukong_opt::optimize_preserving_with(
-        &mut program,
-        opts.opt_level,
-        &[],
-        optimize_options_for(opts, &lower_opts),
-    );
-    Ok(Built {
-        program,
+    let (program, lower_diags) = wukong_mir_build::lower_program_located(
+        &module,
+        &sema,
         interner,
-        sm,
-    })
+        lower_options_for(opts),
+        &locate,
+    );
+    let errors: Vec<Diagnostic> = lower_diags.into_iter().filter(|d| d.is_error()).collect();
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(program)
 }
 
 /// The example's code as a source text laid over the documented file: each code line at its own

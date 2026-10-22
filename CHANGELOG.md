@@ -42,8 +42,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and columns, so a diagnostic in it points at the doc comment it is written in. One
   `doctest <file>:<line> (<what it documents>) ... ok|FAILED|ignored` line per example and a
   `doctest result:` summary on stdout; reasons, compile errors and captured output on stderr; exit
-  1 if any failed. Interp or native at the given `-O`, `--fp` and `--target-cpu`; every other
-  flag is refused by name. USAGE documents both flags.
+  1 if any failed. A file that does not compile on its own (through lowering) runs no example and
+  reports its errors, so a `compile_fail` example cannot pass for the file's error. Interp or
+  native at the given `-O`, `--fp` and `--target-cpu`; every other flag is refused by name. USAGE
+  documents both flags.
 - **The formatter keeps doc comments on what they document.** Its self-check's AST law now compares
   the docs too, so a reformat that moved a doc comment to another item would be refused (a test
   feeds the check exactly that output); doc comments on every documentable construct are pinned

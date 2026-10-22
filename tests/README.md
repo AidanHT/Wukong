@@ -18,7 +18,7 @@ harnesses that consume them live in `crates/wukongc/tests/` and reach this direc
 | `fail/lib/` | 2 (`badlib.wk`, `dup.wk`) | Support for import fixtures. **Not fixtures.** |
 | `warn/` | 12 top-level `*.wk` | Must **compile** and produce exactly the warnings (lints) their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list, in order. |
 | `imports/` | 6 | Flat import-graph fixtures consumed **only** by `crates/wukong_driver/src/loader.rs` unit tests. E2e harnesses ignore this directory. |
-| `doc/` | 2 `*.wk` + 1 `*.md` | Doc-comment fixtures for `crates/wukongc/tests/doc.rs`: `geometry.wk` (every documentable construct; doc examples of every kind that pass) with its hand-written `--emit=doc` page `geometry.md`, and `doctest_failures.wk` (one doc example per way of failing). Formatted by the formatter's corpus test; not run by `run.rs`. |
+| `doc/` | 3 `*.wk` + 1 `*.md` | Doc-comment fixtures for `crates/wukongc/tests/doc.rs`: `geometry.wk` (every documentable construct; doc examples of every kind that pass) with its hand-written `--emit=doc` page `geometry.md`, `doctest_failures.wk` (one doc example per way of failing), and `doctest_broken_file.wk` (a file that does not compile on its own, so none of its examples runs). Formatted by the formatter's corpus test; not run by `run.rs`. |
 
 See each subdirectory's `README.md` for format details and landmines.
 

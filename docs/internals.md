@@ -491,7 +491,9 @@ signature is the formatter's printer run on a `Src` with **no comments** and `bl
 printer's flat (one-line) form (`field_decl`, `variant`). A construct the printer refuses falls back
 to its source text.
 
-**`--doctest` (`wukong_driver::doctest`).** The file is parsed (an error stops everything); every
+**`--doctest` (`wukong_driver::doctest`).** The file is parsed, then compiled on its own through
+lowering (`check_file`, the same `lower` the examples go through); an error in either stops
+everything, so a `compile_fail` example cannot pass for the file's error. Every
 `Docs` is walked in source order, and each CommonMark fence (```` ``` ````/`~~~`, closed by a run at
 least as long) whose info string has the word `wk` or `wukong` is an example; the other words are
 the tags `ignore`, `no_run`, `compile_fail` and error codes (anything else fails the example). Each

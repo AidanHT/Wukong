@@ -3369,8 +3369,10 @@ The report goes to stdout: one line per example, naming its fence's line and wha
 documents, then the failures and a summary. Why an example failed goes to stderr: its compile
 errors, its captured output, and the run-time error or exit status. A diagnostic in an example
 points at the line and column of the doc comment it is written in
-(`--> examples/relu.wk:24:9`). The exit status is 0 when nothing failed and 1 otherwise; a file
-that does not parse runs nothing. Examples go through the same front end, optimizer and backend as
+(`--> examples/relu.wk:24:9`). The exit status is 0 when nothing failed and 1 otherwise. A file
+that does not compile on its own (through lowering, its `fn main` included) runs nothing: its
+errors are reported as by any compile, so a `compile_fail` example can only pass for an error of
+its own. Examples go through the same front end, optimizer and backend as
 `--run`, at the given `-O`, `--fp`, `--target-cpu` and `--backend` (interp or native). Their
 output is captured, their standard input is empty, and they are not linted. `--doctest` also takes
 `--color`, `--error-format`, `--error-limit` and `--threads`, and refuses every other flag
