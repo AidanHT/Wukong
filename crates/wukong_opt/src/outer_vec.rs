@@ -705,8 +705,11 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
         .map(|v| f.value_type(*v).clone())
         .collect();
     let inner_params: Vec<ValueId> = f.block(p.inner_header).params.clone();
-    // The nest's new values stay unlocated (sound: an entry may be lost, never invented).
-    let mut e = Emit::new(f, Span::dummy());
+    // The nest's own span ([`nest_loc`]) for what no single instruction owns: the guard, the trip,
+    // the counter's step and the back edges. [`Nest::inst`] moves the cursor to each reproduced
+    // instruction's own span, as the inner path's `emit_body` does.
+    let nest_at = nest_loc(f, p);
+    let mut e = Emit::new(f, nest_at);
 
     let guard_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
     let guard = e.block(guard_params.clone(), Terminator::Unreachable);
@@ -718,6 +721,8 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
     let mut vih_of: Vec<Vec<ValueId>> = Vec::new();
     for (k, ip) in inner_params.iter().enumerate() {
         let ty = e.f.value_type(*ip).clone();
+        // A row's accumulator is the scalar one, a lane per row: it keeps that one's line.
+        e.loc = e.f.value_loc(*ip).unwrap_or(nest_at);
         let vals: Vec<ValueId> = if p.carried_vec[k] {
             (0..parts_of(&ty, p.w))
                 .map(|_| e.value(part_ty(&ty)))
@@ -728,6 +733,7 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
         vih_params.extend(&vals);
         vih_of.push(vals);
     }
+    e.loc = nest_at;
     let vih = e.block(vih_params, Terminator::Unreachable);
     let vb = e.block(Vec::new(), Terminator::Unreachable);
     let vpost = e.block(Vec::new(), Terminator::Unreachable);
@@ -764,6 +770,7 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
         map: FxHashMap::default(),
         ramps: FxHashMap::default(),
         rv: vh_params[p.iv_index],
+        at: nest_at,
     };
     for (k, hp) in header_params.iter().enumerate() {
         if k != p.iv_index {
@@ -811,6 +818,7 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
         args: back,
     };
     s.block(&mut e, p.post, vpost);
+    e.loc = nest_at;
     let latch = term_args(e.f, p.post);
     let mut next = Vec::with_capacity(latch.len());
     for (k, a) in latch.iter().enumerate() {
@@ -833,6 +841,26 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
     );
 }
 
+/// The span of the source nest `p` widens: its outer header's exit test, else its counter, else
+/// the first located value of the block before the inner loop. Dummy when none is located (a nest
+/// the optimizer itself built), so its new values stay unknown rather than borrow another line.
+fn nest_loc(f: &Function, p: &OuterPlan) -> Span {
+    let header = f.block(p.header);
+    let exit_test = match &header.term {
+        Terminator::CondBr { cond, .. } => f.value_loc(*cond),
+        _ => None,
+    };
+    exit_test
+        .or_else(|| f.value_loc(header.params[p.iv_index]))
+        .or_else(|| {
+            f.block(p.pre)
+                .insts
+                .iter()
+                .find_map(|i| i.result.and_then(|r| f.value_loc(r)))
+        })
+        .unwrap_or_else(Span::dummy)
+}
+
 /// The arguments a block's plain jump passes.
 fn term_args(f: &Function, b: BlockId) -> Vec<ValueId> {
     match &f.block(b).term {
@@ -850,6 +878,8 @@ struct Nest<'p> {
     ramps: FxHashMap<u32, Option<ValueId>>,
     /// The group's first row.
     rv: ValueId,
+    /// The nest's span ([`nest_loc`]): where an instruction with no span of its own goes.
+    at: Span,
 }
 
 impl Nest<'_> {
@@ -975,6 +1005,7 @@ impl Nest<'_> {
 
     fn inst(&mut self, e: &mut Emit<'_>, b: BlockId, inst: &Inst) {
         let w = self.p.w;
+        e.loc = inst_loc(e.f, inst).unwrap_or(self.at);
         if let Op::Store { ptr, value } = &inst.op {
             let (at, elem) = self.contiguous_ptr(e, b, *ptr);
             let lent = self.lend_ramps(e, b, &inst.op, false);
@@ -1094,6 +1125,11 @@ impl Nest<'_> {
         let mut out = Vec::new();
         for (k, a) in args.iter().enumerate() {
             if self.p.carried_vec[k] {
+                // A row's entry splat or back-edge value is the scalar argument it stands for.
+                e.loc =
+                    e.f.value_loc(*a)
+                        .or_else(|| e.f.value_loc(params[k]))
+                        .unwrap_or(self.at);
                 let ty = e.f.value_type(params[k]).clone();
                 let op = Op::Splat(*a);
                 let lent = self.lend_ramps(e, b, &op, false);

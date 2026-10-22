@@ -852,7 +852,11 @@ spans), loop unrolling and unroll-and-jam, bounds-check versioning and unswitchi
 loop) and jump threading (each copy of a block). The vectorizer's builder has a current location,
 like `mir_build`'s: a widened step's vector values take the span of the scalar step they widen (a
 store's, its address's), a reduction's folds the span of its update, and the guard, trip and exit
-the span of the loop's exit test. Every other new value stays unknown — the unroller's wrap-safe
+the span of the loop's exit test; a checked body's lane test takes its bounds check's span, and
+each lane's copy of a lane-serial step (or of a per-lane call) the span of that step. The outer
+path (`outer_vec.rs`) does the same per reproduced instruction, a row's vector accumulator takes
+the scalar accumulator's span, and its guard, trip and counter step the outer loop's exit test's.
+Every other new value stays unknown — the unroller's wrap-safe
 limits, the bounds-check and unswitch guards, SLP packs — and the same census pins the share that
 survives `-O2` from below (96.48% over the corpus). The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
 `ValueId` (`FnTranslator::translate`): an instruction with a result carries that value when it is

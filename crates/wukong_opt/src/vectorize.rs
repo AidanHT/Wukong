@@ -5296,10 +5296,10 @@ fn loop_loc(f: &Function, p: &VecPlan) -> Span {
         .unwrap_or_else(Span::dummy)
 }
 
-/// The span of the scalar step a body step widens: its result's, or for a store (which has no
-/// result) its address's, else its stored value's. `None` when the step is not located.
-fn step_loc(f: &Function, step: &LinInst) -> Option<Span> {
-    let inst_loc = |(block, idx): (BlockId, usize)| match &f.blocks[block.0 as usize].insts[idx] {
+/// The span of a scalar instruction: its result's, or for a store (which has no result) its
+/// address's, else its stored value's. `None` when it is not located.
+fn inst_loc(f: &Function, inst: &Inst) -> Option<Span> {
+    match inst {
         Inst {
             result: Some(r), ..
         } => f.value_loc(*r),
@@ -5308,7 +5308,14 @@ fn step_loc(f: &Function, step: &LinInst) -> Option<Span> {
             ..
         } => f.value_loc(*ptr).or_else(|| f.value_loc(*value)),
         _ => None,
-    };
+    }
+}
+
+/// The span of the scalar step a body step widens ([`inst_loc`] of its instruction). `None` when
+/// the step is not located.
+fn step_loc(f: &Function, step: &LinInst) -> Option<Span> {
+    let inst_loc =
+        |(block, idx): (BlockId, usize)| inst_loc(f, &f.blocks[block.0 as usize].insts[idx]);
     match step {
         LinInst::Real { block, idx } | LinInst::PredLoad { block, idx, .. } => {
             inst_loc((*block, *idx))
@@ -6666,10 +6673,14 @@ fn emit_serial_region(
         (Op::Load(ptr, _), true) | (Op::Store { ptr, .. }, true) => Some(*ptr),
         _ => None,
     };
+    // Each step's copies, and the lane values read for it, keep that step's own span ([`inst_loc`]);
+    // the caller's cursor, the region's last step, is the fallback and is restored after.
+    let region_at = e.loc;
     // Lane values of everything the region reads from outside it, read once, before lane 0 — a
     // compare widened before the region as each lane's `bool` ([`scalar_lanes`]).
     let mut table: FxHashMap<u32, Vec<ValueId>> = FxHashMap::default();
     for (i, inst, contiguous) in &steps {
+        e.loc = inst_loc(e.f, inst).unwrap_or(region_at);
         let mut uses = Vec::new();
         each_op_use(&inst.op, &mut |u| uses.push(u));
         for u in uses {
@@ -6689,6 +6700,7 @@ fn emit_serial_region(
     let mut out: FxHashMap<u32, Vec<ValueId>> = FxHashMap::default();
     for k in 0..p.w as usize {
         for (i, inst, contiguous) in &steps {
+            e.loc = inst_loc(e.f, inst).unwrap_or(region_at);
             let at = address(inst, *contiguous).map(|ptr| {
                 let elem = match &inst.op {
                     Op::Load(_, ty) => ty.clone(),
@@ -6721,6 +6733,7 @@ fn emit_serial_region(
             }
         }
     }
+    e.loc = region_at;
     for (r, lanes) in out {
         map.insert(r, Wide::Lanes(lanes));
     }

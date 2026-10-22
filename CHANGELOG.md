@@ -48,6 +48,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   provably apart from everything else it touches, and the rows past the last whole group run in
   the original nest. A recurrence over row-major (gathered) rows stays with unroll-and-jam.
   `WUKONG_NO_OUTER_VEC` turns it off.
+- **Source locations.** Every value the new forms create keeps a source line at `-O2`: a lane test
+  its bounds check's, each lane's copy of a lane-serial step or per-lane call its step's, and an
+  outer-vectorized nest's values the scalar instruction each one reproduces (the guard, trip and
+  counter step the outer loop's exit test's). `crates/wukong_opt/tests/source_locations.rs` pins
+  all three.
 - **Still scalar:** a predicated or checked scatter, a lane test inside a lane-serial region or
   after a store, an if-converted body, a call or a row-varying `bf16`/`f16` value inside the outer
   path, an `i32` outer counter indexing through a widening cast, a lane-serial region in a search
