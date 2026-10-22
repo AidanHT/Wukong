@@ -201,7 +201,11 @@ that is not a statically bound parameter is `Op::CallIndirect` (`lower_indirect_
 direct call's ABI: an `sret` destination first, aggregates by pointer). A function-typed argument
 `methods::fn_value_of` cannot name binds the parameter's pseudo-generic to its own `Ty::Fn` instead
 of a `Ty::Named` (`fn_arg_binding`): that instance declares a `Ptr` parameter for it
-(`methods::is_dynamic_fn`) and calls through it. Every function used as a value is
+(`methods::is_dynamic_fn`) and calls through it. A closure that captures a function value is such
+an instance itself (the capture's key bound to its own `Ty::Fn`: a captured function value is
+always a run-time one), and a call through a parameter bound to it passes the environment first, so
+the instance collector lines the call's own arguments up after it (`MonoCollector::env_len`).
+Every function used as a value is
 `dispatch_taint`ed (a call through a pointer may pass it any arguments). A function value is made
 only in a function body (`E0411` in a `const`: its initializer is lowered at each use, past
 `dispatch_taint`, the instance collector and name hygiene). Sema compares

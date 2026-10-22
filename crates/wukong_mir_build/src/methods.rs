@@ -968,6 +968,45 @@ mod tests {
         );
     }
 
+    /// A closure that captures a function value is instantiated for the call through the
+    /// parameter it is bound to: the call passes the environment (`k`, then the pointer `g`)
+    /// first, and the instance collector lines the call's own arguments up after it — with `g`
+    /// second, the call's one argument used to land on `g`'s slot and no instance was registered.
+    #[test]
+    fn a_closure_capturing_a_function_value_is_instantiated_through_a_parameter() {
+        let funcs = lower(
+            "fn twice(x: i32) -> i32 { return x * 2; } \
+             fn apply(f: fn(i32) -> i32, x: i32) -> i32 { return f(x); } \
+             fn with(h: fn(fn(fn(i32) -> i32, i32) -> i32, i32) -> i32, k: i32) -> i32 { \
+                 return h(apply, k); } \
+             fn main() -> i32 { let g: fn(i32) -> i32 = twice; let k = 100; \
+                 let c = |x: i32| k + g(x); \
+                 return apply(|x| k + g(x), 3) + apply(c, 4) \
+                     + with(|a: fn(fn(i32) -> i32, i32) -> i32, y: i32| a(|x| x + k, y), 5); }",
+        );
+        // `$0` is the `let`-bound `c`, `$1` the literal, `$2` the closure inside `$3`.
+        for l in ["main$closure$0", "main$closure$1"] {
+            let apply = body(&funcs, &format!("apply${l}"));
+            assert!(
+                apply.contains(&format!("call {l}$fn1$i32$to$i32(")),
+                "{apply}"
+            );
+            let inst = body(&funcs, &format!("{l}$fn1$i32$to$i32"));
+            assert!(inst.contains("call_indirect"), "{inst}");
+        }
+        // `with`'s closure has its own function-typed parameter `a`, bound to `apply` at compile
+        // time through `h(apply, k)` (the environment `k` comes first): a direct call, never the
+        // instance that would take `a` at run time.
+        let with = body(&funcs, "with$main$closure$3");
+        assert!(with.contains("call main$closure$3$apply("), "{with}");
+        assert!(
+            !funcs
+                .iter()
+                .any(|(n, _)| n.starts_with("main$closure$3$fn")),
+            "{funcs:?}"
+        );
+    }
+
     /// The address of a function with a function-typed parameter is its instance taking that
     /// parameter at run time.
     #[test]

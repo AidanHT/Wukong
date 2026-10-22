@@ -470,6 +470,9 @@ fn canon_type_args(
 struct MonoCollector<'a> {
     sema: &'a SemaResult,
     interner: &'a mut Interner,
+    /// Every lifted closure (`closures.rs`): a call through a function-typed parameter bound to one
+    /// that captures passes its environment first (`FnLowerer::lower_dispatched_call`).
+    closures: &'a closures::ClosureTable,
     type_generics: HashMap<Symbol, Vec<Symbol>>,
     fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>>,
     fn_bodies: HashMap<Symbol, &'a Block>,
@@ -495,17 +498,34 @@ impl MonoCollector<'_> {
             return;
         }
         // A call through a function-typed parameter is a call of the function this instance binds
-        // — and one bound to a run-time value is a call through a pointer.
-        let name = match methods::bound_fn(p.first().sym, outer, self.interner) {
-            Some(f) => f,
-            None if self.sema.fn_value_locals.contains(&callee.id) => return,
-            None => p.first().sym,
-        };
-        self.handle_named_call(name, args, outer);
+        // — and one bound to a run-time value is a call through a pointer. A parameter bound to a
+        // lifted closure that captures passes the environment first (`lower_dispatched_call`).
+        match methods::bound_fn(p.first().sym, outer, self.interner) {
+            Some(f) => self.handle_named_call(f, self.env_len(f), args, outer),
+            None if self.sema.fn_value_locals.contains(&callee.id) => {}
+            None => self.handle_named_call(p.first().sym, 0, args, outer),
+        }
     }
 
-    /// [`Self::handle_call`] once the callee is resolved to the function `name`.
-    fn handle_named_call(&mut self, name: Symbol, args: &[Expr], outer: &HashMap<Symbol, Ty>) {
+    /// The number of captured values the lifted closure `f` takes ahead of its own parameters: the
+    /// environment a call through a function-typed parameter bound to it passes first. 0 for any
+    /// other function.
+    fn env_len(&self, f: Symbol) -> usize {
+        self.closures.get(&f).map_or(0, |c| c.env_tys.len())
+    }
+
+    /// [`Self::handle_call`] once the callee is resolved to the function `name`. Its first `env`
+    /// parameters are a lifted closure's environment, which `args` does not include; `args` binds
+    /// the parameters after it. A captured function value is a run-time value (a closure cannot
+    /// capture a function-typed parameter, `E0418`), so a function-typed environment parameter is
+    /// bound to its own type, exactly as the argument the lowerer passes for it is.
+    fn handle_named_call(
+        &mut self,
+        name: Symbol,
+        env: usize,
+        args: &[Expr],
+        outer: &HashMap<Symbol, Ty>,
+    ) {
         let tg = match self.type_generics.get(&name) {
             Some(g) if !g.is_empty() => g,
             _ => return,
@@ -516,7 +536,9 @@ impl MonoCollector<'_> {
         };
         let mut subst: HashMap<Symbol, Ty> = HashMap::default();
         for (i, a) in args.iter().enumerate() {
-            let Some(pty) = params.get(i) else { break };
+            let Some(pty) = params.get(env + i) else {
+                break;
+            };
             let aty = self.sema.types.get(&a.id).unwrap_or(&Ty::Unknown);
             // Concrete callers need no copy of their already-resolved type trees. Generic
             // callers substitute once, without first cloning the same tree from the side table.
@@ -533,7 +555,13 @@ impl MonoCollector<'_> {
         // function value of its type (`methods::fn_arg_binding`).
         if let Some(keys) = self.fn_value_keys.get(&name) {
             for &(i, key) in keys {
-                let (Some(a), Some(pty)) = (args.get(i), params.get(i)) else {
+                let Some(pty) = params.get(i) else {
+                    continue;
+                };
+                let Some(a) = i.checked_sub(env).and_then(|j| args.get(j)) else {
+                    if i < env {
+                        subst.insert(key, pty.clone());
+                    }
                     continue;
                 };
                 if let Some(b) =
@@ -599,10 +627,12 @@ impl MonoCollector<'_> {
 
     /// The arguments of a call of `name` that bind its function-typed parameters at compile time
     /// (`methods::fn_value_of`): their function is specialized into the callee, not taken as an
-    /// address, so they are not value uses.
+    /// address, so they are not value uses. `args` binds the parameters after the first `env`
+    /// (see [`Self::handle_named_call`]).
     fn static_fn_args(
         &self,
         name: Symbol,
+        env: usize,
         args: &[Expr],
         subst: &HashMap<Symbol, Ty>,
     ) -> Vec<ast::NodeId> {
@@ -610,7 +640,7 @@ impl MonoCollector<'_> {
             return Vec::new();
         };
         keys.iter()
-            .filter_map(|&(i, _)| args.get(i))
+            .filter_map(|&(i, _)| i.checked_sub(env).and_then(|j| args.get(j)))
             .filter(|a| methods::fn_value_of(a, subst, self.sema, self.interner).is_some())
             .map(|a| a.id)
             .collect()
@@ -697,16 +727,16 @@ impl MonoCollector<'_> {
                 // the callee is specialized for (only a closure value's captures are read).
                 let dispatched = methods::dispatch_in_instance(e, callee, args, subst, self.sema);
                 let statics = match (&dispatched, &callee.kind) {
-                    (Some((target, full)), _) => self.static_fn_args(*target, full, subst),
+                    (Some((target, full)), _) => self.static_fn_args(*target, 0, full, subst),
                     // A call through a run-time function value specializes nothing.
                     (None, ExprKind::Path(_)) if self.sema.fn_value_lets.contains(&callee.id) => {
                         Vec::new()
                     }
                     (None, ExprKind::Path(p)) if p.is_single() => {
                         match methods::bound_fn(p.first().sym, subst, self.interner) {
-                            Some(n) => self.static_fn_args(n, args, subst),
+                            Some(n) => self.static_fn_args(n, self.env_len(n), args, subst),
                             None if self.sema.fn_value_locals.contains(&callee.id) => Vec::new(),
-                            None => self.static_fn_args(p.first().sym, args, subst),
+                            None => self.static_fn_args(p.first().sym, 0, args, subst),
                         }
                     }
                     _ => Vec::new(),
@@ -727,7 +757,7 @@ impl MonoCollector<'_> {
                 }
                 // A call through a trait bound reaches the instantiated type's method.
                 match dispatched {
-                    Some((target, full)) => self.handle_named_call(target, &full, subst),
+                    Some((target, full)) => self.handle_named_call(target, 0, &full, subst),
                     None => self.handle_call(callee, args, subst),
                 }
             }
@@ -788,7 +818,12 @@ impl MonoCollector<'_> {
 /// Collect every concrete instantiation of every type-generic function reachable from a concrete
 /// (non-type-generic) caller, plus transitively from those instances' bodies. Runs before lowering
 /// so instance names can be interned (needs `&mut interner`).
-fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> Mono {
+fn collect_mono(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    closures: &closures::ClosureTable,
+) -> Mono {
     let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
     let mut fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>> = HashMap::default();
     let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::default();
@@ -819,6 +854,7 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
     let mut c = MonoCollector {
         sema,
         interner,
+        closures,
         type_generics,
         fn_value_keys,
         fn_bodies,
@@ -1681,7 +1717,7 @@ fn lower_program_pooled(
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
     // (a generic type param has no single MIR type); its specialized copies are emitted afterward.
-    let mut mono = collect_mono(module, sema, interner);
+    let mut mono = collect_mono(module, sema, interner, &closure_table);
     mono.closures = closure_table;
     // Intern every unique string literal into a read-only `.rodata` blob (deduped by content) and
     // hand the content->symbol table to the lowerer via `mono`, so `ExprKind::Str` yields a stable

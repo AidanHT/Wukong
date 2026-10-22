@@ -233,7 +233,7 @@ fn main() -> i32 {
   `--backend=gpu-native` (the function is declined, an `UNSUPPORTED` skip) and automatic
   differentiation of a loss that calls through one (refused by name) are not supported.
 
-`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt,fn_values_shadowing}.wk`.
+`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt,fn_values_shadowing,fn_values_captured}.wk`.
 
 ### Closures ✅
 

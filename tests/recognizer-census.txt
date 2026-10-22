@@ -189,6 +189,7 @@ float_underscore.wk:
 fmax_int.wk:
 fn_params.wk:
 fn_values.wk:
+fn_values_captured.wk:
 fn_values_devirt.wk:
 fn_values_dispatch.wk:
 fn_values_shadowing.wk:

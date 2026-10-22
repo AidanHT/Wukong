@@ -73,6 +73,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   callee also no longer registers an instance of the parameter's function, or keeps an argument
   from being noted as a value (`forward` in `tests/run/fn_values_shadowing.wk` called a function
   that was never compiled).
+- **Fixed: a closure capturing a function value, passed to a higher-order function, was never
+  compiled.** A function-typed capture makes the lifted closure a function compiled per binding,
+  and a call through the parameter it is bound to passes the captures ahead of its own arguments.
+  The instance collector lined the call's arguments up against the closure's parameters without
+  them, so `apply(|x| k + g(x), 3)` (captures `k`, then `g`) registered no instance and `apply`
+  called a function that was never compiled ("call to unknown function" on the interpreter,
+  `C0001` natively), and a capturing closure with a function-typed parameter of its own
+  (`with(|a, y| a(|x| x + k, y), 5)`) got the instance taking `a` at run time instead of the one
+  specialized for `apply`. The collector now skips the environment, binding a captured function
+  value as the run-time value it always is. `tests/run/fn_values_captured.wk`.
 - **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
   lowered again at each use, so a function named there escaped the whole-program analyses (a
   recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the
