@@ -1069,7 +1069,11 @@ the earlier lane's write. The region's pure steps that read nothing it computed 
 run first. Every pair with at most one listed access is still checked as before. A typed element
 store never lands on a slice header (no type punning), so a slice's data-pointer reads stay out of
 the region — and a plain scatter beside its slice's in-loop data-pointer read needs no region at
-all. Under `WUKONG_NO_LANE_SERIAL` the vectorizer asks for the plain dependence verdict
+all. The region is straight-line code: a listed access the if-conversion predicated or merged (a
+scatter in an `if` arm), or any synthesized step (a masked, merged or predicated store, a merge, a
+predicated load) between the first and the last listed access, declines the loop; an if-converted
+step outside the span widens beside it (it is independent of the region's accesses, like every
+other step). Under `WUKONG_NO_LANE_SERIAL` the vectorizer asks for the plain dependence verdict
 (`DepFacts::serial` off), which restores both declines, the header-read exemption's included.
 
 **Outer-loop vectorization** (`outer_vec.rs`, a child module): a two-deep nest — outer header, one

@@ -1936,9 +1936,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   (`x[n - 1 - i]`); a strided access outside a *complete* interleave group (a gap, or a stride above
   4), or any interleave group in a countdown; a scatter in an `if` arm, or a checked scatter (its
   check is on data, not the counter); a lane test (a checked gather's per-group bounds test) after
-  a store or inside a lane-serial region; a body every access of which would run lane by lane (an
-  unpromised scatter, a bare histogram: the replication rule declines it); and a call with an
-  effect, or a second call that may trap or never return. (A scatter nothing else in the loop
+  a store or inside a lane-serial region; a lane-serial region in a search loop, or one that
+  contains or spans an if-converted step (an if-converted step outside the span widens beside it);
+  a body every access of which would run lane by lane (an unpromised scatter, a bare histogram: the
+  replication rule declines it); and a call with an effect, or a second call that may trap or never
+  return. (A scatter nothing else in the loop
   touches widens around its per-lane stores since 2026-10-12, `gap5/vectorizer-scatter-slp`; a
   read-modify-write, two scatters into one object, a scatter beside a store to its object and a
   gather beside a store it may read run lane by lane in a lane-serial region, a checked gather is

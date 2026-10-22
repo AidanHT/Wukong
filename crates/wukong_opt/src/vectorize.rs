@@ -11100,6 +11100,57 @@ mod tests {
         ));
     }
 
+    /// A lane-serial region is straight-line code, and only the region is. An if-converted step
+    /// after it — a predicated store to another `@noalias` object — touches nothing the region
+    /// does, so it widens beside the region. The same step between the gather and the scatter has
+    /// no place in lane order, and declines the loop; that same store made unconditional (a step
+    /// of its own) widens inside the region, so the `if` is what declines it.
+    #[test]
+    fn an_if_converted_step_widens_beside_a_lane_serial_region_but_not_inside_it() {
+        // `k` and `again` call each other, so the inliner never splices `k` into `main`.
+        let k = |body: &str| {
+            format!(
+                "@unchecked fn k(@noalias mut h: []f32, q: []i32, x: []f32, @noalias mut o: []f32, \
+                   n: i64, z: i64) {{ \
+                 if z > 0 {{ again(z - 1); return; }} let mut i: i64 = 0; \
+                 while i < n {{ let j: i64 = q[i] as i64; let c: f32 = x[i] * 2.0 + 1.0; \
+                   let e: f32 = c * c - x[i] * 0.25 + 3.0; {body} i = i + 1; }} }} \
+                 fn again(z: i64) {{ let mut t: []f32 = alloc_f32(1); \
+                   let mut u: []f32 = alloc_f32(1); let mut w: []f32 = alloc_f32(1); \
+                   let mut q: []i32 = alloc_i32(1); k(u, q, t, w, 1, z); }} "
+            )
+        };
+        let shape = |src: &str| format!("{src} fn main() -> i32 {{ return 0; }}");
+        let after = k("let g: f32 = h[j]; h[j] = g + e; if c > 0.0 { o[i] = e * 0.5 - c; }");
+        let inside = k("let g: f32 = h[j]; if c > 0.0 { o[i] = e * 0.5 - c; } h[j] = g + e;");
+        let inside_plain = k("let g: f32 = h[j]; o[i] = e * 0.5 - c; h[j] = g + e;");
+        assert!(
+            is_widened(&shape(&after), "k"),
+            "an if-converted store after the region was declined"
+        );
+        assert!(
+            !is_widened(&shape(&inside), "k"),
+            "an if-converted store inside the region widened"
+        );
+        assert!(
+            is_widened(&shape(&inside_plain), "k"),
+            "the unconditional control inside the region was declined"
+        );
+        // q[j] = j^2 mod 5 for j < 11 (bins hit twice inside a group), x[j] = j/2 - 2 so that
+        // c = j - 3 (negative, zero and positive lanes), o[j] = -1 before the call so a lane the
+        // store skips shows.
+        scalar_and_vector_agree(&format!(
+            "{after} fn main() -> i32 {{ let mut h: []f32 = alloc_f32(5); \
+             let mut q: []i32 = alloc_i32(11); let mut x: []f32 = alloc_f32(11); \
+             let mut o: []f32 = alloc_f32(11); let mut j: i64 = 0; \
+             while j < 11 {{ q[j] = ((j * j) % 5) as i32; x[j] = (j as f32) * 0.5 - 2.0; \
+               o[j] = -1.0; j = j + 1; }} \
+             k(h, q, x, o, 11, 0); j = 0; while j < 5 {{ print(h[j]); j = j + 1; }} \
+             j = 0; while j < 11 {{ print(o[j]); j = j + 1; }} \
+             free(h); free(q); free(x); free(o); return 0; }}"
+        ));
+    }
+
     /// A checked gather, `o[i] = t[q[i]] * x[i] + 1.0` over `[]T` slices. `bce` versions the loop
     /// but cannot prove the gathered index, so its fast copy keeps that one check on every
     /// iteration — a second exit the vectorizer used to refuse. Now the check is a lane test: the
