@@ -52,6 +52,8 @@ mod ml_rt;
 mod text_rt;
 // The `i128` operations x64 has no instruction for: wide constants, division, float conversion.
 mod int128;
+// The 8-bit floats' inline codec (`f8e4m3`, `f8e5m2`).
+mod fp8;
 
 // Where each function's machine code went: the DWARF of a `-g` object and the JIT's perf map
 // (`WUKONG_PERF_MAP=1`).
@@ -65,6 +67,11 @@ pub use entry::ObjectKind;
 
 // Stack-slot coloring: allocas with disjoint lifetimes share one frame slot.
 mod stack_color;
+
+// The general vectorizer's `<4 x bf16>` / `<4 x f16>` lanes: an `f32x4` in a register, four 2-byte
+// elements in memory, and the lane-wise grid roundings between the two.
+mod half_lanes;
+use half_lanes::half_x4;
 pub use stack_color::{frame_bytes, FrameBytes};
 
 // --- The minimal runtime the generated code calls back into ---------------------------------
@@ -253,9 +260,19 @@ extern "C" fn rt_print_str(ptr: *const u8) {
     emit_stdout(&line);
 }
 
-extern "C" fn rt_assert(cond: i64) {
+// `wukong_rt_assert(cond, site, message)`: the lowering passes the `assert` call's `.rodata`
+// `file:line:col` and its message literal, each null when the MIR call carried none. A failure is
+// recorded like a bounds failure; the generated code then returns through its callers.
+extern "C" fn rt_assert(cond: i64, site: *const u8, message: *const u8) {
     if cond == 0 {
-        record_failure(|| "assertion failed".to_owned());
+        // SAFETY: each is null or a NUL-terminated `.rodata` string the compiler emitted.
+        let (site, message) = unsafe {
+            (
+                wukong_runtime::site_str(site),
+                wukong_runtime::site_str(message),
+            )
+        };
+        record_failure(|| wukong_runtime::assert_failure_message(&site, &message));
     }
 }
 
@@ -305,9 +322,19 @@ extern "C" fn rt_bounds_fail_abort(index: i64, len: i64, site: *const u8) {
 // there, a failed assertion is fatal (Rust's `panic = "abort"`): a raw caller has no run handle a
 // failure could be reported through, and returning a dummy value would be a silent wrong answer.
 // The assertion lowering only calls this on its failure edge, so `cond` is always 0 in practice.
-extern "C" fn rt_assert_abort(cond: i64) {
+extern "C" fn rt_assert_abort(cond: i64, site: *const u8, message: *const u8) {
     if cond == 0 {
-        eprintln!("error: assertion failed");
+        // SAFETY: as in `rt_assert`.
+        let (site, message) = unsafe {
+            (
+                wukong_runtime::site_str(site),
+                wukong_runtime::site_str(message),
+            )
+        };
+        eprintln!(
+            "error: {}",
+            wukong_runtime::assert_failure_message(&site, &message)
+        );
         std::process::abort();
     }
 }
@@ -766,7 +793,9 @@ enum Intrinsic {
 fn classify_intrinsic(name: &str, arg: Option<&MirType>) -> Option<Intrinsic> {
     match name {
         "print" | "println" => Some(match arg {
-            Some(MirType::F32 | MirType::F16 | MirType::BF16) => Intrinsic::PrintF32,
+            Some(
+                MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2,
+            ) => Intrinsic::PrintF32,
             Some(t) if t.is_float() => Intrinsic::PrintFloat,
             _ => Intrinsic::PrintInt,
         }),
@@ -784,14 +813,9 @@ fn classify_intrinsic(name: &str, arg: Option<&MirType>) -> Option<Intrinsic> {
 
 // --- Type and size mapping ------------------------------------------------------------------
 
-/// Is `t` the general vectorizer's `<4 x bf16>`: four bf16 lanes held as an `f32x4`, stored as four
-/// 2-byte elements? Its loads, stores and grid-rounding casts are lowered on their own.
-fn is_bf16_x4(t: &MirType) -> bool {
-    matches!(t, MirType::Vec(lane, 4) if **lane == MirType::BF16)
-}
-
-/// Map a MIR type to its Cranelift type, or `None` for `Void`. `i1` becomes `i8`; `f16`/`bf16` are
-/// computed as `f32` (matching the interpreter's promotion of sub-`f32` floats).
+/// Map a MIR type to its Cranelift type, or `None` for `Void`. `i1` becomes `i8`; `f16`/`bf16` and
+/// the 8-bit floats are computed as `f32` (matching the interpreter's promotion of sub-`f32`
+/// floats).
 fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
     Some(match t {
         MirType::I1 | MirType::I8 => types::I8,
@@ -799,7 +823,9 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
         MirType::I32 => types::I32,
         MirType::I64 => types::I64,
         MirType::I128 => types::I128,
-        MirType::F16 | MirType::BF16 | MirType::F32 => types::F32,
+        MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 | MirType::F32 => {
+            types::F32
+        }
         MirType::F64 => types::F64,
         MirType::Ptr => ptr_ty,
         MirType::Vec(elem, n) => {
@@ -818,7 +844,7 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
 /// letting the `u32` multiply overflow-panic.
 fn size_of(t: &MirType) -> Option<u32> {
     Some(match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -1273,6 +1299,14 @@ impl<'a> FnTranslator<'a> {
                     .builder
                     .ins()
                     .f32const(wukong_runtime::round_f16(*v as f32)),
+                // An f8 const is the literal rounded once from its f64 value (`fp8.rs`).
+                MirType::F8E4M3 | MirType::F8E5M2 => {
+                    let fmt = fp8::f8_format(ty).expect("an f8 type");
+                    let code = wukong_runtime::fp8::encode_f64(*v, fmt);
+                    self.builder
+                        .ins()
+                        .f32const(wukong_runtime::fp8::decode_f32(code, fmt))
+                }
                 _ => self.builder.ins().f32const(*v as f32),
             },
             Op::Bin(op, l, r) => {
@@ -1395,13 +1429,11 @@ impl<'a> FnTranslator<'a> {
             Op::Load(p, ty) => {
                 let addr = self.val(*p);
                 let flags = self.load_flags_for(*p, ty);
-                if is_bf16_x4(ty) {
-                    // `<4 x bf16>` (the general vectorizer's bf16 lanes): four 2-byte elements,
-                    // each widened exactly as the scalar load above widens one — zero-extended
-                    // into the top half of an f32 lane. Register type is `f32x4` (see `cl_type`).
-                    let ext = self.builder.ins().uload16x4(flags, addr, 0);
-                    let shifted = self.builder.ins().ishl_imm(ext, 16);
-                    self.vec_bitcast(types::F32X4, shifted)
+                if let Some(lane) = half_x4(ty) {
+                    // `<4 x bf16>` / `<4 x f16>` (the general vectorizer's half lanes): four 2-byte
+                    // elements, each widened exactly as the scalar load below widens one. Register
+                    // type is `f32x4` (see `cl_type`).
+                    half_lanes::load_x4(&mut self.builder, lane, flags, addr)
                 } else if matches!(ty, MirType::BF16) {
                     // bf16 storage is 2 bytes; load the 16 bits and widen to f32 exactly (the bits
                     // become the top half of the f32). Register type is f32 (see `cl_type`).
@@ -1411,6 +1443,10 @@ impl<'a> FnTranslator<'a> {
                     self.builder
                         .ins()
                         .bitcast(types::F32, MemFlags::new(), shifted)
+                } else if let Some(fmt) = fp8::f8_format(ty) {
+                    // An f8 is stored as its 1-byte code; decode it exactly into its f32 register.
+                    let code = self.builder.ins().uload8(types::I32, flags, addr, 0);
+                    self.f8_decode(code, fmt)
                 } else if matches!(ty, MirType::F16) {
                     // f16 storage is 2 bytes; widen via the runtime shim (no cheap inline bit-extend
                     // like bf16). Register type is f32.
@@ -1427,18 +1463,11 @@ impl<'a> FnTranslator<'a> {
             Op::Store { ptr, value } => {
                 let addr = self.val(*ptr);
                 let flags = self.mem_flags_for(*ptr);
-                if is_bf16_x4(self.ty_of(*value)) {
-                    // Each lane rounded to bf16 exactly as the scalar store below rounds one, the
-                    // four top halves packed into 8 bytes. After the shift every lane is in
-                    // `0..=0xffff`, so the saturating pack (`packusdw`) is a plain truncation.
+                if let Some(lane) = half_x4(self.ty_of(*value)).cloned() {
+                    // Each lane rounded to its grid exactly as the scalar store below rounds one,
+                    // the four 16-bit encodings packed into 8 bytes.
                     let v = self.val(*value);
-                    let rounded = self.round_to_bf16_x4(v);
-                    let bits = self.vec_bitcast(types::I32X4, rounded);
-                    let hi = self.builder.ins().ushr_imm(bits, 16);
-                    let packed = self.builder.ins().unarrow(hi, hi);
-                    let wide = self.vec_bitcast(types::I64X2, packed);
-                    let low = self.builder.ins().extractlane(wide, 0);
-                    self.builder.ins().store(flags, low, addr, 0);
+                    half_lanes::store_x4(&mut self.builder, &lane, flags, v, addr);
                 } else if matches!(self.ty_of(*value), MirType::BF16) {
                     // Round the f32 register to bf16 and store the top 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -1450,6 +1479,13 @@ impl<'a> FnTranslator<'a> {
                     let hi = self.builder.ins().ushr_imm(bits, 16);
                     let half = self.builder.ins().ireduce(types::I16, hi);
                     self.builder.ins().store(flags, half, addr, 0);
+                } else if let Some(fmt) = fp8::f8_format(self.ty_of(*value)) {
+                    // Encode the f32 register (rounding it, should it be off the grid) and store
+                    // the 1-byte code.
+                    let v = self.val(*value);
+                    let code = self.f8_encode(v, fmt);
+                    let byte = self.builder.ins().ireduce(types::I8, code);
+                    self.builder.ins().store(flags, byte, addr, 0);
                 } else if matches!(self.ty_of(*value), MirType::F16) {
                     // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -1742,18 +1778,28 @@ impl<'a> FnTranslator<'a> {
             FpToUi => self.fcvt_to_int_sat(x, to_ty, false),
             SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
             UiToFp => self.builder.ins().fcvt_from_uint(to_ty, x),
-            // The vectorizer's `<4 x bf16>` casts: a lane-wise `FpExt` to `f32` and `FpTrunc` to
-            // bf16 both round each lane to the bf16 grid, exactly as the scalar forms below do.
-            FpExt | FpTrunc if is_bf16_x4(self.ty_of(v)) || is_bf16_x4(to) => {
+            // The vectorizer's half-lane casts (`<4 x bf16>`, `<4 x f16>`): every lane is an `f32`
+            // in a register on both sides, so a lane-wise `FpExt` rounds each lane to the source's
+            // grid and an `FpTrunc` to the target's, exactly as the scalar forms below do.
+            FpExt | FpTrunc if half_x4(self.ty_of(v)).is_some() || half_x4(to).is_some() => {
+                let four_byte = |t: &MirType| {
+                    matches!(t.lane_type(), MirType::F32 | MirType::BF16 | MirType::F16)
+                };
                 debug_assert!(
-                    matches!(
-                        (kind, self.ty_of(v).lane_type(), to.lane_type()),
-                        (FpExt, MirType::BF16, MirType::F32)
-                            | (FpTrunc, MirType::F32 | MirType::BF16, MirType::BF16)
-                    ),
-                    "a bf16 vector cast the vectorizer never builds"
+                    four_byte(self.ty_of(v)) && four_byte(to),
+                    "a half-lane vector cast the vectorizer never builds"
                 );
-                self.round_to_bf16_x4(x)
+                let grid = if kind == FpExt {
+                    self.ty_of(v).lane_type().clone()
+                } else {
+                    to.lane_type().clone()
+                };
+                match grid {
+                    MirType::BF16 | MirType::F16 => {
+                        half_lanes::round_x4(&mut self.builder, &grid, x)
+                    }
+                    _ => x,
+                }
             }
             FpExt => {
                 // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
@@ -1764,6 +1810,10 @@ impl<'a> FnTranslator<'a> {
                 let xr = match self.ty_of(v) {
                     MirType::BF16 => self.round_to_bf16(x),
                     MirType::F16 => self.round_to_f16(x),
+                    t @ (MirType::F8E4M3 | MirType::F8E5M2) => {
+                        let fmt = fp8::f8_format(t).expect("an f8 type");
+                        self.round_to_f8(x, fmt)
+                    }
                     _ => x,
                 };
                 let xr_ty = self.dfg_ty(xr);
@@ -1774,7 +1824,10 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             FpTrunc => {
-                if matches!(to, MirType::BF16) {
+                if let Some(fmt) = fp8::f8_format(to) {
+                    // One rounding from the source's own precision, `f64` included (`fp8.rs`).
+                    self.round_to_f8(x, fmt)
+                } else if matches!(to, MirType::BF16) {
                     // bf16's register type is f32; demote an f64 source first, then round to bf16.
                     let f = if from_ty == types::F64 {
                         self.builder.ins().fdemote(types::F32, x)
@@ -1986,32 +2039,6 @@ impl<'a> FnTranslator<'a> {
             .bitcast(types::F32, MemFlags::new(), resbits)
     }
 
-    /// [`Self::round_to_bf16`] on each lane of an `f32x4`: the same integer round-to-nearest-even on
-    /// the bits, and the same quiet-NaN rule (keep the top half, set the quiet bit), with a lane
-    /// mask from an unordered compare where the scalar form tests `|bits| > 0x7f800000`.
-    fn round_to_bf16_x4(&mut self, x: Value) -> Value {
-        let splat = |me: &mut Self, k: u32| {
-            let c = me.builder.ins().iconst(types::I32, i64::from(k as i32));
-            me.builder.ins().splat(types::I32X4, c)
-        };
-        let bits = self.vec_bitcast(types::I32X4, x);
-        let shr = self.builder.ins().ushr_imm(bits, 16);
-        let one = splat(self, 1);
-        let lsb = self.builder.ins().band(shr, one);
-        let half = splat(self, 0x7fff);
-        let bias = self.builder.ins().iadd(lsb, half);
-        let summed = self.builder.ins().iadd(bits, bias);
-        let top = splat(self, 0xffff_0000);
-        let nonnan = self.builder.ins().band(summed, top);
-        let masked = self.builder.ins().band(bits, top);
-        let quiet = splat(self, 0x0040_0000);
-        let nanres = self.builder.ins().bor(masked, quiet);
-        let isnan = self.builder.ins().fcmp(FloatCC::Unordered, x, x);
-        let isnan = self.vec_bitcast(types::I32X4, isnan);
-        let resbits = self.builder.ins().bitselect(isnan, nanres, nonnan);
-        self.vec_bitcast(types::F32X4, resbits)
-    }
-
     /// Round an `f32` to f16 precision and back to `f32`, by calling the runtime shims
     /// (`wukong_f32_to_f16_bits` then `wukong_f16_bits_to_f32`). f16's exponent/mantissa layout has
     /// no cheap inline round like bf16, so a call to the *identical* `half`-crate conversion the
@@ -2074,7 +2101,7 @@ impl<'a> FnTranslator<'a> {
                 let status = self.runtime_ref(RT_ASSERT_FAILED);
                 let check = self.builder.ins().call(status, &[]);
                 let failed = self.builder.inst_results(check)[0];
-                self.return_on_assert_failure(failed, false);
+                self.return_on_assert_failure(failed, None);
             }
             return result;
         }
@@ -2093,7 +2120,7 @@ impl<'a> FnTranslator<'a> {
                 let status = self.runtime_ref(RT_ASSERT_FAILED);
                 let check = self.builder.ins().call(status, &[]);
                 let failed = self.builder.inst_results(check)[0];
-                self.return_on_assert_failure(failed, false);
+                self.return_on_assert_failure(failed, None);
             }
             return None;
         }
@@ -2557,7 +2584,7 @@ impl<'a> FnTranslator<'a> {
             let fref = self.runtime_ref(RT_BOUNDS_FAIL);
             self.builder.ins().call(fref, &[index, len, site]);
             let failed = self.builder.ins().iconst(types::I8, 1);
-            self.return_on_assert_failure(failed, false);
+            self.return_on_assert_failure(failed, None);
             return None;
         }
         // Every other failed run-time check: wukong_rt_check_fail(kind, a, b, site), the same
@@ -2570,7 +2597,7 @@ impl<'a> FnTranslator<'a> {
             let fref = self.runtime_ref(RT_CHECK_FAIL);
             self.builder.ins().call(fref, &[kind, a, b, site]);
             let failed = self.builder.ins().iconst(types::I8, 1);
-            self.return_on_assert_failure(failed, false);
+            self.return_on_assert_failure(failed, None);
             return None;
         }
         // The file-I/O intrinsics: wukong_rt_{read,write}_{f32,f64,i32,i64,i8,u8}(path, data, len) -> i64.
@@ -2839,7 +2866,7 @@ impl<'a> FnTranslator<'a> {
             let status = self.runtime_ref(RT_ASSERT_FAILED);
             let check = self.builder.ins().call(status, &[]);
             let stopped = self.builder.inst_results(check)[0];
-            self.return_on_assert_failure(stopped, false);
+            self.return_on_assert_failure(stopped, None);
             return None;
         }
         // The text builtins' entries (the `text_rt` table).
@@ -2920,6 +2947,10 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             Intrinsic::Assert => {
+                // `assert(cond[, site[, message]])`: the operands after the condition are the
+                // `.rodata` strings the failure reports (`wukong_mir_build/src/bounds.rs`).
+                let site = args.get(1).map(|&a| self.val(a));
+                let message = args.get(2).map(|&a| self.val(a));
                 let failed = if let Some(&a) = args.first() {
                     let value = self.val(a);
                     let ty = self.dfg_ty(value);
@@ -2942,7 +2973,7 @@ impl<'a> FnTranslator<'a> {
                 } else {
                     self.builder.ins().iconst(types::I8, 1)
                 };
-                self.return_on_assert_failure(failed, true);
+                self.return_on_assert_failure(failed, Some([site, message]));
             }
         }
         None
@@ -2950,15 +2981,26 @@ impl<'a> FnTranslator<'a> {
 
     /// Return normally through generated callers; never unwind Rust through an extern-C frame.
     /// A caller checks the shared failure flag before it can observe the dummy return value.
-    fn return_on_assert_failure(&mut self, failed: Value, record: bool) {
+    /// `record` is `Some([site, message])` for a failed `assert`, which the stop block reports
+    /// through `wukong_rt_assert(0, site, message)` (a missing operand passes null); `None` when
+    /// the failure was already recorded by the call that raised it.
+    fn return_on_assert_failure(&mut self, failed: Value, record: Option<[Option<Value>; 2]>) {
         let stop = self.builder.create_block();
         let resume = self.builder.create_block();
         self.builder.ins().brif(failed, stop, &[], resume, &[]);
         self.builder.switch_to_block(stop);
-        if record {
+        if let Some(operands) = record {
             let zero = self.builder.ins().iconst(types::I64, 0);
+            let mut call_args = vec![zero];
+            for operand in operands {
+                let v = match operand {
+                    Some(v) => v,
+                    None => self.builder.ins().iconst(self.ptr_ty, 0),
+                };
+                call_args.push(v);
+            }
             let assert = self.runtime_ref(RT_ASSERT);
-            self.builder.ins().call(assert, &[zero]);
+            self.builder.ins().call(assert, &call_args);
         }
         match cl_type(&self.func.ret, self.ptr_ty) {
             None => {
@@ -3627,7 +3669,7 @@ fn populate_module<M: Module>(
     // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
     // Stack-slot coloring needs to know which calls may retain a pointer (`stack_color`).
-    let captures = stack_color::enabled().then(|| wukong_opt::CaptureSummary::analyze(program));
+    let captures = stack_color::enabled().then(|| stack_color::capture_summary(program, interner));
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 
@@ -3906,6 +3948,11 @@ fn populate_module<M: Module>(
         sig_check_fail.params.push(AbiParam::new(types::I64));
     }
     sig_check_fail.params.push(AbiParam::new(ptr_ty));
+    // wukong_rt_assert(cond: i64, site: ptr, message: ptr) -- either pointer may be null
+    let mut sig_assert = Signature::new(call_conv);
+    sig_assert.params.push(AbiParam::new(types::I64));
+    sig_assert.params.push(AbiParam::new(ptr_ty));
+    sig_assert.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -3920,7 +3967,7 @@ fn populate_module<M: Module>(
             .declare_function(RT_PRINT_STR, Linkage::Import, &sig_print_str)
             .map_err(|e| e.to_string())?,
         assert: module
-            .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
+            .declare_function(RT_ASSERT, Linkage::Import, &sig_assert)
             .map_err(|e| e.to_string())?,
         assert_failed: module
             .declare_function(RT_ASSERT_FAILED, Linkage::Import, &sig_now_ns)
@@ -5280,7 +5327,7 @@ unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
         // [127:32]. Reading those 64 bits as an `f64` reinterprets a live float as a denormal —
         // `fn main() -> f32 { return 42.9; }` (XMM0[31:0] = 0x422b_999a) came out as 5.4e-315,
         // which `as i64` saturates to 0, while the interpreter oracle exits 42.
-        MirType::F32 | MirType::F16 | MirType::BF16 => {
+        MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 => {
             let f: extern "C" fn() -> f32 = std::mem::transmute(code);
             f() as i64
         }
@@ -6929,6 +6976,15 @@ mod tests;
 
 #[cfg(test)]
 mod lane_op_tests;
+
+#[cfg(test)]
+mod fp8_tests;
+
+#[cfg(test)]
+mod half_lane_tests;
+
+#[cfg(test)]
+mod avx2_f16_tests;
 
 #[cfg(test)]
 mod assertion_tests;

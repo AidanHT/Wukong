@@ -707,7 +707,8 @@ pub(super) fn apply(f: &mut Function, p: &OuterPlan) {
         .map(|v| f.value_type(*v).clone())
         .collect();
     let inner_params: Vec<ValueId> = f.block(p.inner_header).params.clone();
-    let mut e = Emit { f };
+    // The nest's new values stay unlocated (sound: an entry may be lost, never invented).
+    let mut e = Emit::new(f, Span::dummy());
 
     let guard_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
     let guard = e.block(guard_params.clone(), Terminator::Unreachable);

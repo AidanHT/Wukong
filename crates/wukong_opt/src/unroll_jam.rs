@@ -1280,6 +1280,8 @@ fn clone_insts(
         let result = inst.result.map(|r| {
             let ty = f.value_type(r).clone();
             let nv = fresh(f, ty);
+            // A row's copy is the same source as the original (`unroll::clone_insts`).
+            f.copy_value_loc(r, nv);
             map.insert(r.0, nv);
             nv
         });
@@ -1532,6 +1534,7 @@ fn apply(f: &mut Function, n: &Nest) -> BlockId {
     for &p in &oh.params {
         let ty = f.value_type(p).clone();
         let nv = fresh(f, ty);
+        f.copy_value_loc(p, nv);
         rmap.insert(p.0, nv);
         rh_params.push(nv);
     }
@@ -1567,6 +1570,7 @@ fn apply(f: &mut Function, n: &Nest) -> BlockId {
         let ty = f.value_type(p).clone();
         if i == n.t_index {
             let nv = fresh(f, ty);
+            f.copy_value_loc(p, nv);
             for map in maps.iter_mut() {
                 map.insert(p.0, nv);
             }
@@ -1574,6 +1578,7 @@ fn apply(f: &mut Function, n: &Nest) -> BlockId {
         } else {
             for map in maps.iter_mut() {
                 let nv = fresh(f, ty.clone());
+                f.copy_value_loc(p, nv);
                 map.insert(p.0, nv);
                 jh_params.push(nv);
             }
@@ -1621,6 +1626,7 @@ fn apply(f: &mut Function, n: &Nest) -> BlockId {
         for &p in &ix.params {
             let ty = f.value_type(p).clone();
             let nv = fresh(f, ty);
+            f.copy_value_loc(p, nv);
             map.insert(p.0, nv);
             jx_params.push(nv);
         }

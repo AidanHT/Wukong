@@ -56,7 +56,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 31] {
+pub(crate) fn entries() -> [Entry; 33] {
     use Abi::{Ptr, F32, F64, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -248,6 +248,20 @@ pub(crate) fn entries() -> [Entry; 31] {
             params: &[Ptr, I64, Ptr, I64, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_quantize_q4_0_f32 as *const u8,
+        },
+        // (q, nq, scale, nscale, group, out, nout) -> i64: `dequant_i4`.
+        Entry {
+            name: "wukong_dequant_i4_f32",
+            params: &[Ptr, I64, Ptr, I64, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_dequant_i4_f32 as *const u8,
+        },
+        // (q, nq, scale, nscale, zero, nzero, group, out, nout) -> i64: `dequant_u4`.
+        Entry {
+            name: "wukong_dequant_u4_f32",
+            params: &[Ptr, I64, Ptr, I64, Ptr, I64, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_dequant_u4_f32 as *const u8,
         },
         // (w, nw, x, nx, y, ny) -> i64: `gemv_q8_0` / `gemv_q4_0`.
         Entry {

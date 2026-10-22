@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0440
+module tests.fail.f8_format_mix
+
+// The two 8-bit floats each hold values the other cannot: E4M3FN has a fourth mantissa bit
+// (1.125 is not an E5M2 value) and E5M2 two more octaves of range (57344 is not an E4M3FN value),
+// so neither is a lossless common type and mixing them is E0440, as `f16` with `bf16` is. Either
+// one widens to `f16`, `bf16`, `f32` or `f64` without loss, so `a as f32 + b as f32` is the fix.
+fn sum(a: f8e4m3, b: f8e5m2) -> f32 {
+    return (a + b) as f32;
+}
+
+fn main() -> i32 {
+    return sum(1.125f8e4m3, 2.0f8e5m2) as i32;
+}

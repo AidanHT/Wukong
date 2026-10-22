@@ -8,6 +8,7 @@
 //! type's note before building on the two-level design).
 
 mod builder;
+pub mod f16_bits;
 mod inst;
 #[cfg(test)]
 mod lane_op_tests;
@@ -22,9 +23,9 @@ pub use inst::{
     IntUnOp, NarrowKind, Op, RoundMode, SwitchCase, Terminator, MAX_ALLOCA_ALIGN,
 };
 pub use vec_kernel::{
-    host_supports_vec_kernels, op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecLane,
-    VecOp, VecPressure, VecRedOp, VecReduce, VecValue, VEC_BYTES, VEC_LANES, VEC_MAX_STREAMS,
-    VEC_NREG,
+    host_supports_f16c_kernels, host_supports_vec_kernels, op_operands, op_produces_value, VecBin,
+    VecCmp, VecKernel, VecLane, VecOp, VecPressure, VecRedOp, VecReduce, VecValue, VEC_BYTES,
+    VEC_LANES, VEC_MAX_STREAMS, VEC_NREG,
 };
 
 use wukong_span::{Span, Symbol};
@@ -67,6 +68,16 @@ pub enum MirType {
     I128,
     F16,
     BF16,
+    /// OCP FP8 E4M3FN (`f8e4m3` in source). Like `F16`/`BF16` it is a narrow float that every
+    /// backend holds in an `f32` register on its grid and stores as its 1-byte code: a constant, a
+    /// load, an `FpTrunc` to it and an `FpExt` from it round onto the grid (`wukong_runtime::fp8`'s
+    /// bit-level codec, saturating at ±448), and arithmetic computes in `f32` with `mir_build`
+    /// rounding each result by a same-type `FpTrunc`. Scalar only: no vector has f8 lanes and no
+    /// bitcast reinterprets one (the verifier rejects both), since its register is not its code.
+    F8E4M3,
+    /// OCP FP8 E5M2 (`f8e5m2` in source): the top byte of an `f16`, with infinities. Held and
+    /// rounded exactly as [`MirType::F8E4M3`] is.
+    F8E5M2,
     F32,
     F64,
     Ptr,
@@ -93,6 +104,8 @@ impl MirType {
             I128 | U128 => MirType::I128,
             F16 => MirType::F16,
             Bf16 => MirType::BF16,
+            F8E4M3 => MirType::F8E4M3,
+            F8E5M2 => MirType::F8E5M2,
             F32 => MirType::F32,
             F64 => MirType::F64,
             // A Unicode scalar value is a 32-bit integer in MIR (signless, like every int).
@@ -110,7 +123,27 @@ impl MirType {
     pub fn is_float(&self) -> bool {
         matches!(
             self,
-            MirType::F16 | MirType::BF16 | MirType::F32 | MirType::F64
+            MirType::F16
+                | MirType::BF16
+                | MirType::F8E4M3
+                | MirType::F8E5M2
+                | MirType::F32
+                | MirType::F64
+        )
+    }
+
+    /// The two 8-bit floats (scalar only, so never a vector lane).
+    pub fn is_f8(&self) -> bool {
+        matches!(self, MirType::F8E4M3 | MirType::F8E5M2)
+    }
+
+    /// A float narrower than `f32` that lives in an `f32` register and is rounded onto its own
+    /// grid at every observation boundary: `f16`, `bf16`, `f8e4m3`, `f8e5m2` (or a vector of a
+    /// 16-bit one).
+    pub fn is_sub_f32_float(&self) -> bool {
+        matches!(
+            self.lane_type(),
+            MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2
         )
     }
 
@@ -137,6 +170,8 @@ impl MirType {
             MirType::I128 => "i128".into(),
             MirType::F16 => "f16".into(),
             MirType::BF16 => "bf16".into(),
+            MirType::F8E4M3 => "f8e4m3".into(),
+            MirType::F8E5M2 => "f8e5m2".into(),
             MirType::F32 => "f32".into(),
             MirType::F64 => "f64".into(),
             MirType::Ptr => "ptr".into(),
@@ -244,9 +279,12 @@ pub struct Function {
 /// - No pass renumbers a `ValueId` (`value_types` only ever grows, and a new value is appended
 ///   at its end), so an entry can be lost but never transferred to another value.
 ///
-/// `wukong_mir_build` fills it for every value it creates. Of the optimizer's passes only
-/// inlining (a callee's values keep the callee's spans) and loop unrolling (each copy keeps its
-/// original's span) carry locations onto values they create; every other new value stays unknown.
+/// `wukong_mir_build` fills it for every value it creates. The optimizer's passes that copy
+/// located code carry each original's span onto its copy: inlining (a callee's values keep the
+/// callee's spans), loop unrolling and unroll-and-jam, bounds-check versioning and unswitching
+/// (each copy of a loop) and jump threading (each copy of a block). The vectorizer attributes each
+/// widened step to its scalar step's span and the guard, trip and exit it adds to the loop's. Every
+/// other new value stays unknown.
 /// The Cranelift backend tags each instruction with the `ValueId` it lowers (its `SourceLoc`), so
 /// a machine-code range maps back to a span through [`Function::value_loc`], and a backend
 /// failure points at the value it was lowering. The interpreter and the MIR printer ignore it, so

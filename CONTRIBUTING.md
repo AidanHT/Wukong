@@ -271,8 +271,8 @@ build it with `-g` and use a debugger: `wukongc --emit=exe -g -O2 bug.wk -o bug.
 `gdb bug.exe` breaks by function or `bug.wk:<line>`, steps by line and backtraces through every
 Wukong frame (`docs/internals.md`, "Debug info and the JIT perf map"); `-g` changes no machine code.
 A value a pass creates is attributed to a line only if the pass copies a location onto it
-(`Function::copy_value_loc`, as inlining and unrolling do); otherwise its code continues the line
-before it.
+(`Function::copy_value_loc`, as inlining, unrolling and the loop-copying passes do; the vectorizer
+sets its builder's current location instead); otherwise its code continues the line before it.
 
 ## Adding a language feature
 
@@ -457,6 +457,18 @@ suffix, an all-literal expression adapting as a whole, a `char`, an array length
 must range-check it against the type it lands in, or it silently keeps its low bits
 (`tests/fail/suffixed_literal_out_of_range.wk` and its siblings).
 
+A float narrower than `f32` (`f16`, `bf16`, and the 8-bit `f8e4m3`/`f8e5m2`) is the other worked
+example: it lives in an `f32` register on its own grid, so the audit is every **observation
+boundary** where a value can leave the grid unrounded — a constant, a load, a store, a conversion
+to it, a widening from it, and every value `mir_build` builds at the type (an arithmetic result, an
+integer converted to it, a math builtin's polynomial — whose constants, such as `+inf`, may not
+exist at the narrow type) — plus every optimizer rule that could forward or fold past one
+(`simplify`'s folds, `cse::forwardable`). `MirType::is_sub_f32_float` names the family; a missed
+boundary shows up as `-O0` != `-O2`, never as interp != native, so pin each with an opaque
+operand at both levels. A new format's codec needs a reference written differently from the
+production one (`wukong_runtime::fp8`'s exact-`f64` reference beside its bit-level codec) and a
+sweep of every code and every midpoint on each backend.
+
 ## Adding a runtime kernel (and its recognizer)
 
 A "recognized kernel" is a loop shape that `wukong_mir_build` pattern-matches and replaces with a
@@ -493,6 +505,21 @@ call to a hand-written `extern "C"` kernel in `wukong_runtime`. Six layers, all 
    `_parallel` symbol), and writes the results back. Without it the interpreter aborts on the call.
 6. **Fixture** — `tests/run/<name>.wk`, which `cargo test -p wukongc --test run` runs on both
    backends at every `-O` level.
+
+If the kernel writes every element of its output before reading any of it, add it to
+`wukong_runtime::OVERWRITES` (`crates/wukong_runtime/src/overwrite.rs`) with the operand values
+that guarantee it — and its test operands in that module's `calls`/`invoke` — so the native backend's
+stack coloring can end a scratch array's lifetime at the call. The entry is a promise the coloring
+trusts: `every_contract_holds_on_the_kernel` runs it against the kernel over four output fills (a
+NaN, `-3.0e30`, `+3.0e30` and a per-element pattern, chosen so a sum, product, max, min or magnitude
+fold seeded from the output is caught), and probes every integer operand the entry leaves free at
+0 and -1, so an early exit on a value the entry admits (an unknown op code, a zero flag) fails it;
+an extent or `positive` operand must be listed (a GEMM's `K <= 0` writes nothing). A `_parallel`
+entry with a size gate of its own needs a test shape past that gate (`past_size_gate`), or the test
+only ever runs its serial fallback. The fills are a test, not a proof: a read of the old value
+through a computation every fill is an identity of still passes, so read the kernel too — a fold
+must seed from its input (as the column max seeds from row 0), never from `out`. A kernel left out
+of the table is merely assumed to read its output.
 
 If the kernel is differentiable, mirror it in `crates/wukong_autodiff/src/tape.rs` (`Syms`,
 `is_kernel`, `diff_kernel_call`) — **including the `_parallel` spelling**: a `_parallel` recognizer
@@ -542,7 +569,13 @@ runtime (`WUKONG_RT_C` in `crates/wukong_driver/src/lib.rs`); the interpreter, b
 the AOT link already route every kind through the one formatter. Pin the message with a `tests/run`
 fixture's `// EXPECT-STDERR:` lines, and fail it inside a helper function too, with output after the
 call, so the differential gate sees a caller that runs on. An element access keeps
-`wukong_rt_bounds_fail`, which `wukong_opt::bce` keys on. A new failure *entry* (a runtime function
+`wukong_rt_bounds_fail`, which `wukong_opt::bce` keys on. A check whose condition is already an
+`i1` and that needs no operands in its message can instead trap through the `assert` intrinsic with
+the construct's site, as the kernel builtins' extent checks do
+(`emit_builtin_checks(checks, span)`): build its operands with `assert_site_operands(span, None)`,
+which appends the site placeholder only when the lowering has a source locator. Either way, add a
+case for the new trap to `crates/wukongc/tests/runtime_sites.rs`, so its exact message is pinned on
+the interpreter, the JIT and a linked executable. A new failure *entry* (a runtime function
 that stops the run, rather than a new kind of the existing one) must also join
 `is_failure_intrinsic` in `crates/wukong_codegen_cranelift/src/lib.rs`: the JIT returns a failure
 through its callers, and a call is followed by a status poll only when the callee is known to be

@@ -1087,3 +1087,55 @@ fn zero_trip_vector_recipes_constrain_no_stream_base() {
         }
     }
 }
+
+/// An f16 stream is one slot per element like any other, and the recipe's evaluator rounds what
+/// its f16 operations read and write, as the machine code's `vcvtph2ps`/`vcvtps2ph` do. A slot of
+/// an f16 stream may hold a value off the f16 grid (the interpreter stores a scalar f16 value as
+/// is and rounds on load), so `LoadF16` must round it; `StoreF16` writes, and forwards to a later
+/// `LoadF16` of its stream, the rounded lane. Here stream 0 holds 2049 (between the f16 values
+/// 2048 and 2050, a tie that goes to even), 0.1 and a quiet NaN; stream 1 receives each rounded
+/// and stream 2 the `f32` reload of stream 1.
+#[test]
+fn vector_recipe_f16_streams_round_where_the_conversions_do() {
+    let mut interner = Interner::new();
+    let program = one_recipe_program(
+        &mut interner,
+        3,
+        0,
+        vec![
+            VecOp::LoadF16 { stream: 0 },
+            VecOp::StoreF16 { stream: 1, val: 0 },
+            VecOp::LoadF16 { stream: 1 },
+            VecOp::Store { stream: 2, val: 2 },
+        ],
+    );
+    let mut interp = interpreter(&program, &interner);
+    let input = [2049.0, 0.1, f64::NAN, -0.0, 65520.0, 1e-8, 3.0, -2.5];
+    let mut memory = vec![Value::Unit; 40];
+    memory[0] = P(8);
+    memory[1] = P(16);
+    memory[2] = P(24);
+    for (k, &x) in input.iter().enumerate() {
+        memory[8 + k] = F(x);
+    }
+    interp.memory = memory;
+    interp
+        .run_function(&program.funcs[0], &[P(0), P(3), I(8)])
+        .unwrap();
+    for (k, &x) in input.iter().enumerate() {
+        let want = wukong_runtime::round_f16(x as f32).to_bits();
+        for slot in [16 + k, 24 + k] {
+            let Value::Float(got) = interp.memory[slot] else {
+                panic!("slot {slot} holds {:?}", interp.memory[slot]);
+            };
+            assert_eq!(
+                (got as f32).to_bits(),
+                want,
+                "lane {k} ({x}) at slot {slot}"
+            );
+        }
+    }
+    // 2049 rounds to even (2048), 65520 to infinity.
+    assert_eq!(interp.memory[16], F(2048.0));
+    assert_eq!(interp.memory[20], F(f64::INFINITY));
+}

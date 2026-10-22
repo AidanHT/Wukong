@@ -1,0 +1,86 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -8 120 -8 7
+// EXPECT-OUT: -7 105 -7 6
+// EXPECT-OUT: -6 90 -6 5
+// EXPECT-OUT: -5 75 -5 4
+// EXPECT-OUT: -4 60 -4 3
+// EXPECT-OUT: -3 45 -3 2
+// EXPECT-OUT: -2 30 -2 1
+// EXPECT-OUT: -1 15 -1 0
+// EXPECT-OUT: 0 240 0 -1
+// EXPECT-OUT: 1 225 1 -2
+// EXPECT-OUT: 2 210 2 -3
+// EXPECT-OUT: 3 195 3 -4
+// EXPECT-OUT: 4 180 4 -5
+// EXPECT-OUT: 5 165 5 -6
+// EXPECT-OUT: 6 150 6 -7
+// EXPECT-OUT: 7 135 7 -8
+// EXPECT-OUT: 0 240 0 15
+// EXPECT-OUT: 1 225 1 14
+// EXPECT-OUT: 2 210 2 13
+// EXPECT-OUT: 3 195 3 12
+// EXPECT-OUT: 4 180 4 11
+// EXPECT-OUT: 5 165 5 10
+// EXPECT-OUT: 6 150 6 9
+// EXPECT-OUT: 7 135 7 8
+// EXPECT-OUT: 8 120 8 7
+// EXPECT-OUT: 9 105 9 6
+// EXPECT-OUT: 10 90 10 5
+// EXPECT-OUT: 11 75 11 4
+// EXPECT-OUT: 12 60 12 3
+// EXPECT-OUT: 13 45 13 2
+// EXPECT-OUT: 14 30 14 1
+// EXPECT-OUT: 15 15 15 0
+// EXPECT-OUT: 197
+// EXPECT-OUT: (5, 12)
+// EXPECT-OUT: 135
+// EXPECT-OUT: (7, -8)
+// EXPECT-OUT: (0, 0)
+// EXPECT-OUT: (-1, -1)
+// EXPECT-OUT: (15, 15)
+// EXPECT-OUT: (-8, 7)
+// EXPECT-OUT: (8, 7)
+module tests.run.int4_pack
+
+// Two 4-bit integers per byte: `pack_i4` / `pack_u4` put `lo` in bits 0..4 and `hi` in bits 4..8,
+// and `unpack_i4` / `unpack_u4` take them back as `(lo, hi)` -- a signed nibble sign-extended from
+// its fourth bit, an unsigned one zero-extended. Every signed nibble -8..=7 goes through the low half
+// with its complement `-1 - v` in the high half (so both halves see all sixteen values), every
+// unsigned nibble 0..=15 likewise with `15 - u`. Each line is `v`, the byte, and the unpacked pair.
+//
+// Expected by hand from the definition: the byte is `(v & 15) | ((hi & 15) << 4)`, e.g. -8 is the
+// nibble 1000 and its complement 7 the nibble 0111, so the byte is 0x78 = 120. A run-time operand
+// outside the nibble keeps its low four bits, as `as` would: 37 -> 5, 300 -> 12 (0xC5 = 197); -9 ->
+// 7 (two's complement ...0111), 8 -> 8 (0x87 = 135, which unpacks signed as (7, -8)). The last lines
+// unpack fixed bytes: 0x00, 0xFF (signed -1 twice, unsigned 15 twice) and 0x78.
+fn main() -> i32 {
+    let z: i64 = arg_count() - 1;
+    for v in -8..8 {
+        let x = (z + v) as i8;
+        let b = pack_i4(x, -1 - x);
+        let (lo, hi) = unpack_i4(b);
+        printf("{} {} {} {}\n", v, b, lo, hi);
+    }
+    for u in 0..16 {
+        let x = (z + u) as u8;
+        let b = pack_u4(x, 15 - x);
+        let (lo, hi) = unpack_u4(b);
+        printf("{} {} {} {}\n", u, b, lo, hi);
+    }
+    let w = pack_u4((z + 37) as u64, (z + 300) as i32);
+    print(w);
+    print(unpack_u4(w));
+    let s = pack_i4((z - 9) as i16, z + 8);
+    print(s);
+    print(unpack_i4(s));
+    let zero: u8 = z as u8;
+    let ones: u8 = (z + 255) as u8;
+    let mixed: u8 = (z + 0x78) as u8;
+    print(unpack_i4(zero));
+    print(unpack_i4(ones));
+    print(unpack_u4(ones));
+    print(unpack_i4(mixed));
+    print(unpack_u4(mixed));
+    return 0;
+}

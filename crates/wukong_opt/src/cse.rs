@@ -313,6 +313,8 @@ fn scalar_of(code: u64) -> MirType {
         9 => MirType::F64,
         10 => MirType::Ptr,
         12 => MirType::I128,
+        13 => MirType::F8E4M3,
+        14 => MirType::F8E5M2,
         _ => MirType::Void,
     }
 }
@@ -336,6 +338,8 @@ fn scalar_code(ty: &MirType) -> Option<u64> {
         MirType::Ptr => 10,
         MirType::Void => 11,
         MirType::I128 => 12,
+        MirType::F8E4M3 => 13,
+        MirType::F8E5M2 => 14,
         MirType::Vec(..) | MirType::Array(..) => return None,
     })
 }
@@ -403,12 +407,12 @@ enum MemKey {
 
 /// May a load or store of `ty` participate in forwarding at all?
 ///
-/// `bf16`/`f16` are excluded: their register form is `f32` and the narrowing happens on the way to
-/// (2-byte) storage, so forwarding a stored `f32` register straight into a later load would skip the
-/// rounding and change the value. That is the open `-O0` != `-O2` half-float defect (gap-hunt 15D);
-/// this pass must not widen it.
+/// `bf16`/`f16` and the f8 floats are excluded: their register form is `f32` and the narrowing
+/// happens on the way to (2- or 1-byte) storage, so forwarding a stored `f32` register straight
+/// into a later load would skip the rounding and change the value. That is the open `-O0` !=
+/// `-O2` half-float defect (gap-hunt 15D); this pass must not widen it.
 fn forwardable(ty: &MirType) -> bool {
-    !matches!(ty, MirType::F16 | MirType::BF16)
+    !ty.is_sub_f32_float()
 }
 
 /// A typed value-numbering key for a pure op. One variant per cacheable `Op`, carrying its
@@ -1370,10 +1374,14 @@ mod tests {
             MirType::I64,
             MirType::F16,
             MirType::BF16,
+            MirType::F8E4M3,
+            MirType::F8E5M2,
             MirType::F32,
             MirType::F64,
             MirType::Ptr,
             MirType::Void,
+            MirType::I128,
+            MirType::Array(Box::new(MirType::F8E5M2), 3),
             MirType::Vec(Box::new(MirType::F32), 4),
             MirType::Vec(Box::new(MirType::I64), 2),
             MirType::Array(Box::new(MirType::I8), 16),

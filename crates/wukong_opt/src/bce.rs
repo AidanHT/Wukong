@@ -1018,6 +1018,8 @@ fn apply(f: &mut Function, p: &Plan) {
             .chain(blk.insts.iter().filter_map(|i| i.result))
         {
             let nv = fresh_like(&mut f.value_types, v);
+            // The check-free copy is the same source as the loop it copies.
+            f.copy_value_loc(v, nv);
             vmap.insert(v.0, nv);
         }
     }
@@ -1075,7 +1077,11 @@ fn apply(f: &mut Function, p: &Plan) {
     // fresh parameters, and every use after the loop reads those instead.
     let merged: Vec<ValueId> = live_out
         .iter()
-        .map(|v| fresh_like(&mut f.value_types, *v))
+        .map(|v| {
+            let nv = fresh_like(&mut f.value_types, *v);
+            f.copy_value_loc(*v, nv);
+            nv
+        })
         .collect();
     let fast_out: Vec<ValueId> = live_out.iter().map(|v| m(*v)).collect();
     let fast_header = blk_map(p.header);

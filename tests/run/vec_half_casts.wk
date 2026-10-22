@@ -1,0 +1,430 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9221124635087601664 9222246136947933184 9223372036854775808 0 9218868437227405312 18442240474082181120 4604930618986332160
+// EXPECT-OUT: 13831117405608214528 4494592428115755008 4674732015164063744 4602683217219158016 4539619628296437760 13826050856027422720 4638703218145099776
+// EXPECT-OUT: 4638707616191610880 13855605728582041600 9221124635087601664 9222246136947933184 9223372036854775808 0 9218868437227405312
+// EXPECT-OUT: 9221155421413179392 13830554455654793216 13830554455654793216 9218868437227405312 18442240474082181120 4602678819172646912 13837872805049270272
+// EXPECT-OUT: 13830554455654793216 5183607986731352064 4575657221408423936 4746794007244308480 13970166044105375744 4746829191618494464 4643140847074803712
+// EXPECT-OUT: 4643176031446892544 13860179696953589760 9221155421413179392 13830554455654793216 13830554455654793216 9218868437227405312 18442240474082181120
+// EXPECT-OUT: 32257 32512 32768 0 31744 64512 16512 49856 2 31744 15874 1534 48640 24063 24064 55472 32257 32512 32768 0 31744
+// EXPECT-OUT: 32705 49216 49216 32640 65408 16320 49436 49216 32640 15552 20416 53184 20418 17470 17471 50072 32705 49216 49216 32640 65408
+// EXPECT-OUT: 0 0 0 0 2147483647 -2147483648 1 -2 0 65504 1 0 -1 255 256 -100 0 0 0 0 2147483647
+// EXPECT-OUT: 0 0 0 2147483647 -2147483648 1 -2 0 2147483647 1 2147483647 -2147483648 2147483647 255 256 -100 0 0 0 2147483647 -2147483648
+// EXPECT-OUT: 0 0 0 0 255 0 1 0 0 255 1 0 0 255 255 0 0 0 0 0 255
+// EXPECT-OUT: 0 15360 48128 26624 26626 31743 31743 31744 64512 31744 31744 64512 25552 27648 22448 30720 0 15360 48128 26624 26626
+// EXPECT-OUT: 0 16256 49024 17280 17282 19328 20224 52992 18304 18804 49818 19456 20223 17985 18371 19328 0 16256 49024 17280 17282
+// EXPECT-OUT: 0 15360 48128 30720 63488 26624 26626 27648 60417 25598 25601 29191 61959 23544 23552 26623 0 15360 48128 30720 63488
+// EXPECT-OUT: 32257 32257 32768 0 32512 32512 55445 23322 64512 31744 1024 0 32257 32257 30236 31744 32257 32257 32768 0 32512 32512 55445 23322 64512 31744 1024 0 32257 32257 30236 31744 32257 32257 32768 0 32512 32512 55445 23322 64512 31744
+// EXPECT-OUT: 32705 32705 65472 32640 65472 65408 17249 16546 32640 65408 56960 24192 32705 32705 18120 18304 32705 32705 65472 32640 65472 65408 17249 16546 32640 65408 56960 24192 32705 32705 18120 18304 32705 32705 65472 32640 65472 65408 17249 16546 32640 65408
+module tests.run.vec_half_casts
+
+// bf16/f16 casts through f64 and to and from integers, and bf16/f16 interleave groups, widened by
+// the general vectorizer (-O2) with no lane replicated: a half lane is an f32 lane, so a cast
+// through f64 is the half grid rounding plus the f32 <-> f64 widen or narrow (in the scalar cast's
+// order), a cast to or from an integer is the f32 one (the sitofp rounds nothing at the half grid:
+// an integer becomes an f32 and the fptrunc mir_build places after it rounds it to the half grid,
+// so i32 -> bf16 rounds twice), and a stride-2 group is split and merged by lane shuffles. n = 21:
+// five groups of four lanes and one scalar lane, except where a narrower lane sets the group
+// (sixteen lanes and five scalar ones for the u8 loop, eight and five for the i16 one). Every lane
+// is printed, floats as raw bits.
+//
+// Each kernel calls itself when `z > 0` (never, here), so the inliner keeps it out of `main` and
+// its trip a runtime value.
+//
+// x[i] = HX[i % 16] (f16 bits), b[i] = BX[i % 16] (bf16 bits), p[i] = IX[i % 16],
+// q[i] = JX[i % 16], s[i] = SX[i % 16]:
+//   HX = 7e01 (qNaN), 7d00 (sNaN, read back quiet as 7f00), 8000, 0000, 7c00, fc00, 3e00 (1.5),
+//        c080 (-2.25), 0001 (2^-24), 7bff (65504), 3c01 (1.0009765625), 03ff (1023 * 2^-24),
+//        bc00 (-1), 5bff (255.875), 5c00 (256), d640 (-100)
+//   BX = 7fc1 (qNaN), 8000, 0000, 7f80, ff80, 3fc0 (1.5), c010 (-2.25), 0001 (2^-133), 7f7f (the
+//        largest finite), 3f81 (1.0078125), 4f00 (2^31), cf00 (-2^31), 4f01 (past i32), 437f (255),
+//        4380 (256), c2c8 (-100)
+//   IX = 0, 1, -1, 2049 and 2051 (f16 ties: 2048, 2052), 65504, 65519 (to 65504), 65520 (to inf),
+//        -65520, 70000, 2147483647, -2147483648, 1000, 4097 (to 4096), 123, 32767
+//   JX = 0, 1, -1, 257 and 259 (bf16 ties: 256, 260), 16842753 (2^24 + 2^16 + 1: f32 rounds it to
+//        the tie 2^24 + 2^16, which bf16 rounds to even, 2^24; a single rounding would give
+//        2^24 + 2^17), 2147483647, -2147483648, 65535, 1000000, -77, 33554431, 2139095039, 12345,
+//        99999, 16777217 (2^24 + 1)
+//   SX = 0, 1, -1, 32767, -32768, 2049, 2051, 4097, -4099, 1023, 1025, 12345, -12345, 255, 256, 2047
+// Every expected lane is derived by hand under IEEE 754 binary64, binary32, binary16 and bfloat16
+// (round to nearest even), the half NaN rules (an f16 NaN widens with its payload and the quiet
+// bit; a NaN narrows to its top payload bits with the quiet bit), x86's NaN rules (a NaN operand
+// propagates quiet; an invalid operation gives the default NaN) and saturating float-to-integer
+// conversion (NaN to 0):
+//   c1: d = (x as f64) * 0.5        c2: e = (b as f64) - 1
+//   c3: x2 = (d * 3) as f16         c4: b2 = (e * 3) as bf16        (f64 -> f32 -> half grid)
+//   c5: x as i32    c6: b as i32    c7: x as u8                     (saturating)
+//   c8: p as f16    c9: q as bf16   c10: s as f16 (i16)
+//   kh/kb: o[2i] = a[2i] c[2i] - a[2i+1] c[2i+1], o[2i+1] = a[2i] c[2i+1] + a[2i+1] c[2i], each
+//          product rounded to the half grid except the one fused into the second sum's
+//          multiply-add; a[i] = HX[i % 16] / BX[i % 16], c[i] = the same at (7i + 5) % 16
+// The f64 arrays print seven lanes to a line, every other array one line.
+
+@unchecked
+fn c1(x: []f16, mut d: []f64, n: i64, z: i64) {
+    if z > 0 {
+        c1(x, d, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        d[i] = x[i] as f64 * 0.5;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c2(b: []bf16, mut e: []f64, n: i64, z: i64) {
+    if z > 0 {
+        c2(b, e, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        e[i] = b[i] as f64 - 1.0;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c3(d: []f64, mut x: []f16, n: i64, z: i64) {
+    if z > 0 {
+        c3(d, x, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        x[i] = (d[i] * 3.0) as f16;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c4(e: []f64, mut b: []bf16, n: i64, z: i64) {
+    if z > 0 {
+        c4(e, b, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        b[i] = (e[i] * 3.0) as bf16;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c5(x: []f16, mut p: []i32, n: i64, z: i64) {
+    if z > 0 {
+        c5(x, p, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        p[i] = x[i] as i32;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c6(b: []bf16, mut p: []i32, n: i64, z: i64) {
+    if z > 0 {
+        c6(b, p, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        p[i] = b[i] as i32;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c7(x: []f16, mut u: []u8, n: i64, z: i64) {
+    if z > 0 {
+        c7(x, u, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        u[i] = x[i] as u8;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c8(p: []i32, mut x: []f16, n: i64, z: i64) {
+    if z > 0 {
+        c8(p, x, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        x[i] = p[i] as f16;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c9(p: []i32, mut b: []bf16, n: i64, z: i64) {
+    if z > 0 {
+        c9(p, b, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        b[i] = p[i] as bf16;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn c10(s: []i16, mut x: []f16, n: i64, z: i64) {
+    if z > 0 {
+        c10(s, x, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        x[i] = s[i] as f16;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn kh(a: []f16, c: []f16, mut o: []f16, n: i64, z: i64) {
+    if z > 0 {
+        kh(a, c, o, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[2 * i] = a[2 * i] * c[2 * i] - a[2 * i + 1] * c[2 * i + 1];
+        o[2 * i + 1] = a[2 * i] * c[2 * i + 1] + a[2 * i + 1] * c[2 * i];
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn kb(a: []bf16, c: []bf16, mut o: []bf16, n: i64, z: i64) {
+    if z > 0 {
+        kb(a, c, o, n, z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[2 * i] = a[2 * i] * c[2 * i] - a[2 * i + 1] * c[2 * i + 1];
+        o[2 * i + 1] = a[2 * i] * c[2 * i + 1] + a[2 * i + 1] * c[2 * i];
+        i = i + 1;
+    }
+}
+
+fn hx(r: i64) -> u16 {
+    let t: [u16; 16] = [
+        32257, 32000, 32768, 0, 31744, 64512, 15872, 49280, 1, 31743, 15361, 1023, 48128, 23551,
+        23552, 54848,
+    ];
+    return t[r];
+}
+
+fn bx(r: i64) -> u16 {
+    let t: [u16; 16] = [
+        32705, 32768, 0, 32640, 65408, 16320, 49168, 1, 32639, 16257, 20224, 52992, 20225, 17279,
+        17280, 49864,
+    ];
+    return t[r];
+}
+
+fn ix(r: i64) -> i32 {
+    let t: [i32; 16] = [
+        0,
+        1,
+        -1,
+        2049,
+        2051,
+        65504,
+        65519,
+        65520,
+        -65520,
+        70000,
+        2147483647,
+        -2147483647 - 1,
+        1000,
+        4097,
+        123,
+        32767,
+    ];
+    return t[r];
+}
+
+fn jx(r: i64) -> i32 {
+    let t: [i32; 16] = [
+        0,
+        1,
+        -1,
+        257,
+        259,
+        16842753,
+        2147483647,
+        -2147483647 - 1,
+        65535,
+        1000000,
+        -77,
+        33554431,
+        2139095039,
+        12345,
+        99999,
+        16777217,
+    ];
+    return t[r];
+}
+
+fn sx(r: i64) -> i16 {
+    let t: [i16; 16] = [
+        0,
+        1,
+        -1,
+        32767,
+        -32767 - 1,
+        2049,
+        2051,
+        4097,
+        -4099,
+        1023,
+        1025,
+        12345,
+        -12345,
+        255,
+        256,
+        2047,
+    ];
+    return t[r];
+}
+
+fn show_h(v: []f16, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        print_raw(bits(v[i]));
+        if i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+}
+
+fn show_b(v: []bf16, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        print_raw(bits(v[i]));
+        if i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+}
+
+fn show_d(v: []f64, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        print_raw(bits(v[i]));
+        if (i + 1) % 7 == 0 || i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+}
+
+fn show_i(v: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        print_raw(v[i]);
+        if i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let n: i64 = 21;
+    let m: i64 = 2 * n;
+    let mut x: []f16 = alloc_f16(n);
+    let mut b: []bf16 = alloc_bf16(n);
+    let mut p: []i32 = alloc_i32(n);
+    let mut q: []i32 = alloc_i32(n);
+    let mut s: []i16 = alloc_i16(n);
+    let mut i: i64 = 0;
+    while i < n {
+        x[i] = f16_from_bits(hx(i % 16));
+        b[i] = bf16_from_bits(bx(i % 16));
+        p[i] = ix(i % 16);
+        q[i] = jx(i % 16);
+        s[i] = sx(i % 16);
+        i = i + 1;
+    }
+    let mut d: []f64 = alloc_f64(n);
+    let mut e: []f64 = alloc_f64(n);
+    let mut x2: []f16 = alloc_f16(n);
+    let mut b2: []bf16 = alloc_bf16(n);
+    let mut pi: []i32 = alloc_i32(n);
+    let mut qi: []i32 = alloc_i32(n);
+    let mut u: []u8 = alloc_u8(n);
+    let mut x3: []f16 = alloc_f16(n);
+    let mut b3: []bf16 = alloc_bf16(n);
+    let mut y3: []f16 = alloc_f16(n);
+    c1(x, d, n, 0);
+    c2(b, e, n, 0);
+    c3(d, x2, n, 0);
+    c4(e, b2, n, 0);
+    c5(x, pi, n, 0);
+    c6(b, qi, n, 0);
+    c7(x, u, n, 0);
+    c8(p, x3, n, 0);
+    c9(q, b3, n, 0);
+    c10(s, y3, n, 0);
+    show_d(d, n);
+    show_d(e, n);
+    show_h(x2, n);
+    show_b(b2, n);
+    show_i(pi, n);
+    show_i(qi, n);
+    i = 0;
+    while i < n {
+        print_raw(u[i]);
+        if i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+    show_h(x3, n);
+    show_b(b3, n);
+    show_h(y3, n);
+    let mut a: []f16 = alloc_f16(m);
+    let mut c: []f16 = alloc_f16(m);
+    let mut o: []f16 = alloc_f16(m);
+    let mut a2: []bf16 = alloc_bf16(m);
+    let mut c2: []bf16 = alloc_bf16(m);
+    let mut o2: []bf16 = alloc_bf16(m);
+    i = 0;
+    while i < m {
+        a[i] = f16_from_bits(hx(i % 16));
+        c[i] = f16_from_bits(hx((7 * i + 5) % 16));
+        a2[i] = bf16_from_bits(bx(i % 16));
+        c2[i] = bf16_from_bits(bx((7 * i + 5) % 16));
+        i = i + 1;
+    }
+    kh(a, c, o, n, 0);
+    kb(a2, c2, o2, n, 0);
+    show_h(o, m);
+    show_b(o2, m);
+    return 0;
+}

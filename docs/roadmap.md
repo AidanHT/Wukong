@@ -28,7 +28,15 @@ only the `wukong_*` kernels, a link error), and `exe.rs` compares a slice of the
 executables with `--run`. A runtime failure (a failed `assert`, a slice index out of bounds) stops
 the program at the same statement on every path — interpreter, JIT, linked executable, and inside
 a `@parallel` region (the earliest failing iteration is reported) — keeping the output printed
-before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
+before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`). Every such trap names
+its source site on every CPU path: a failed `assert` (`assertion failed at file:line:col`, with an
+optional literal message, `assert(cond, "msg")`), a kernel builtin's run-time extent check (which
+traps through `assert` and names the builtin call), a value `match` no arm of which matched, a
+slice index out of bounds, a range index and `str_from_utf8`
+(`crates/wukongc/tests/runtime_sites.rs`). 🟡 `--backend=gpu-native` still reports a bare
+`assertion failed`: it keeps one assert-failed flag on the device and is handed a copy of the
+program without the site operands (`wukong_opt::strip_assert_sites`). It stops at a `match` no arm
+matched as well, rather than failing the launch with a CUDA error.
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 `--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` picks the instruction-set level of that
@@ -39,8 +47,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
 and a failure inside one function points at the source construct being lowered (the oversized
 `let`), else at that function's declaration; a module-level failure (an unresolved `extern "C"`
 symbol, an unsupported target CPU) has no span. Every MIR value is located straight out of lowering,
-inlining and unrolling carry locations onto the values they copy, and values other passes create
-stay unknown (about 75% of the corpus's instructions are still located at `-O2`); Cranelift's
+the passes that copy code (inlining, unrolling, bounds-check versioning, unswitching, jump threading)
+carry locations onto the values they copy, the vectorizer gives each widened value its scalar step's,
+and the guards other passes synthesize stay unknown (about 96% of the corpus's instructions are still
+located at `-O2`); Cranelift's
 per-instruction source locations follow the table and drop, never borrow, an unknown one. `-g`
 turns them into DWARF in `--emit=obj|exe` (COFF and ELF): a line table (`file:line:column` per
 machine-code range; an unlocated range continues the row before it), one subprogram per function,
@@ -192,7 +202,12 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   in fields, arrays, slices, `match`, `printf` and the integer builtins, with wrapping arithmetic,
   zero-divisor and `MIN / -1` division, shifts modulo 128 and once-rounded float conversions
   pinned on both backends by `tests/run/i128_*.wk`), `bool`, `char` (a 32-bit Unicode scalar,
-  interconvertible with the integers via `as`; `tests/run/char_type.wk`), and floats. `f32` is computed at **`f32`
+  interconvertible with the integers via `as`; `tests/run/char_type.wk`), the **8-bit floats
+  `f8e4m3`/`f8e5m2`** (OCP E4M3FN and E5M2 — one byte of storage, `f32` compute, every result
+  rounded to nearest-even onto its own grid with E4M3FN saturating at ±448 and E5M2 overflowing to
+  ±∞, an `f64` converted in one rounding; every code of both formats round-trips, pinned on both
+  backends by `tests/run/f8_*.wk`, and the inline codec is JIT-checked in the LLVM text too), and
+  floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
   rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
   with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
@@ -776,7 +791,11 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   (`tests/run/vec256_opt_int_sum.wk`). Still 128-bit: float sums and every other reduction kind
   (the kernel would reassociate them), casts, gathers and scatters, shifts and bitwise
   ops, the counter read as a value, countdowns, search loops, interleave groups, unsigned compares,
-  `i64` multiplies and `bf16` bodies (no recipe lane). The 2048 gate is the crossover measured for the
+  `i64` multiplies and `bf16` bodies (no recipe lane). **f16 bodies** take the kernel as an `f32`
+  recipe whose f16 loads, stores and grid roundings are F16C's `vcvtph2ps`/`vcvtps2ph` (round to
+  nearest even), the conversions the scalar path's `half`-crate shims perform, bit for bit; they
+  need F16C beside AVX2+FMA, and an f16 invariant that may lie off the f16 grid (a parameter) keeps
+  the 128-bit loop (`tests/run/vec256_f16_lanes.wk`, every lane's bits). The 2048 gate is the crossover measured for the
   front end's out-of-line *reduction* kernel; the elementwise crossover is unmeasured and likely
   lower.
   **bf16 bodies** widen too (P15.7): a bf16 lane is an `f32` lane in a register, so a bf16 loop
@@ -784,10 +803,16 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   arithmetic, compares and blends in `f32`, each lane rounded to the bf16 grid exactly where the
   scalar loop rounds (a load, a store, a constant, an `fptrunc`/`fpext`) — bit-exact with the scalar
   loop on interp and native (`tests/run/vec_bf16_lanes.wk` prints every lane's bits over NaN
-  payloads, signed zeros, infinities, subnormals and rounding ties). Still scalar: `f16` bodies
-  (Cranelift has no vector half conversion; each scalar `f16` load and store calls a runtime shim),
-  bf16 accumulators, bf16 interleave groups, and bf16 casts through `f64` or integers (replicated
-  lane by lane).
+  payloads, signed zeros, infinities, subnormals and rounding ties). **f16 bodies** widen the same
+  way to `<4 x f16>`: Cranelift has no vector half conversion, so the backend converts four lanes at
+  once in SSE2 integer arithmetic (`codegen_cranelift::half_lanes`), bit-identical to the scalar
+  path's runtime shims on all 65536 f16 encodings and a dense cover of `f32` inputs (every exponent,
+  every tie position, every subnormal boundary, every NaN payload), under the host ISA and the
+  x86-64 baseline (`tests/run/vec_f16_lanes.wk`, every lane's bits). Half casts through `f64` and
+  to and from integers convert lane-wise in the scalar cast's own steps, and bf16/f16 interleave
+  groups widen like 32-bit ones (`tests/run/vec_half_casts.wk`, every lane's bits). Still scalar:
+  bf16 and f16 accumulators (they round inside the recurrence, which no fold reproduces) and a
+  bitcast to or from a half type (replicated lane by lane).
 - **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
   consecutive elements of one object whose values are one lane-wise operation tree pack into one
   128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane
@@ -857,7 +882,12 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   E5M2 pair). All but the bit counts and the special functions are plain compare/select/shift MIR, so
   they agree on every backend by construction. `fmax`/`fmin` on an integer variable is now `E0445`
   (`max`/`min` keep the type); `E0446`/`E0447` reject a wrong operand kind or a mixed-type saturating
-  operation (`tests/run/scalar_*.wk`, `tests/run/fp8_convert.wk`).
+  operation (`tests/run/scalar_*.wk`, `tests/run/fp8_convert.wk`). Since 2026-10-14 (`gap7/f8-types`)
+  also **int4 packing**: `pack_i4`/`pack_u4` and `unpack_i4`/`unpack_u4` put two 4-bit integers in a
+  byte (low nibble first; a literal a nibble cannot hold is `E0439`), and the decode builtins
+  `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)` expand a packed
+  buffer with per-group scales and zero points, `(q - zero) * scale` in `f32`, one runtime call
+  (`tests/run/int4_pack.wk`, `tests/run/int4_dequant.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
   runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
@@ -1713,18 +1743,23 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   contracted while `s = s + y*z` is; a strict function that wants a single-rounding multiply-add
   writes the explicit `fma(a, b, c)`, which is one rounding in every mode.
 
-- **Stack-slot coloring follows uses, not scopes** (2026-10-12, `gap6/stack-coloring`). The native
-  backend lets allocas whose lifetimes never overlap share one frame slot (`tests/run`: 5.8% fewer
-  static slot bytes at `-O0`, 4.8% at `-O2`). A slot is live from a use to a later use — around the
-  whole loop when it is used inside one — and dead before a counted loop that overwrites every byte of
-  it (the `[v; N]` re-initialization of a `let` inside a loop body), so per-iteration scratch arrays
-  share at `-O0`. What it does not separate: scratch declared and zero-initialized at the top of a
-  function and overwritten later by a 2-D loop nest, a runtime kernel or, at `-O2`, an unrolled or
-  fused loop — those slots are live from the top (`examples/llama_block.wk`'s ten scratch arrays
-  share nothing); and at `-O1`+ a slot handed to a runtime kernel never shares with one accessed only
-  in place, since the two sit in different Cranelift alias regions. An address passed to a user
-  function that may keep it, to `extern "C"` code or into a `@parallel` region keeps its slot for the
-  whole function. The interpreter (the oracle) keeps one slot per alloca.
+- **Stack-slot coloring follows reads and full overwrites, not scopes** (2026-10-12,
+  `gap6/stack-coloring`; 2026-10-12, `gap7/slot-coloring-2`). The native backend lets allocas whose
+  lifetimes never overlap share one frame slot (`tests/run`: 6.5% fewer static slot bytes at `-O0`,
+  5.2% at `-O2`; `examples/llama_block.wk`'s kernel frame 27.5% smaller). A slot is live from a use
+  to a later read — around the whole loop when it is read inside one — and dead before a full
+  overwrite: a region of counted loops that only write it and cover every byte (`[v; N]`
+  initializers, whole-array `for` loops, nests tiling it in either order, and the vector, unrolled
+  and remainder loops the optimizer leaves, at `-O0` and `-O2`), a runtime kernel promised to
+  overwrite its output (`wukong_runtime::OVERWRITES`: GEMM with `beta = 0`, GEMV, elementwise maps,
+  norms, bias, transpose, cumsum, column reductions, attention), or a vector kernel's write-only
+  stream. What it does not separate: a slot rewritten by a loop whose trip count or start is not a
+  compile-time constant (symbolic dimensions, triangular nests) or by a kernel outside the table
+  (embedding, RoPE, the half-precision and int8 GEMMs); and at `-O1`+ a slot handed to a runtime
+  kernel never shares with one accessed only in place, since the two sit in different Cranelift
+  alias regions (measured: 0.2% of the `-O2` corpus). An address passed to a user function that may
+  keep it, to `extern "C"` code or into a `@parallel` region keeps its slot for the whole function.
+  The interpreter (the oracle) keeps one slot per alloca.
 
 - **Generics sharp edges** (2026-10-11, `gap4/sema-soundness`). By design, a `const` generic
   parameter is a compile-time *dimension*, so it is `usize` and nothing else (`E0523` for
@@ -1782,9 +1817,19 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   one piece, and the call's "may touch any memory" verdict keeps it scalar. The copy that keeps the
   calls stays scalar too.
 
-- **Scalar-type gaps** (2026-10-08; `i128`/`u128` landed 2026-10-12). FP8 is storage-only —
-  E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that loads, stores and
-  promotes by itself; packed `int4` and constructible SIMD values are not started. The 128-bit
+- **Scalar-type gaps** (2026-10-08; `i128`/`u128` landed 2026-10-12, `f8e4m3`/`f8e5m2` and the
+  int4 packing builtins 2026-10-14). Constructible SIMD values are not started — a `vec[T, N]` /
+  `f32x4` value still cannot be built in source (left for later: SIMD reaches programs through the
+  loop vectorizers and the recognized kernels). int4 has no sub-byte *type*: it is two nibbles per
+  `u8` with `pack_i4`/`pack_u4`/`unpack_i4`/`unpack_u4` and the group-wise `dequant_i4`/`dequant_u4`
+  decode builtins (one scalar runtime loop, not yet a hand-written AVX2 kernel, and no int4 GEMV:
+  dequantize to `f32` and use `matmul` or a recognized GEMV loop, or `gemv_q4_0` for GGML
+  blocks). The 8-bit floats run everywhere a `bf16` does except
+  in vector lanes (a loop over f8 data stays scalar: neither vectorizer widens an f8 lane, and
+  `vec[f8e4m3, N]` is `E0302`), the kernel builtins (which take `f32` buffers), `extern "C"`
+  (`C0001`) and `gpu-native` (which declines a function holding one: PTX has no twin of the codec
+  yet); each f8 operation is an inline integer encode/decode around its `f32` op, not one
+  instruction (no x86 CPU has FP8 arithmetic). The 128-bit
   integers run everywhere but in four places: `atomic_add` takes at most 64 bits (`E0446`), an
   `extern "C"` signature cannot carry one (`C0001`), the loop vectorizers never widen them (a loop
   over `i128` data stays scalar — no ISA has 128-bit integer lanes — and a loop driven by an

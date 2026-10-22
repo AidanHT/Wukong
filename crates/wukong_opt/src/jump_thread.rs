@@ -653,6 +653,8 @@ fn apply(f: &mut Function, t: Thread) {
         let result = inst.result.map(|r| {
             let ty = f.value_type(r).clone();
             let nr = fresh(f, ty);
+            // The private copy of the block is the same source as the block.
+            f.copy_value_loc(r, nr);
             map.insert(r.0, nr);
             nr
         });

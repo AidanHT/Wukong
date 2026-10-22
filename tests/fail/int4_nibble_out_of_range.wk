@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0439
+// EXPECT-COUNT: 5
+module tests.fail.int4_nibble_out_of_range
+
+// `pack_u4` and `pack_i4` keep each run-time operand's low four bits, as `as` would, but a literal
+// operand is a value the program wrote, and one a nibble cannot hold would silently become another:
+// `pack_u4(16, 3)` would pack 0 and 3, `pack_i4(8, 0)` the nibble -8, and `pack_i4(0, -9)` the nibble
+// 7. Each is E0439; the in-range extremes (`pack_u4(15, 0)`, `pack_i4(-8, 7)`) are fine. A suffix does
+// not make a literal a run-time value: `pack_u4(16u8, 3)` and `pack_i4(0, 8i8)` are E0439 as well, and
+// `pack_u4(15u8, 0u8)` is fine.
+fn main() -> i32 {
+    let a = pack_u4(16, 3); //~ E0439
+    let b = pack_i4(8, 0); //~ E0439
+    let c = pack_i4(0, -9); //~ E0439
+    let d = pack_u4(16u8, 3); //~ E0439
+    let e = pack_i4(0, 8i8); //~ E0439
+    let ok = pack_u4(15, 0) + pack_i4(-8, 7) + pack_u4(15u8, 0u8);
+    return (a as i32) + (b as i32) + (c as i32) + (d as i32) + (e as i32) + (ok as i32);
+}

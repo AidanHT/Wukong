@@ -116,13 +116,22 @@ not duplicate them. In summary, Wukong:
   `-O2` removes the checks from counted loops by versioning them on one preheader guard, and
   `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
   constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
-  A pointer used as a condition (`if p`) is a null test.
+  A pointer used as a condition (`if p`) is a null test. A failed `assert(cond)` names its site the
+  same way (`assertion failed at file:line:col`, or `assertion failed: msg at …` for
+  `assert(cond, "msg")`), on the interpreter, the JIT and a linked executable alike.
 - **128-bit integers.** `i128` and `u128` are first-class: literals up to `u128::MAX` (range-checked
   at every width), wrapping arithmetic, division and shifts with the same zero-divisor, `MIN / -1`
   and modulo-width rules as every other integer, once-rounded float conversions, struct fields,
   arrays, `match`, `printf` and the integer builtins (`widening_mul` of two `u64` is a `u128`).
   Native code keeps one in a register pair and calls the runtime only for division and float
   conversion (`tests/run/i128_*.wk`).
+- **8-bit floats.** `f8e4m3` and `f8e5m2` — the OCP E4M3FN and E5M2 formats FP8 checkpoints ship in —
+  are first-class one-byte types: `f32` compute with every result rounded to nearest-even onto its
+  grid (E4M3FN saturating at ±448, E5M2 overflowing to ±∞), literals with a suffix, `as` to and from
+  every numeric type in one rounding, arrays, structs, slices and printing; the codec is inline
+  integer code on every backend, and all 256 codes of each format round-trip
+  (`tests/run/f8_*.wk`). int4 weights pack two to a byte (`pack_i4`/`unpack_u4`, …) and expand with
+  per-group scales and zero points in one call (`dequant_i4`/`dequant_u4`; `tests/run/int4_*.wk`).
 - **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
   functions; traits with bounds (`<T: Shape>`, `where`), function-typed parameters
   (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read

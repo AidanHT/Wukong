@@ -57,6 +57,260 @@ All notable changes to Wukong are documented here. The format is loosely based o
   or scatter is emitted (every per-lane access is a scalar load or store).
   None of these forms has been timed: each is a rule, not a measured win.
 
+### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)
+
+- **Each labelled source line prints once.** The human renderer drew one frame per label, so two
+  labels on a line printed that line twice. Now the labels of a line share one underline row (`^`
+  primary, `-` secondary; a label nested in another stays visible inside it), the rightmost
+  message ends that row and the others hang below on `|` bars, rustc-style.
+- **Every multi-line label gets connectors.** Overlapping ones each take their own column of the
+  left margin, so a second multi-line label is no longer cut to its first line, and a single-line
+  label inside a connector's lines is drawn on its line instead of in a second frame after it.
+  The lines between two labelled lines print only inside a connector, eliding a long gap around
+  `...` as before. A diagnostic whose labels are single-line and on distinct lines renders
+  byte-for-byte as before; JSON is unchanged except for `rendered`, which carries the new form.
+
+### Runtime traps name their source site (`gap7/diag-locations`, N89)
+
+- **A failed `assert` names its site on every CPU backend.** It used to print a bare `assertion
+  failed` everywhere, while a slice index out of bounds already said where it happened. Now
+  `error: assertion failed at <file>:<line>:<col>` — the `assert` call's site — goes to stderr on
+  the interpreter, the native JIT (every `-O` level) and a linked `--emit=exe` executable (the
+  rustc link and the `cc` fallback alike), with the same exit status 1 and the same stdout. The
+  lowering appends the call's `.rodata` site to the intrinsic (`assert(cond, site)`), as a bounds
+  failure carries one, and every path formats it with `wukong_runtime::assert_failure_message`;
+  `wukong_rt_assert` is now `(cond, site, message)` in the JIT, the textual LLVM, the Rust link
+  shim and the C fallback. A linked executable's message gains the `error: ` prefix `--run`
+  always printed.
+- **Added: `assert(cond, "message")`.** An optional string-literal message prints after
+  `assertion failed:` and before the site (`tests/run/assert_message.wk`). Any other second
+  argument is `E0437` (`tests/fail/assert_message_not_literal.wk`), as for `static_assert`'s
+  message; any other argument count stays `E0503`.
+- **Every other runtime trap was audited for its site.** A kernel builtin's run-time extent check
+  and the decode builtins' geometry checks trap through `assert` and now name the builtin call
+  (`tests/run/builtin_extent_trap.wk`, `decode_shape_trap.wk`, `decode_kv_batch_trap.wk`). A slice
+  index, a range index (end and order) and `str_from_utf8` already named theirs. Integer division
+  and remainder by zero do not trap (they return 0). `crates/wukongc/tests/runtime_sites.rs` pins
+  the exact message of each on the interpreter and the JIT at `-O0` and `-O2` and in a linked
+  executable (on whichever link path the machine has; it never needs the `cc` fallback).
+- **Fixed: a value `match` no arm matched killed the native process.** A match sema cannot prove
+  exhaustive (a zero-filled `let e: E;` of an enum with no discriminant 0 reaches it) ended in a
+  bare `unreachable`: the interpreter reported `execution reached unreachable` with no site, and
+  the JIT and a linked executable executed a hardware trap (`SIGILL`) that killed the process with
+  its buffered output. It now stops like a failed `assert` on every CPU backend, keeping that
+  output: `assertion failed: no `match` arm matched its value at <the match's site>`, exit 1
+  (`tests/run/match_no_arm_trap.wk`).
+- **`--backend=gpu-native` keeps its bare `assertion failed`.** It keeps one assert-failed flag on
+  the device and declines a `GlobalAddr`, so the driver hands it a copy of the program stripped of
+  the site and message operands (`wukong_opt::strip_assert_sites`). MIR lowered without a source
+  locator (`lower_program_with`, the GPU device gates) keeps the one-operand `assert(cond)`.
+- **Fixed: a reached `unreachable` faulted the GPU instead of stopping the program.** gpu-native
+  lowered the terminator to PTX `trap;`, which fails the launch with a sticky CUDA error: the
+  context is lost for the rest of the process. `tests/run/match_no_arm_trap.wk` is the first
+  corpus program to reach one (its `match` falls into `assert(false)`, then `unreachable`), so the
+  device corpus gate (`run_corpus_matches_interp_oracle`) would have recorded a driver fault and
+  listed every later program as NOT RUN. The terminator now sets a flag in the device context and
+  `exit`s, which also ends the thread inside a called function. The run reports `assertion failed`
+  as the interpreter does when an `assert(false)` came first, and the interpreter's
+  ``execution reached `unreachable` `` for a bare one.
+
+### int4: packing builtins and group-wise dequantization (`gap7/f8-types`, N25)
+
+- **Added: `pack_i4(lo, hi)`, `pack_u4(lo, hi)`, `unpack_i4(b)`, `unpack_u4(b)`.** Two 4-bit
+  integers per `u8`, `lo` in bits 0..4 and `hi` in bits 4..8 (ONNX `Int4` / PyTorch `quint4x2`
+  order); `unpack_i4` sign-extends each nibble to an `i8`, `unpack_u4` zero-extends to a `u8`, both
+  returning `(lo, hi)`. A run-time operand keeps its low four bits, as `as` would; a literal a
+  nibble cannot hold (`pack_u4(16, 0)`, `pack_u4(16u8, 0)`, `pack_i4(8, 0)`, `pack_u4(8 + 8, 0)`) is
+  the new **`E0439`**. Plain shifts and
+  masks in MIR, identical on every backend.
+- **Added: the `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)`
+  decode builtins** for the weight-only int4 layout GPTQ, AWQ and ONNX checkpoints share: element
+  `i` is nibble `i & 1` of byte `i >> 1`, group `i / group`, and the output is `q * scale[g]`
+  (signed) or `(q - zero[g]) * scale[g]` (unsigned) in `f32`, one rounding per operation in that
+  order. One runtime call (`wukong_runtime::quant::wukong_dequant_{i4,u4}_f32`) validates the exact
+  extents first (`ceil(n/2)` bytes, `ceil(n/group)` scales and zero points, a short last group
+  allowed) and traps like a failed `assert` otherwise; an output overlapping an input is computed
+  from the inputs as they were. Not differentiable (autodiff refuses it, as it does the other
+  quantized kernels).
+- A sub-byte `int4` *type* and an int4 GEMV are not part of this; neither are constructible SIMD
+  values, which stay open (N25).
+- Fixtures: `tests/run/int4_pack.wk` (all 16 values of each nibble kind through both halves),
+  `tests/run/int4_dequant.wk` (both forms, a short last group, an odd count, a slice and heap
+  buffer, and the same expansion written as a loop over `unpack_i4`);
+  `tests/fail/int4_nibble_out_of_range.wk` (E0439).
+
+### First-class 8-bit floats: `f8e4m3` and `f8e5m2` (`gap7/f8-types`, N25)
+
+- **Added: the `f8e4m3` and `f8e5m2` scalar types** — OCP E4M3FN (bias 7, 3 mantissa bits, no
+  infinity, saturating at ±448, one NaN per sign) and OCP E5M2 (bias 15, 2 mantissa bits, IEEE
+  infinities), one byte each, in every position `bf16` takes: locals, parameters and results, struct
+  and tuple fields, arrays, slices, `alloc::<f8e4m3>(n)`, generic instantiations and tensor
+  elements, on the interpreter, the native backend (JIT and `--emit=obj|exe`) and the LLVM text
+  emitter. A value computes in `f32` and every result rounds to nearest, ties to even, onto its own
+  grid by the rule of the `f32_to_f8e4m3`/`f32_to_f8e5m2` builtins (E4M3FN saturates, E5M2
+  overflows to ±∞, a NaN becomes the canonical NaN of its sign), so each of `+ - * /` is the
+  correctly rounded f8 result and `-O0` and `-O2` agree. Before this FP8 was `u8` codes and
+  conversion builtins only.
+- **Literals, conversions, printing.** `1.5f8e4m3` / `3f8e5m2` suffixes and unsuffixed literals
+  adapting to an f8 type; a literal that would saturate, overflow or round to zero is the new
+  **`E0438`** — and so is an unsuffixed integer literal that converts to an f8 beside an f8 value
+  (`x * 1000`, `x < 1000`, `e += 1000`, `max(x, 1000)`, `clamp`, `fma`, an `if`/`match` arm),
+  which would otherwise silently be 448 or infinity. `as` reaches every integer and float type in one rounding — an `f64` is encoded from
+  its own bits, never through `f32` (which would round twice) — and an f8 widens losslessly in mixed
+  arithmetic to `f16`, `bf16`, `f32`, `f64`; `f8e4m3` with `f8e5m2`, or with an integer, is `E0440`.
+  An f8 prints as the `f32` it holds, in `print`, `printf` and aggregates. `bits(x)` is the OCP code
+  (`u8`) and `f8e4m3_from_bits` / `f8e5m2_from_bits` take one back; the float builtins (`sqrt`,
+  `exp`, `fma`, `ldexp`, `isinf`, …) compute in `f32` and round once.
+- **One codec, inline everywhere.** `wukong_runtime::fp8` gains a bit-level encoder (from `f32` and
+  from `f64`) and decoder, pinned to its exact reference on every code, every midpoint and its
+  neighbours and a 262144-pattern sweep. The interpreter calls it; Cranelift and the LLVM emitter
+  emit the identical integer sequence inline (no runtime call, no new link symbol). The native and
+  interpreted type is checked against the runtime on all 256 codes of both formats, every midpoint,
+  4096 `f32` patterns, an `f64` sweep and strided arithmetic at `-O0`/`-O2`
+  (`wukong_codegen_cranelift` `fp8_tests`); the LLVM codec is JIT-checked against a transcription
+  of the reference (`semantic_tests::f8_codec_modules`, 10556 checks under `verify_semantics.py`).
+- **Not 8-bit (documented):** SIMD lanes (`vec[f8e4m3, N]` is `E0302`, a loop over f8 data stays
+  scalar), kernel builtins, `atomic_add` (`E0446`), `extern "C"` (`C0001`), and
+  `--backend=gpu-native`, which declines a function holding one. Autodiff treats an f8 like a
+  `bf16`: straight-through rounding, adjoints in the value's type.
+- **Fixed: an integer converted to `bf16`/`f16` was not rounded at the value.** `sitofp`/`uitofp`
+  produce the `f32`, and only a store rounded it to the half grid, so once mem2reg forwarded the
+  value past its store, `print(i as bf16)` of 257 printed 257 at `-O2` (native and interpreter
+  alike) where `-O0` printed 256. The conversion now rounds at the value, for the 8-bit floats too.
+- **Changed: an integer literal beside a `bf16`/`f16` is that type's value.** The implicit
+  conversion of an unsuffixed integer literal that adapts to a half operand rounds at the value as
+  well, so the literal is the number it adapts to, on the half grid, before the operation runs. This
+  fixes a second `-O0`/`-O2` split — `max(b, 257)` and `if c { 257 } else { b }` of a `bf16` printed
+  257 at `-O2` (the unrounded literal forwarded past its store) and 256 at `-O0` — and it changes
+  results that did not split: with `b: bf16 = 1.0`, `b + 257` is now 1 + 256 = 256 (it was the
+  `f32` sum 258, rounded once), and with `h: f16 = 2048.0`, `h < 2049` is now `false` (2049 is 2048
+  on the f16 grid; the compare used the exact `f32` 2049). A float literal stays `f32` and is
+  unaffected (`b + 257.0` is 258). Pinned by `tests/run/half_int_literal_operand.wk`; no corpus
+  program changes.
+- The optimizer keeps an f8 constant at its exact literal value, so folding a unary minus rounds it
+  once, as every backend does: `-1.12500001` as an `f8e5m2` is `-1.25` at every `-O` level (through
+  `f32` it was the tie `-1.125` and folded to `-1`).
+- Fixtures: `tests/run/f8_scalar.wk`, `f8_aggregates.wk`, `f8_code_round_trip.wk`,
+  `f8_negated_literal.wk`;
+  `tests/fail/f8_literal_out_of_range.wk` (E0438), `f8_format_mix.wk` (E0440),
+  `f8_vector_lane.wk` (E0302), `extern_f8.wk` (C0001).
+
+### Source locations through the vectorizer and the loop-copying passes
+
+- **Fix: vectorized and copied code keeps its source line at `-O2`.** The MIR vectorizer created
+  every widened value with no source location, and bounds-check versioning, unswitching, jump
+  threading and unroll-and-jam copied loops and blocks without their originals' locations (a later
+  unroll of such a copy then copied nothing). With the vectorizer now widening more loops (256-bit
+  kernels, bf16 lanes) the `-O2` census in `crates/wukong_opt/tests/source_locations.rs` fell to
+  73.05%, below its 74% floor. The vectorizer's builder now has a current location: a widened
+  step's values take the span of the scalar step they widen, a reduction's folds its update's, and
+  the guard, trip and exit the loop's; each copying pass copies its originals' spans. `-O2` now
+  keeps 96.48% of the corpus's result-bearing instructions located, pinned at 96%; what stays
+  unknown is what the optimizer synthesizes (the unroller's limits, the bounds-check and unswitch
+  guards, SLP packs). Code is unchanged; only the `-g` line table and native diagnostics see it.
+
+### f16 general loops vectorize (`gap7/f16-vec`, P15.7)
+
+- **f16 general loops vectorize.** The MIR vectorizer widened bf16 bodies but refused every f16
+  one: Cranelift 0.124 has no vector half conversion, and the scalar path converts each f16 load
+  and store through a runtime shim (the `half` crate). An f16 body now widens to `<4 x f16>` like a
+  bf16 one, four f16 lanes in an `f32x4`, and the native backend converts four lanes at once in
+  SSE2 integer arithmetic (`wukong_codegen_cranelift::half_lanes`): a load widens four 2-byte
+  elements, a store rounds four lanes to nearest even and packs them, and a vector
+  `fptrunc`/`fpext` rounds each lane to the f16 grid. The conversions are bit-identical to the
+  shims on every input class — all 65536 f16 encodings, and every `f32` exponent with a one, a run
+  or a tie at every rounding position, every f16 midpoint and its neighbours, every NaN payload and
+  a million random patterns — under the host's ISA and the x86-64 baseline (`half_lane_tests`,
+  which also checks the shim against a transcription of the `half` crate's software routine, so a
+  host without F16C computes the same bits). `tests/run/vec_f16_lanes.wk` prints every lane's bits
+  of five f16 kernels (a contracted multiply-add, a compare and negation, a division, `fpext` and
+  `fptrunc`) over NaN payloads, signed zeros, infinities, subnormals, overflow and ties, hand-derived,
+  on interp and native at `-O0` and `-O2`. Six corpus programs gain `<4 x f16>` loops at `-O2`
+  (no dispatch moves).
+- **f16 loops take 256-bit kernels (F16C).** A widened f16 body with a raw-AVX2 recipe form and a
+  trip of 2048 or more now calls a kernel like an `f32` one: the recipe is an `f32` recipe with
+  three new operations, `LoadF16` (`vcvtph2ps`), `StoreF16` (`vcvtps2ph`, imm8 0: round to nearest
+  even regardless of `MXCSR`) and `RoundF16` (both, for a cast into f16). F16C is used because it is
+  bit-identical to the scalar shims on every input class — on an F16C host the `half` crate *is*
+  those instructions — and the AVX2 tests check the machine code against the shims and the recipe's
+  reference evaluator on every f16 encoding and the dense `f32` cover. The kernel needs F16C beside
+  AVX2+FMA (`wukong_mir::host_supports_f16c_kernels`); an f16 invariant the loop cannot show is on
+  the f16 grid (a parameter, a carried value, a bare `sitofp` result) keeps the 128-bit loop. The
+  interpreter marshals f16 streams like any other, its evaluator rounding where the instructions do;
+  the LLVM emitter lowers the three ops through `half`. The evaluator's rounding is the `half`
+  crate's software routine transcribed in `wukong_mir::f16_bits`, tested bit for bit against `half`
+  (a dev-dependency), so `wukong_mir` still depends on `wukong_span` and `wukong_types` only, which
+  a test now pins. `tests/run/vec256_f16_lanes.wk` runs five f16 kernels over 2048 lanes each and
+  prints every lane's bits (hand-derived). Census: `vec256_f16_lanes`, `vec_f16_lanes` (a runtime
+  trip) and `cov4_par_lowp_dot` gain kernels; nothing is lost.
+- **Half casts through `f64` and integers, and half interleave groups, vectorize.** A bf16 or f16
+  cast through `f64` or to or from an integer used to run lane by lane (extract, scalar cast,
+  insert), and a bf16/f16 interleave group (`o[2i]`, `o[2i + 1]`) declined the loop. The casts now
+  convert lane-wise in the scalar cast's own steps — the half-grid rounding, then the `f32 <-> f64`
+  widen or narrow; or the `f32` integer route, since `sitofp` itself rounds nothing at the half grid
+  and the rounding `fptrunc` `mir_build` places after an integer-to-half conversion widens on its
+  own — and the groups widen like 32-bit ones. `tests/run/vec_half_casts.wk` (ten casts and a
+  complex multiply in each half type; every lane's bits, hand-derived; interp and native at `-O0`
+  and `-O2`). No corpus program's `-O2` MIR changes but the new fixture's.
+
+### Stack-slot coloring ends lifetimes at full overwrites (`gap7/slot-coloring-2`, N86)
+
+- **Scratch zeroed at the top of a kernel and filled for real later no longer stays live from the
+  top.** The lifetime analysis (`wukong_opt::slot_lifetime`) ends a slot's lifetime at every *full
+  overwrite* it can prove — a point after which nothing can read the old contents — and the native
+  backend's frame coloring shares more slots as a result. `examples/llama_block.wk`'s
+  `llama_block` frame drops from 37,964 to 27,520 slot bytes at `-O0` and from 37,884 to 27,448 at
+  `-O2` (27.5%; the whole program saved 56 and 112 bytes before, 10,456 and 10,540 now), close to
+  the floor its FFN sets (`gate`, `up`, `h` and the residual live at once). Over `tests/run` the
+  static slot bytes saved go from 6.3% to 6.5% at `-O0` and from 5.0% to 5.2% at `-O2` (609
+  programs, 1,745,802 -> 1,632,872 and 1,695,139 -> 1,607,057), `examples/` from 0.3% / 0.1% to
+  3.4% / 3.3%; most corpus programs keep their few arrays live together.
+- **Full overwrites recognized:**
+  - **loop nests** whose iteration space tiles the array, in either order (`x[i*W + j]`,
+    `x[j*H + i]`): a mixed-radix coverage proof — a loop's stride closes into the run the loops
+    inside it cover when it is no wider — with every intermediate index range checked against its
+    integer type, so no "indices do not wrap" assumption is taken;
+  - **the shapes the vectorizers and the unroller leave**: a vector body whose induction variable
+    is tested with `!=`, an unrolled body advancing it through a chain of adds, unrolled stores at
+    a stride wider than an element, a synthesized vector kernel over each row (`Op::VecKernelCall`,
+    with its count folded from the vectorizer's `and`/`select` arithmetic), and the remainder loops
+    that follow — loops forced to run one after another count as one overwrite;
+  - **`-O0` `for` loops**, whose variable the front end keeps in a counter slot (a slot loaded
+    directly and stored only by the latch's increment is read as an induction variable), and
+    `let`s kept in memory within a block;
+  - **runtime kernel calls** that overwrite their output — GEMM with `beta = 0`, GEMV, the
+    elementwise maps (`vmath`, `vmath2`, `velem`), norms, bias, transpose, cumsum, the column
+    reductions and attention, serial and `_parallel` — whole, or row by row inside a counted loop.
+    The facts come from a new contract table next to the kernels, `wukong_runtime::OVERWRITES`:
+    per exact symbol, the operand written, its extent, and the operand values under which the
+    overwrite holds (`beta` the constant 0, `K >= 1` for a GEMM, a norm's op code one it
+    implements — an unknown one writes nothing). Its test runs every entry against its kernel over
+    an output pre-filled four ways (a NaN, -3e30, +3e30 and a per-element pattern) and requires
+    bit-identical results (5,181 calls, every integer operand an entry leaves free also probed at 0
+    and -1, every `_parallel` entry with a size gate of its own run past it); an entry that
+    overstates its extent fails it, and so does a kernel that seeds a sum, product, max, min or
+    magnitude fold from its output (a running max passes a NaN and -3e30 alike, hence +3e30). A
+    kernel that accumulates or reads its output in place kills nothing, and so does a call whose
+    output is also reachable through another operand.
+- **Liveness is driven by reads.** A store is a use but not a read, so a slot whose stored values
+  are all overwritten before any read occupies its storage only at the stores themselves: arrays
+  zeroed together in one fused loop and rewritten before they are read no longer interfere.
+- **Private and non-private slots still do not share at `-O1`+.** Measured: allowing it would save
+  0.2% more of the `-O2` corpus (1,604,237 bytes instead of 1,607,057). It would compute the same
+  values under Cranelift 0.124's alias analysis, but it violates the IR contract Cranelift states
+  for alias regions, and demoting the private slot instead costs its load forwarding; the
+  reasoning is in `stack_color.rs`.
+- **Not separated yet:** loops whose trip count or start is not a compile-time constant (symbolic
+  dimensions, triangular nests), runtime kernels outside the table (embedding, RoPE, the
+  half-precision and int8 GEMMs, ...), and an index that goes through a `let` stored in another
+  block at `-O0`.
+- `tests/run/stack_color_kills.wk` prints every lane of arrays rewritten by nests, by a vectorized
+  nest, by a recognized GEMM and by a recognized elementwise kernel, and of the arrays they must not
+  share with; unit tests cover each kill and each way it can fail (rows one short, gaps,
+  read-before-write, triangular and conditional nests, an `!=` test the variable steps over, a short
+  remainder, accumulating, in-place, short and aliased kernels, a promise for a user function's
+  name).
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

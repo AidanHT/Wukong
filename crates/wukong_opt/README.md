@@ -67,8 +67,12 @@ load-bearing.
   `Op::VecKernelCall` ahead of the original loop, which stays as the 128-bit-widened remainder (an
   integer sum takes a reduction kernel; a float sum keeps the in-order 128-bit fold)
   (`src/vec256.rs`; `OptimizeOptions::vec_kernels`, `WUKONG_P4_NO_256`, `WUKONG_VEC256_MIN_TRIP`).
-  A bf16 body widens as `<4 x bf16>` (four bf16 lanes in an `f32x4`, rounded to the bf16 grid at
-  the load, the store and each bf16 cast exactly as the scalar loop rounds); `f16` stays scalar.
+  A bf16 or f16 body widens as `<4 x bf16>` / `<4 x f16>` (four half lanes in an `f32x4`, rounded
+  to the half grid at the load, the store and each half cast exactly as the scalar loop rounds; the
+  f16 conversions are SSE2 integer code in `codegen_cranelift::half_lanes`). An f16 body's
+  256-bit recipe is an `f32` one with F16C conversions (`VecOp::LoadF16`/`StoreF16`/`RoundF16`).
+  Half casts through `f64` and to and from integers convert lane-wise, and half interleave groups
+  widen.
 
 **Whole-program stages at `-O2`+ (not `Pass` traits):**
 
@@ -92,10 +96,12 @@ load-bearing.
 can be seen by a load through `p`. The Cranelift backend uses it too.
 
 `slot_lifetime` is the other analysis only a backend consumes: per `alloca`, the program points at
-which its storage may still be read (reachable from a use and able to reach one, killed on entry to
-a counted loop that overwrites every byte of it), and which slots escape (live for the whole
-function); `CaptureSummary` says which call arguments a callee may retain. The Cranelift backend
-colors frame slots with it (`stack_color.rs`). Pure analysis; no MIR op marks a lifetime.
+which its storage may still be read (reachable from a use and able to reach a read, killed at a
+full overwrite — `slot_lifetime/kills.rs`: a region of counted loops, nests included, that write
+every byte of it before any read, a runtime kernel call the backend's `KernelOverwrite` promises
+say overwrites it, or a vector kernel's write-only stream), and which slots escape (live for the
+whole function); `CaptureSummary` says which call arguments a callee may retain. The Cranelift
+backend colors frame slots with it (`stack_color.rs`). Pure analysis; no MIR op marks a lifetime.
 
 ## Analysis cache (`CfgAnalyses`)
 

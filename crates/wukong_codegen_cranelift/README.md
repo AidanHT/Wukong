@@ -45,7 +45,7 @@ Generated code calls:
 | crate | role |
 |---|---|
 | `wukong_mir`, `wukong_span`, `wukong_backend` | MIR lowering seam |
-| `wukong_runtime` | kernel symbols for JIT binding / object imports |
+| `wukong_runtime` | kernel symbols for JIT binding / object imports; `OVERWRITES` (which kernels overwrite their output) for stack-slot coloring |
 | `wukong_opt` | `alias` provenance → Cranelift `AliasRegion` on loads/stores; `slot_lifetime` → stack-slot coloring |
 | `cranelift-*` 0.124 | codegen, frontend, JIT, object emission |
 | `iced-x86` | raw AVX2 assembler (`code_asm` feature) |

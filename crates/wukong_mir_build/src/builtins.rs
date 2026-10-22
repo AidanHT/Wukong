@@ -61,7 +61,7 @@ use wukong_mir::{BinOp, CastKind, CmpOp, MirType, Op, ValueId};
 use wukong_sema::{
     builtin_operand_dims, builtin_output, Activation, BuiltinCall, BuiltinDim, KernelBuiltin,
 };
-use wukong_span::Symbol;
+use wukong_span::{Span, Symbol};
 use wukong_types::{Dim, Scalar, Ty};
 
 use crate::alias::{plan_kernel_alias, KernelAliasPlan, OperandPair};
@@ -214,10 +214,11 @@ impl FnLowerer<'_> {
         self.builder.build(MirType::I1, Op::Bin(BinOp::And, lo, hi))
     }
 
-    /// Trap (through the `assert` intrinsic) unless every condition holds. `false` when a user
+    /// Trap (through the `assert` intrinsic) unless every condition holds; a failure names the
+    /// builtin call at `span` as its site, as a failed `assert` names its own. `false` when a user
     /// function named `assert` shadows the intrinsic — the caller then reports a codegen limit
     /// rather than calling the user's function with a check it never asked for.
-    pub(crate) fn emit_builtin_checks(&mut self, checks: Vec<ValueId>) -> bool {
+    pub(crate) fn emit_builtin_checks(&mut self, checks: Vec<ValueId>, span: Span) -> bool {
         if checks.is_empty() {
             return true;
         }
@@ -229,9 +230,11 @@ impl FnLowerer<'_> {
             return false;
         }
         for c in checks {
+            let mut args = vec![c];
+            args.extend(self.assert_site_operands(span, None));
             self.builder.build_void(Op::Call {
                 func: assert_fn,
-                args: vec![c],
+                args,
             });
         }
         true
@@ -389,7 +392,7 @@ impl FnLowerer<'_> {
                     .build(MirType::I1, Op::Cmp(CmpOp::Eq, have, count)),
             );
         }
-        if !self.emit_builtin_checks(checks) {
+        if !self.emit_builtin_checks(checks, e.span) {
             self.unsupported(
                 e.span,
                 "a kernel builtin with a runtime extent in a program that defines its own `assert`",
@@ -919,7 +922,7 @@ impl FnLowerer<'_> {
                     .build(MirType::I1, Op::Cmp(CmpOp::Sge, have, need)),
             );
         }
-        if !self.emit_builtin_checks(checks) {
+        if !self.emit_builtin_checks(checks, e.span) {
             self.unsupported(
                 e.span,
                 "an `sdpa` call in a program that defines its own `assert`",

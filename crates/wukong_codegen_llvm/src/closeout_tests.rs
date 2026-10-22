@@ -323,7 +323,7 @@ fn prints_and_asserts_use_the_aot_runtime_abi() {
         "declare void @wukong_rt_print_f32(float)",
         "declare void @wukong_rt_print_u64(i64)",
         "declare void @wukong_rt_print_str(ptr)",
-        "declare void @wukong_rt_assert(i64)",
+        "declare void @wukong_rt_assert(i64, ptr, ptr)",
     ] {
         assert!(text.contains(decl), "{decl}:\n{text}");
     }
@@ -350,6 +350,55 @@ fn prints_and_asserts_use_the_aot_runtime_abi() {
         !text.contains("@print(") && !text.contains("__wukong_print"),
         "{text}"
     );
+}
+
+/// `assert(cond, site, message)` passes the failure's two `.rodata` strings to
+/// `wukong_rt_assert`, and a call without them passes null in their place: the entry always takes
+/// three parameters, as in the Cranelift object and the link shims.
+#[test]
+fn assert_passes_its_site_and_message_or_null() {
+    let mut i = Interner::new();
+    let assert = i.intern("assert");
+    let (site, message) = (i.intern("wukong$loc$0"), i.intern("wukong$rodata$0"));
+    let mut b = Builder::new(i.intern("asserts"), MirType::Void);
+    let c = b.add_param(MirType::I1);
+    b.build_void(Op::Call {
+        func: assert,
+        args: vec![c],
+    });
+    let s = b.build(MirType::Ptr, Op::GlobalAddr(site));
+    b.build_void(Op::Call {
+        func: assert,
+        args: vec![c, s],
+    });
+    let m = b.build(MirType::Ptr, Op::GlobalAddr(message));
+    b.build_void(Op::Call {
+        func: assert,
+        args: vec![c, s, m],
+    });
+    b.ret(None);
+    let mut p = Program::new();
+    p.funcs.push(b.finish());
+    for (name, text) in [(site, "t.wk:2:5\0"), (message, "boom\0")] {
+        p.statics.push(wukong_mir::StaticData {
+            name,
+            bytes: text.as_bytes().to_vec(),
+        });
+    }
+    let text = try_emit_llvm_ir(&p, &i).expect("representable MIR");
+    assert!(
+        text.contains("declare void @wukong_rt_assert(i64, ptr, ptr)"),
+        "{text}"
+    );
+    let calls: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("call void @wukong_rt_assert("))
+        .collect();
+    assert_eq!(calls.len(), 3, "{text}");
+    assert!(calls[0].ends_with(", ptr null, ptr null)"), "{}", calls[0]);
+    assert!(calls[1].contains(", ptr %v1, ptr null)"), "{}", calls[1]);
+    assert!(calls[2].contains(", ptr %v1, ptr %v2)"), "{}", calls[2]);
 }
 
 #[test]
@@ -884,7 +933,10 @@ fn print_and_assert_lower_to_the_link_shim_abi() {
     ] {
         assert_eq!(
             shim.get(intrinsic.symbol()),
-            Some(&("void".to_string(), vec![intrinsic.param().to_string()])),
+            Some(&(
+                "void".to_string(),
+                intrinsic.params().iter().map(|p| p.to_string()).collect()
+            )),
             "{intrinsic:?}"
         );
     }
@@ -1537,6 +1589,53 @@ fn vector_kernels_are_defined_in_their_lane_type() {
         "%h3 = add i64 %h2, %f3",
         "ret i64 %h3",
         "%v3 = call i64 @__wukong_veckernel_sum_i64_0(ptr %v0, ptr %v1, i64 %v2)",
+    ] {
+        assert!(text.contains(line), "missing `{line}`:\n{text}");
+    }
+}
+
+/// An f16 recipe (an `f32` lane whose f16 streams convert at their loads and stores, and whose
+/// casts into f16 round) is defined with `half` memory and `fpext`/`fptrunc` at exactly those
+/// points, the evaluator's `LoadF16`, `StoreF16` and `RoundF16`; the `f32` stream stays `float`.
+#[test]
+fn f16_kernel_operations_convert_through_half() {
+    use wukong_mir::{VecBin, VecKernel, VecLane, VecOp};
+    let mut i = Interner::new();
+    let text = kernel_module(
+        "half_ops",
+        VecKernel {
+            name: i.intern("k"),
+            lane: VecLane::F32,
+            streams: 3,
+            scalars: 0,
+            ops: vec![
+                VecOp::LoadF16 { stream: 0 },
+                VecOp::Bin {
+                    op: VecBin::Mul,
+                    a: 0,
+                    b: 0,
+                },
+                VecOp::RoundF16 { a: 1 },
+                VecOp::StoreF16 { stream: 1, val: 2 },
+                VecOp::Store { stream: 2, val: 1 },
+            ],
+            unroll: 4,
+            reduce: None,
+        },
+        &mut i,
+    );
+    for line in [
+        "%x0.a = getelementptr half, ptr %base0, i64 %i",
+        "%x0.h = load half, ptr %x0.a",
+        "%x0 = fpext half %x0.h to float",
+        "%x1 = fmul float %x0, %x0",
+        "%x2.h = fptrunc float %x1 to half",
+        "%x2 = fpext half %x2.h to float",
+        "%x3.a = getelementptr half, ptr %base1, i64 %i",
+        "%x3.h = fptrunc float %x2 to half",
+        "store half %x3.h, ptr %x3.a",
+        "%x4.a = getelementptr float, ptr %base2, i64 %i",
+        "store float %x1, ptr %x4.a",
     ] {
         assert!(text.contains(line), "missing `{line}`:\n{text}");
     }

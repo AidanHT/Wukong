@@ -16,6 +16,7 @@
 //! | an unsigned integer and a strictly wider signed one | the signed (`u32 + i64` is `i64`) |
 //! | a signed integer known to be non-negative and an unsigned one at least as wide | the unsigned |
 //! | `f16`/`bf16` with `f32`/`f64`, or `f32` with `f64` | the wider float — never `f16` with `bf16` |
+//! | `f8e4m3`/`f8e5m2` with any wider float | the wider float — never `f8e4m3` with `f8e5m2` |
 //! | an integer and a float that holds every value of it exactly | the float (`i16 + f32`, `i32 + f64`, `u8 + bf16`) |
 //! | `usize` with `u64`, `isize` with `i64` | one 64-bit type under two names: the left operand's name |
 //!
@@ -56,7 +57,13 @@ pub(crate) fn promote(a: Scalar, b: Scalar, a_nonneg: bool, b_nonneg: bool) -> O
     }
     match (a.is_float(), b.is_float()) {
         (true, true) => {
-            if matches!((a, b), (F16, Bf16) | (Bf16, F16)) {
+            // Neither of a pair of same-width floats holds the other: `f16`/`bf16` trade range
+            // for precision, and so do the two 8-bit floats. Every f8 value is exactly an
+            // `f16`, a `bf16`, an `f32` and an `f64`, so an f8 widens to any of those.
+            if matches!(
+                (a, b),
+                (F16, Bf16) | (Bf16, F16) | (F8E4M3, F8E5M2) | (F8E5M2, F8E4M3)
+            ) {
                 None
             } else if a.size() >= b.size() {
                 Some(a)
@@ -101,6 +108,8 @@ fn same_repr(a: Scalar, b: Scalar) -> bool {
 fn exact_in(i: Scalar, f: Scalar) -> bool {
     let magnitude_bits = i.size() * 8 - u64::from(i.is_signed());
     let precision: u64 = match f {
+        Scalar::F8E5M2 => 3,
+        Scalar::F8E4M3 => 4,
         Scalar::F16 => 11,
         Scalar::Bf16 => 8,
         Scalar::F32 => 24,
@@ -224,6 +233,12 @@ impl Sema<'_> {
                 self.report_compound(op, target, value, ts, vs, Some(vs));
             } else if ts.is_int() && !shift {
                 self.range_check_int_literal(value, &Ty::Scalar(ts));
+            } else if ts.is_f8() && vs.is_float() {
+                // The operand is rounded onto the place's 8-bit grid before the operation.
+                self.range_check_f8_literal(value, ts);
+            } else if ts.is_f8() && vs.is_int() && !shift {
+                // So is an integer literal (`e += 1000`), converted to the place's type (`f8.rs`).
+                self.range_check_f8_int_literal(value, ts);
             }
             return;
         }

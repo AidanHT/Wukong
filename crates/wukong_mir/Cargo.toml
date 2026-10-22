@@ -15,3 +15,11 @@ workspace = true
 [dependencies]
 wukong_span = { workspace = true }
 wukong_types = { workspace = true }
+
+[dev-dependencies]
+# Test oracle only: `f16_bits` transcribes the `half` crate's software f16 routine (the runtime
+# shims `wukong_f32_to_f16_bits` / `wukong_f16_bits_to_f32` are `half`), and its tests check it bit
+# for bit against `half`'s host and software paths. A dev-dependency reaches no consumer, so the
+# crate itself still depends on `wukong_span` and `wukong_types` only. Already locked for
+# `wukong_runtime`, at the same version and features.
+half = "2"

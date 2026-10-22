@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 256
+// EXPECT-OUT: 260
+// EXPECT-OUT: 2048
+// EXPECT-OUT: 2052
+// EXPECT-OUT: inf
+// EXPECT-OUT: 16
+// EXPECT-OUT: 20
+module tests.run.half_int_conversion_rounds
+
+// An integer converted to a float narrower than f32 rounds onto that float's grid AT THE VALUE.
+// `sitofp` produces the f32, and only a store used to round it to the half grid, so once mem2reg
+// forwarded the converted value past its store at -O2, `print(i as bf16)` of 257 printed 257 where
+// -O0 printed the stored 256 — on the interpreter and natively alike, so only the -O0/-O2 gate could
+// see it. Each value is an opaque run-time integer (`arg_count() - 1` is 0), printed straight from the
+// conversion.
+//
+// Expected by hand: bf16 has 8 significant bits, so on [256, 512) its step is 2: 257 ties between
+// 256 (even mantissa) and 258 and goes to 256; 259 ties between 258 (odd) and 260 (even), so 260.
+// f16 has 11 significant bits, step 2 on [2048, 4096): 2049 ties to 2048, 2051 to 2052; 70000 is
+// past the overflow midpoint 65520 of f16's largest value 65504, so infinity. f8e4m3 has 4
+// significant bits, step 2 on [16, 32): 17 ties to 16 (mantissa 000), 19 to 20 (mantissa 010).
+fn main() -> i32 {
+    let z: i64 = arg_count() - 1;
+    let a: i32 = (z + 257) as i32;
+    let b: i32 = (z + 259) as i32;
+    let c: i64 = z + 2049;
+    let d: u32 = (z + 2051) as u32;
+    let e: i64 = z + 70000;
+    let f: i16 = (z + 17) as i16;
+    let g: u8 = (z + 19) as u8;
+    print(a as bf16);
+    print(b as bf16);
+    print(c as f16);
+    print(d as f16);
+    print(e as f16);
+    print(f as f8e4m3);
+    print(g as f8e4m3);
+    return 0;
+}

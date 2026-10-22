@@ -109,23 +109,28 @@
 //! saturating quantize and an `i8` dot into an `i32` accumulator all widen. A value is never split
 //! across more than [`MAX_PARTS`] vectors.
 //!
-//! # `bf16` widens as `f32` lanes; `f16` stays scalar
+//! # `bf16` and `f16` widen as `f32` lanes
 //!
-//! Every backend computes a `bf16` value in an `f32` register and rounds it to the bf16 grid at
-//! exactly four points: a load (the storage holds 16 bits), a store, a constant, and a cast
-//! (`fptrunc .. to bf16`, which `mir_build` places after every bf16 operation, and an `fpext` out
-//! of bf16). Arithmetic in between is plain `f32`. So a bf16 lane is an `f32` lane — four to a
-//! 128-bit register, [`lane_bytes`] `4` — and `<4 x bf16>` keeps the same four rounding points
-//! lane by lane: the interpreter rounds each lane of a vector load as it rounds a scalar one, and
-//! Cranelift loads four 2-byte elements into the top halves of an `f32x4` (`uload16x4`), packs
-//! four rounded top halves on a store, and rounds each lane of a bf16 `fptrunc`/`fpext` with the
-//! scalar path's integer round-to-nearest-even. The arithmetic, compares and blends between them
-//! are the `f32x4` ones, and only the three exact casts between `f32` and bf16 are lane-wise
-//! ([`cast_route`]); every other bf16 cast is replicated as the scalar instruction. Reductions
-//! with a bf16 accumulator and bf16 interleave groups stay scalar.
-//!
-//! `f16` stays scalar: Cranelift has no vector half conversion, and the scalar path converts
-//! through runtime shims one element at a time.
+//! Every backend computes a `bf16` or `f16` value in an `f32` register and rounds it to its 16-bit
+//! grid at exactly four points: a load (the storage holds 16 bits), a store, a constant, and a cast
+//! (`fptrunc .. to bf16`/`f16`, which `mir_build` places after every half operation, and an
+//! `fpext` out of one). Arithmetic in between is plain `f32`. So a half lane is an `f32` lane —
+//! four to a 128-bit register, [`lane_bytes`] `4` — and `<4 x bf16>` / `<4 x f16>` keep the same
+//! four rounding points lane by lane: the interpreter rounds each lane of a vector load as it
+//! rounds a scalar one, and Cranelift (`codegen_cranelift::half_lanes`) loads four 2-byte elements
+//! into an `f32x4` (`uload16x4`, then a shift for bf16 or an integer f16 decode), rounds and packs
+//! four lanes on a store, and rounds each lane of a half `fptrunc`/`fpext`. The bf16 rounding is the
+//! scalar path's integer round-to-nearest-even; the f16 one is an SSE2 integer form of the scalar
+//! path's runtime shims (the `half` crate), checked against them on every f16 encoding and a dense
+//! cover of `f32` inputs. The arithmetic, compares and blends between them are the `f32x4` ones.
+//! Every half cast but a bitcast is lane-wise ([`cast_route`]) in the scalar cast's own steps: the
+//! grid-rounding casts between `f32`, bf16 and f16 directly, a cast through `f64` as that rounding
+//! plus the `f32 <-> f64` widen or narrow, and a cast to or from an integer as the `f32` one (the
+//! scalar `sitofp`/`fptosi` rounds nothing at the half grid; `mir_build` rounds an integer
+//! converted to a half type with the `fptrunc` it places after it, which widens like any other).
+//! Half interleave groups widen like 32-bit ones: their loads and stores round where the scalar
+//! ones do, and the shuffles between them move `f32` lanes. Reductions with a half accumulator (it
+//! rounds inside its own recurrence) stay scalar.
 //!
 //! # Reading `WUKONG_VEC_TRACE=1`
 //!
@@ -174,6 +179,7 @@ use crate::loop_info::{
     NaturalLoop, RedKind, TripCount,
 };
 use crate::{each_op_use, CfgAnalyses, Pass};
+use wukong_span::Span;
 
 /// # Termination
 ///
@@ -328,17 +334,23 @@ impl Pass for Vectorize {
 /// Byte width of a lane type this pass will widen, or `None` for one it refuses.
 ///
 /// `I1` is out because a boolean vector is a *mask*, whose machine representation is one all-ones
-/// lane per element of the value it selects, not a one-bit lane. A `bf16` lane is its *register*
-/// width, an `f32`'s, though it is stored in two bytes (module docs); `f16` is out. Pointers and
+/// lane per element of the value it selects, not a one-bit lane. A `bf16` or `f16` lane is its
+/// *register* width, an `f32`'s, though it is stored in two bytes (module docs). Pointers and
 /// aggregates have no lane-wise arithmetic at all.
 fn lane_bytes(t: &MirType) -> Option<u32> {
     Some(match t {
         MirType::I8 => 1,
         MirType::I16 => 2,
-        MirType::I32 | MirType::F32 | MirType::BF16 => 4,
+        MirType::I32 | MirType::F32 | MirType::BF16 | MirType::F16 => 4,
         MirType::I64 | MirType::F64 => 8,
         _ => return None,
     })
+}
+
+/// Is `t` a half-precision float — bf16 or f16, an `f32` lane in a register and two bytes in
+/// memory, rounded to its grid at a load, a store, a constant and a cast (module docs)?
+fn is_half(t: &MirType) -> bool {
+    matches!(t, MirType::BF16 | MirType::F16)
 }
 
 /// Lanes per vector for a lane type.
@@ -433,6 +445,13 @@ enum CastRoute {
     FpExt,
     /// `f64 -> f32`: pairs of parts joined (`Op::Narrow`).
     FpTrunc,
+    /// bf16/f16 `-> f64`: each part rounded to its half grid as an `f32` lane (the lane-wise
+    /// `fpext .. to f32`, the rounding the scalar `fpext` applies to its source), then
+    /// [`CastRoute::FpExt`].
+    HalfToF64,
+    /// `f64 ->` bf16/f16: [`CastRoute::FpTrunc`] to `f32` lanes, then each rounded to the half grid
+    /// (the lane-wise `fptrunc`) — the scalar cast's demote, then round.
+    F64ToHalf,
 }
 
 /// How one instruction of the scalar body is reproduced in the vector body.
@@ -1405,9 +1424,6 @@ fn plan_loop(
     let (groups, member) = interleave_groups(l)?;
     if dir == -1 && !groups.is_empty() {
         return Err("an interleave group in a countdown");
-    }
-    if groups.iter().any(|g| g.elem == MirType::BF16) {
-        return Err("a bf16 interleave group");
     }
     access_shape_verdict(l, &member)?;
     group_order_verdict(l, &lin, groups.len(), &member)?;
@@ -4720,9 +4736,9 @@ fn plan_body(
     // must be a real lane mask: a uniform `i1` cannot blend vectors.
     for r in &reductions {
         lane_bytes(&r.ty)?;
-        // A bf16 accumulate rounds to the grid inside its own recurrence (`fptrunc` after the
-        // combine), which no fold form here reproduces.
-        if r.ty == MirType::BF16 {
+        // A bf16 or f16 accumulate rounds to the grid inside its own recurrence (`fptrunc` after
+        // the combine), which no fold form here reproduces.
+        if is_half(&r.ty) {
             return None;
         }
         if let Some((cond, _)) = r.guard {
@@ -4891,14 +4907,32 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute> {
     use CastKind::*;
     let (fb, tb) = (lane_bytes(from)?, lane_bytes(to)?);
-    // A bf16 lane is an `f32` lane in a register, so the casts that only round it to the bf16 grid
-    // are lane-wise: `fpext bf16 -> f32` (rounds the source first) and `fptrunc` from `f32` or bf16
-    // (the rounding `mir_build` places after every bf16 operation). Any other bf16 cast — through
-    // `f64`, to or from an integer, a bitcast — has no exact lane-wise form here and is replicated.
-    if *from == MirType::BF16 || *to == MirType::BF16 {
-        return match (kind, from, to) {
-            (FpExt, MirType::BF16, MirType::F32)
-            | (FpTrunc, MirType::F32 | MirType::BF16, MirType::BF16) => Some(CastRoute::Same),
+    // A bf16 or f16 lane is an `f32` lane in a register, so the casts that only round it to a
+    // grid are lane-wise: an `fpext` out of a half type (it rounds the source to its grid first)
+    // and an `fptrunc` into one (the rounding `mir_build` places after every half operation), each
+    // between two of `f32`, bf16 and f16 — the backends round exactly where the scalar cast does.
+    // Through `f64` the cast is that rounding and the `f32 <-> f64` lane-count change, in the
+    // scalar cast's order (`HalfToF64`, `F64ToHalf`). To and from an integer, a half lane converts
+    // exactly as an `f32` lane does — the scalar cast rounds nothing at the half grid there (an
+    // integer becomes an `f32`, and `mir_build` rounds it to the half grid with the same-type
+    // `fptrunc` it places right after the conversion, which takes the rounding route above; a half
+    // value is truncated from its `f32` register) — so the `f32` route serves, with the half lane
+    // type at the half end. A bitcast has no lane-wise form and is replicated.
+    if is_half(from) || is_half(to) {
+        let float32 = |t: &MirType| *t == MirType::F32 || is_half(t);
+        let as_f32 = |t: &MirType| {
+            if is_half(t) {
+                MirType::F32
+            } else {
+                t.clone()
+            }
+        };
+        return match kind {
+            FpExt if is_half(from) && float32(to) => Some(CastRoute::Same),
+            FpTrunc if is_half(to) && float32(from) => Some(CastRoute::Same),
+            FpExt if is_half(from) && *to == MirType::F64 => Some(CastRoute::HalfToF64),
+            FpTrunc if *from == MirType::F64 && is_half(to) => Some(CastRoute::F64ToHalf),
+            SiToFp | UiToFp | FpToSi | FpToUi => cast_route(kind, &as_f32(from), &as_f32(to)),
             _ => None,
         };
     }
@@ -5187,14 +5221,27 @@ fn op_of(f: &Function, v: ValueId) -> Option<&Op> {
 // ---------------------------------------------------------------------------------------------
 
 /// A tiny append-only instruction builder over a `Function`.
+///
+/// Like `wukong_mir::Builder` it carries a **current location**: every value it creates is
+/// attributed to `loc` (`wukong_mir::SourceLocs`; a dummy span records nothing). A widened loop is
+/// still its source loop, so [`apply`] starts at the loop's span ([`loop_loc`]) for the guard, the
+/// trip and the exit, and [`emit_body`] moves it to each scalar step's own span ([`step_loc`])
+/// while that step is widened — the vector `fadd` of `y[i] = a * x[i] + y[i]` is on the line the
+/// scalar `fadd` was.
 struct Emit<'a> {
     f: &'a mut Function,
+    loc: Span,
 }
 
 impl<'a> Emit<'a> {
+    fn new(f: &'a mut Function, loc: Span) -> Emit<'a> {
+        Emit { f, loc }
+    }
+
     fn value(&mut self, ty: MirType) -> ValueId {
         let id = ValueId(self.f.value_types.len() as u32);
         self.f.value_types.push(ty);
+        self.f.set_value_loc(id, self.loc);
         id
     }
 
@@ -5229,6 +5276,76 @@ impl<'a> Emit<'a> {
     }
 }
 
+/// The span of the source loop `p` widens: its header's exit test, else its induction variable,
+/// else the first located value of its body. Dummy when none of them is located (a loop the
+/// optimizer itself built), so its new values stay unknown rather than borrow another line.
+fn loop_loc(f: &Function, p: &VecPlan) -> Span {
+    let header = &f.blocks[p.header.0 as usize];
+    let exit_test = match &header.term {
+        Terminator::CondBr { cond, .. } => f.value_loc(*cond),
+        _ => None,
+    };
+    exit_test
+        .or_else(|| f.value_loc(header.params[p.iv_index]))
+        .or_else(|| {
+            f.blocks[p.body.0 as usize]
+                .insts
+                .iter()
+                .find_map(|i| i.result.and_then(|r| f.value_loc(r)))
+        })
+        .unwrap_or_else(Span::dummy)
+}
+
+/// The span of the scalar step a body step widens: its result's, or for a store (which has no
+/// result) its address's, else its stored value's. `None` when the step is not located.
+fn step_loc(f: &Function, step: &LinInst) -> Option<Span> {
+    let inst_loc = |(block, idx): (BlockId, usize)| match &f.blocks[block.0 as usize].insts[idx] {
+        Inst {
+            result: Some(r), ..
+        } => f.value_loc(*r),
+        Inst {
+            op: Op::Store { ptr, value },
+            ..
+        } => f.value_loc(*ptr).or_else(|| f.value_loc(*value)),
+        _ => None,
+    };
+    match step {
+        LinInst::Real { block, idx } | LinInst::PredLoad { block, idx, .. } => {
+            inst_loc((*block, *idx))
+        }
+        LinInst::MaskedStore { at, .. }
+        | LinInst::TreeStore { at, .. }
+        | LinInst::PredStore { at, .. } => inst_loc(*at),
+        LinInst::Merge { param, .. } => f.value_loc(*param),
+    }
+}
+
+/// The span of reduction `r`'s scalar update (its back-edge argument), else of its accumulator,
+/// else `fallback`: the combines and folds of its partials are that update, regrouped.
+fn red_loc(f: &Function, p: &VecPlan, r: &RedPlan, fallback: Span) -> Span {
+    let update = match &f.blocks[p.body.0 as usize].term {
+        Terminator::Br { args, .. } => args.get(r.param_index).copied(),
+        Terminator::CondBr {
+            then_blk,
+            then_args,
+            else_args,
+            ..
+        } => {
+            let args = if *then_blk == p.header {
+                then_args
+            } else {
+                else_args
+            };
+            args.get(r.param_index).copied()
+        }
+        _ => None,
+    };
+    update
+        .and_then(|v| f.value_loc(v))
+        .or_else(|| f.value_loc(f.blocks[p.header.0 as usize].params[r.param_index]))
+        .unwrap_or(fallback)
+}
+
 fn apply(f: &mut Function, p: &VecPlan) {
     let header_params: Vec<ValueId> = f.blocks[p.header.0 as usize].params.clone();
     let header_tys: Vec<MirType> = header_params
@@ -5236,7 +5353,8 @@ fn apply(f: &mut Function, p: &VecPlan) {
         .map(|v| f.value_type(*v).clone())
         .collect();
 
-    let mut e = Emit { f };
+    let loop_at = loop_loc(f, p);
+    let mut e = Emit::new(f, loop_at);
 
     // Reassociable reductions carry an extra, vector-typed accumulator through the vector loop —
     // `W` independent partials that are folded into the scalar accumulator once, on the way out.
@@ -5361,6 +5479,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let mut exit_args = vh_params[..header_tys.len()].to_vec();
     let mut next_param = header_tys.len();
     for r in &vacc {
+        e.loc = red_loc(e.f, p, r, loop_at);
         let n = parts_of(&r.ty, p.w);
         let parts = vh_params[next_param..next_param + n].to_vec();
         next_param += n;
@@ -5391,6 +5510,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
         }
         exit_args[r.param_index] = acc;
     }
+    e.loc = loop_at;
     e.f.blocks[vx.0 as usize].term = Terminator::Br {
         target: p.header,
         args: exit_args,
@@ -5408,6 +5528,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
         &header_params,
         &vh_params,
     );
+    e.loc = loop_at;
     reads.finish(&mut e);
     e.f.blocks[last.0 as usize].term = Terminator::Br {
         target: vh,
@@ -5883,6 +6004,13 @@ fn emit_body(
     vh_params: &[ValueId],
 ) -> (Vec<ValueId>, BlockId) {
     let latch_term = e.f.blocks[p.body.0 as usize].term.clone();
+    // The loop's own span ([`loop_loc`]), for what no single step owns: the lane ramp, the step of
+    // the counter and the back edge. Each step and each reduction moves the cursor to its own.
+    let loop_at = e.loc;
+    let exit_at = p
+        .early
+        .and_then(|x| e.f.value_loc(x.cond))
+        .unwrap_or(loop_at);
 
     // scalar value -> its counterpart in the vector body.
     let mut map: FxHashMap<u32, Wide> = FxHashMap::default();
@@ -5933,11 +6061,15 @@ fn emit_body(
 
     for (i, step) in p.lin.iter().enumerate() {
         if let Some(x) = p.early.filter(|x| x.split == i) {
+            e.loc = exit_at;
             vb = emit_exit_test(e, p, vb, vx, &map, x);
         }
+        // A checked body's lane test sits on its own bounds check's line.
         for x in p.spine_exits.iter().filter(|x| x.split == i) {
+            e.loc = e.f.value_loc(x.cond).unwrap_or(loop_at);
             vb = emit_exit_test(e, p, vb, vx, &map, *x);
         }
+        e.loc = step_loc(e.f, step).unwrap_or(loop_at);
         // Give the induction variable its lane-varying face for exactly the steps that read it as a
         // value, and its scalar one everywhere else, so the address arithmetic around them stays
         // scalar. Set at the top of every iteration rather than restored at the bottom: the body
@@ -6305,9 +6437,11 @@ fn emit_body(
 
     // A search loop whose latch computes nothing but the step tests after every body step.
     if let Some(x) = p.early.filter(|x| x.split == p.lin.len()) {
+        e.loc = exit_at;
         vb = emit_exit_test(e, p, vb, vx, &map, x);
     }
     for x in p.spine_exits.iter().filter(|x| x.split == p.lin.len()) {
+        e.loc = e.f.value_loc(x.cond).unwrap_or(loop_at);
         vb = emit_exit_test(e, p, vb, vx, &map, *x);
     }
 
@@ -6330,6 +6464,7 @@ fn emit_body(
     let mut vacc_next: Vec<ValueId> = Vec::new();
     let header_len = header_params.len();
     for r in &p.reductions {
+        e.loc = red_loc(e.f, p, r, loop_at);
         if let Some((_, ity)) = &r.arg {
             // An argmax: per part, the loop's own compare with the partial maximum in the
             // accumulator's position, a select of the value, and a select of the counter's lane
@@ -6436,6 +6571,8 @@ fn emit_body(
         let out = emit_reduction_fold(e, vb, &map, r, init, p.w);
         acc_of.insert(r.param_index, out);
     }
+
+    e.loc = loop_at;
 
     // Back-edge arguments, one per header parameter.
     let latch_args = match &latch_term {
@@ -7598,6 +7735,14 @@ fn emit_cast(
         }
         CastRoute::FpExt => widen_chain(e, vb, xs, from, to, CastKind::FpExt),
         CastRoute::FpTrunc => narrow_chain(e, vb, xs, from, to, |_| NarrowKind::FpTrunc),
+        CastRoute::HalfToF64 => {
+            let rounded = cast_parts(e, vb, CastKind::FpExt, xs, &MirType::F32);
+            widen_chain(e, vb, rounded, &MirType::F32, to, CastKind::FpExt)
+        }
+        CastRoute::F64ToHalf => {
+            let demoted = narrow_chain(e, vb, xs, from, &MirType::F32, |_| NarrowKind::FpTrunc);
+            cast_parts(e, vb, CastKind::FpTrunc, demoted, to)
+        }
     }
 }
 
@@ -8587,14 +8732,194 @@ mod tests {
         assert!(!is_widened(src, "k"), "a bf16 sum must not be widened");
     }
 
-    /// `f16` is refused: Cranelift has no vector half conversion, and its scalar path converts
-    /// through runtime shims one element at a time.
+    /// An f16 lane is an `f32` lane in a register, like a bf16 one: an f16 body widens to
+    /// `<4 x f16>` parts and to nothing else.
     #[test]
-    fn an_f16_loop_is_refused() {
-        let src = "fn k(x: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0; \
-                   while i < n { o[i] = x[i] * x[i]; i = i + 1; } } \
+    fn an_f16_loop_widens_as_four_f32_lanes() {
+        let src = "fn k(x: []f16, y: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * y[i] + x[i]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "f16 must not be widened");
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "an f16 body was not widened");
+        assert!(
+            vs.iter().all(|(l, n)| *l == MirType::F16 && *n == 4),
+            "{vs:?}"
+        );
+    }
+
+    /// The f16 twin of [`bf16_lanes_agree_with_the_scalar_loop`]: every lane of five f16 bodies,
+    /// `-O0` against `-O2`, as raw bits — over NaN payloads (quiet and signalling), both zeros, both
+    /// infinities, the smallest subnormal and normal, the largest finite value (whose products
+    /// overflow) and rounding ties.
+    #[test]
+    fn f16_lanes_agree_with_the_scalar_loop() {
+        scalar_and_vector_agree(
+            "fn pick(a: f16, b: f16) -> f16 { if a > b { return a; } return -b; } \
+             @unchecked fn k(x: []f16, y: []f16, mut o1: []f16, mut o2: []f16, \
+               mut o3: []f16, mut f: []f32, mut o5: []f16, n: i64, d: i64) { \
+               if d > 0 { k(x, y, o1, o2, o3, f, o5, n, d - 1); return; } \
+               let mut i: i64 = 0; \
+               while i < n { o1[i] = x[i] * y[i] + x[i]; i = i + 1; } \
+               i = 0; while i < n { o2[i] = pick(x[i], y[i]); i = i + 1; } \
+               i = 0; while i < n { o3[i] = x[i] / y[i]; i = i + 1; } \
+               i = 0; while i < n { f[i] = (x[i] as f32) * 0.5; i = i + 1; } \
+               i = 0; while i < n { o5[i] = (f[i] * 3.0) as f16; i = i + 1; } } \
+             fn xs(r: i64) -> u16 { let t: [u16; 16] = [32257, 32000, 32768, 0, 31744, 64512, \
+               15872, 49280, 1, 31743, 15361, 16968, 48128, 13312, 22528, 18688]; return t[r]; } \
+             fn ys(r: i64) -> u16 { let t: [u16; 16] = [15360, 16384, 0, 32768, 31744, 15361, \
+               15359, 49664, 1024, 27648, 14336, 30720, 45056, 19712, 16383, 32258]; return t[r]; } \
+             fn main() -> i32 { let n: i64 = 37; \
+               let mut x: []f16 = alloc_f16(n); let mut y: []f16 = alloc_f16(n); \
+               let mut o1: []f16 = alloc_f16(n); let mut o2: []f16 = alloc_f16(n); \
+               let mut o3: []f16 = alloc_f16(n); let mut o5: []f16 = alloc_f16(n); \
+               let mut f: []f32 = alloc_f32(n); let mut i: i64 = 0; \
+               while i < n { x[i] = f16_from_bits(xs(i % 16)); \
+                 y[i] = f16_from_bits(ys((5 * i + 3) % 16)); i = i + 1; } \
+               k(x, y, o1, o2, o3, f, o5, n, 0); i = 0; \
+               while i < n { print(bits(o1[i])); print(bits(o2[i])); print(bits(o3[i])); \
+                 print(bits(f[i])); print(bits(o5[i])); i = i + 1; } \
+               return 0; }",
+        );
+    }
+
+    /// An f16 accumulator rounds to its grid inside its own recurrence, like a bf16 one, so the
+    /// loop stays scalar.
+    #[test]
+    fn an_f16_reduction_stays_scalar() {
+        let src = "fn k(x: []f16, n: i64) -> f16 { let mut s: f16 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an f16 sum must not be widened");
+    }
+
+    /// Does `func` at `-O2` replicate any step — pack a lane with `Op::InsertLane` — or does every
+    /// step it widened run on whole vectors?
+    fn replicates(src: &str, func: &str) -> bool {
+        let (program, mut interner) = optimized(src, 2);
+        let f = program
+            .function(interner.intern(func))
+            .unwrap_or_else(|| panic!("no fn {func}"));
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i.op, Op::InsertLane(..)))
+    }
+
+    /// Half casts through `f64` and to and from integers convert lane-wise — the half end rounds
+    /// (or not) exactly where the scalar cast does, the `f32 <-> f64` end is a widen or a narrow —
+    /// where each lane used to be extracted, converted by the scalar instruction and packed again.
+    /// Each body widens with no lane replicated at all.
+    #[test]
+    fn half_casts_through_f64_and_integers_convert_lane_wise() {
+        for (name, ty, from, to, expr) in [
+            ("f16 to f64", "f16", "f16", "f64", "x[i] as f64 * 0.5"),
+            ("bf16 to f64", "bf16", "bf16", "f64", "x[i] as f64 - 1.0"),
+            ("f64 to f16", "f16", "f64", "f16", "(x[i] * 3.0) as f16"),
+            ("f64 to bf16", "bf16", "f64", "bf16", "(x[i] * 3.0) as bf16"),
+            ("f16 to i32", "f16", "f16", "i32", "x[i] as i32"),
+            ("bf16 to i32", "bf16", "bf16", "i32", "x[i] as i32"),
+            ("f16 to u8", "f16", "f16", "u8", "x[i] as u8"),
+            ("f16 to u32", "f16", "f16", "u32", "x[i] as u32"),
+            ("i32 to f16", "f16", "i32", "f16", "x[i] as f16"),
+            ("i32 to bf16", "bf16", "i32", "bf16", "x[i] as bf16"),
+            ("i16 to f16", "f16", "i16", "f16", "x[i] as f16"),
+            ("u8 to bf16", "bf16", "u8", "bf16", "x[i] as bf16"),
+        ] {
+            let src = format!(
+                "fn k(x: []{from}, mut o: []{to}, n: i64) {{ let mut i: i64 = 0; \
+                 while i < n {{ o[i] = {expr}; i = i + 1; }} }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            let vs = vector_values(&src, "k");
+            assert!(
+                vs.iter().any(|(l, _)| l.display() == ty),
+                "{name}: no {ty} vector: {vs:?}"
+            );
+            assert!(!replicates(&src, "k"), "{name}: a cast is still replicated");
+        }
+    }
+
+    /// Every lane of those casts, `-O0` against `-O2`, over every class a half holds — NaN
+    /// payloads, both zeros and infinities, subnormals, the largest finite values — and integers
+    /// at and past the half ranges (f16 saturates to infinity from 65520; bf16 rounds 2^24 + 2^16
+    /// + 1 through `f32`). Runtime trips, so the vector loop and the scalar tail both run.
+    #[test]
+    fn half_cast_lanes_agree_with_the_scalar_loop() {
+        scalar_and_vector_agree(
+            "@unchecked fn k(x: []f16, b: []bf16, p: []i32, s: []i16, mut d: []f64, \
+               mut e: []f64, mut x2: []f16, mut b2: []bf16, mut pi: []i32, mut qi: []i32, \
+               mut u: []u8, mut x3: []f16, mut b3: []bf16, mut y3: []f16, n: i64, z: i64) { \
+               if z > 0 { k(x, b, p, s, d, e, x2, b2, pi, qi, u, x3, b3, y3, n, z - 1); return; } \
+               let mut i: i64 = 0; \
+               while i < n { d[i] = x[i] as f64 * 0.5; i = i + 1; } \
+               i = 0; while i < n { e[i] = b[i] as f64 - 1.0; i = i + 1; } \
+               i = 0; while i < n { x2[i] = (d[i] * 3.0) as f16; i = i + 1; } \
+               i = 0; while i < n { b2[i] = (e[i] * 3.0) as bf16; i = i + 1; } \
+               i = 0; while i < n { pi[i] = x[i] as i32; i = i + 1; } \
+               i = 0; while i < n { qi[i] = b[i] as i32; i = i + 1; } \
+               i = 0; while i < n { u[i] = x[i] as u8; i = i + 1; } \
+               i = 0; while i < n { x3[i] = p[i] as f16; i = i + 1; } \
+               i = 0; while i < n { b3[i] = p[i] as bf16; i = i + 1; } \
+               i = 0; while i < n { y3[i] = s[i] as f16; i = i + 1; } } \
+             fn main() -> i32 { let n: i64 = 67; \
+               let mut x: []f16 = alloc_f16(n); let mut b: []bf16 = alloc_bf16(n); \
+               let mut p: []i32 = alloc_i32(n); let mut s: []i16 = alloc_i16(n); \
+               let mut d: []f64 = alloc_f64(n); let mut e: []f64 = alloc_f64(n); \
+               let mut x2: []f16 = alloc_f16(n); let mut b2: []bf16 = alloc_bf16(n); \
+               let mut pi: []i32 = alloc_i32(n); let mut qi: []i32 = alloc_i32(n); \
+               let mut u: []u8 = alloc_u8(n); let mut x3: []f16 = alloc_f16(n); \
+               let mut b3: []bf16 = alloc_bf16(n); let mut y3: []f16 = alloc_f16(n); \
+               let mut i: i64 = 0; \
+               while i < n { x[i] = f16_from_bits(((i * 2731 + 1) % 65536) as u16); \
+                 b[i] = bf16_from_bits(((i * 4099 + 7) % 65536) as u16); \
+                 p[i] = ((i * 1000003) % 33554432 - 16777216) as i32; \
+                 s[i] = ((i * 977) % 65536 - 32768) as i16; i = i + 1; } \
+               p[3] = 2049; p[4] = 65519; p[5] = 65520; p[6] = -70000; p[7] = 16842753; \
+               k(x, b, p, s, d, e, x2, b2, pi, qi, u, x3, b3, y3, n, 0); i = 0; \
+               while i < n { print(bits(d[i])); print(bits(e[i])); print(bits(x2[i])); \
+                 print(bits(b2[i])); print(pi[i]); print(qi[i]); print(u[i]); \
+                 print(bits(x3[i])); print(bits(b3[i])); print(bits(y3[i])); i = i + 1; } \
+               return 0; }",
+        );
+    }
+
+    /// bf16 and f16 interleave groups widen like the 32-bit ones: a complex multiply over
+    /// interleaved real and imaginary parts, its stride-2 loads and stores split and merged by
+    /// lane shuffles, every lane `-O0` against `-O2` over special values.
+    #[test]
+    fn half_interleave_groups_widen_and_agree_with_the_scalar_loop() {
+        let src = "@unchecked fn kh(a: []f16, c: []f16, mut o: []f16, n: i64, z: i64) { \
+               if z > 0 { kh(a, c, o, n, z - 1); return; } let mut i: i64 = 0; \
+               while i < n { \
+                 o[2 * i] = a[2 * i] * c[2 * i] - a[2 * i + 1] * c[2 * i + 1]; \
+                 o[2 * i + 1] = a[2 * i] * c[2 * i + 1] + a[2 * i + 1] * c[2 * i]; \
+                 i = i + 1; } } \
+             @unchecked fn kb(a: []bf16, c: []bf16, mut o: []bf16, n: i64, z: i64) { \
+               if z > 0 { kb(a, c, o, n, z - 1); return; } let mut i: i64 = 0; \
+               while i < n { \
+                 o[2 * i] = a[2 * i] * c[2 * i] - a[2 * i + 1] * c[2 * i + 1]; \
+                 o[2 * i + 1] = a[2 * i] * c[2 * i + 1] + a[2 * i + 1] * c[2 * i]; \
+                 i = i + 1; } } \
+             fn main() -> i32 { let n: i64 = 37; let m: i64 = 2 * n; \
+               let mut a: []f16 = alloc_f16(m); let mut c: []f16 = alloc_f16(m); \
+               let mut o: []f16 = alloc_f16(m); let mut a2: []bf16 = alloc_bf16(m); \
+               let mut c2: []bf16 = alloc_bf16(m); let mut o2: []bf16 = alloc_bf16(m); \
+               let mut i: i64 = 0; \
+               while i < m { a[i] = f16_from_bits(((i * 2731 + 1) % 65536) as u16); \
+                 c[i] = f16_from_bits(((i * 3517 + 5) % 65536) as u16); \
+                 a2[i] = bf16_from_bits(((i * 4099 + 7) % 65536) as u16); \
+                 c2[i] = bf16_from_bits(((i * 1543 + 3) % 65536) as u16); i = i + 1; } \
+               kh(a, c, o, n, 0); kb(a2, c2, o2, n, 0); i = 0; \
+               while i < m { print(bits(o[i])); print(bits(o2[i])); i = i + 1; } \
+               return 0; }";
+        for (f, lane) in [("kh", MirType::F16), ("kb", MirType::BF16)] {
+            let vs = vector_values(src, f);
+            assert!(
+                vs.iter().any(|(l, _)| *l == lane),
+                "{f}: the group was not widened: {vs:?}"
+            );
+        }
+        scalar_and_vector_agree(src);
     }
 
     // ---- min/max reductions --------------------------------------------------------------------

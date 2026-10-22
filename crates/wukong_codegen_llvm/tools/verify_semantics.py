@@ -15,10 +15,11 @@ import llvmlite.binding as llvm
 
 root = Path(sys.argv[1])
 paths = sorted(root.glob("*.ll"))
-# The 46 modules executed below are the saturating-conversion, FMA and bf16-narrowing regressions;
-# every other exported module (e.g. `lowp_fma`, which pins only its text) is parsed and verified.
-executed = [p for p in paths if p.stem.startswith(("sat_", "fma_", "bf16_"))]
-assert len(executed) == 46, f"expected exactly 46 executed regression modules, got {len(executed)}"
+# The 52 modules executed below are the saturating-conversion, FMA, bf16-narrowing and f8-codec
+# regressions; every other exported module (e.g. `lowp_fma`, which pins only its text) is parsed
+# and verified.
+executed = [p for p in paths if p.stem.startswith(("sat_", "fma_", "bf16_", "f8_"))]
+assert len(executed) == 52, f"expected exactly 52 executed regression modules, got {len(executed)}"
 llvm.initialize()
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
@@ -196,6 +197,115 @@ for start in range(0, len(bf16_samples), 4):
         assert ov[k] == want, ("bf16_vec_bits", hex(x), hex(ov[k]), hex(want))
         bf16_checks += 2
 
+
+# The OCP FP8 formats, as `wukong_runtime::fp8` defines them: (mantissa bits, bias, largest
+# finite value, has infinities). E4M3FN saturates and has one NaN per sign (`S.1111.111`); E5M2
+# overflows to infinity and its canonical NaN is `S.11111.10`.
+F8_FORMATS = {"e4m3": (3, 7, 448.0, False), "e5m2": (2, 15, 57344.0, True)}
+
+
+def f8_decode(code, fmt):
+    """The exact value of an FP8 code (None for a NaN), by the format's formula."""
+    mbits, bias, _, has_inf = F8_FORMATS[fmt]
+    emax = (1 << (7 - mbits)) - 1
+    e, m = (code >> mbits) & emax, code & ((1 << mbits) - 1)
+    sign = -1.0 if code & 0x80 else 1.0
+    if e == emax:
+        if has_inf:
+            return sign * math.inf if m == 0 else None
+        if m == (1 << mbits) - 1:
+            return None
+    if e == 0:
+        return sign * math.ldexp(m, 1 - bias - mbits)
+    return sign * math.ldexp((1 << mbits) + m, e - bias - mbits)
+
+
+def f8_reference_encode(x, fmt):
+    """The runtime's reference encoder (`fp8::encode_exact`), transcribed: round-to-nearest-even
+    of the exact value of `x` (any double), then the format's saturation / overflow rule."""
+    mbits, bias, top, has_inf = F8_FORMATS[fmt]
+    sign = 0x80 if math.copysign(1.0, x) < 0 else 0
+    if math.isnan(x):
+        return sign | (0x7E if has_inf else 0x7F)
+    a = abs(x)
+    if math.isinf(a) or a == 0.0:
+        rounded = a
+    else:
+        e = max(math.frexp(a)[1] - 1, 1 - bias)
+        ulp = math.ldexp(1.0, e - mbits)
+        q = a / ulp
+        r = math.floor(q)
+        if q - r > 0.5 or (q - r == 0.5 and r % 2 == 1):
+            r += 1
+        rounded = r * ulp
+    target = (math.inf if has_inf else top) if rounded > top else rounded
+    code = next(c for c in range(0x80) if f8_decode(c, fmt) == target)
+    return sign | code
+
+
+def f8_value_bits(code, fmt):
+    """The f32 bits a stored code widens to: its exact value, a NaN canonical (quiet, signed)."""
+    v = f8_decode(code, fmt)
+    if v is None:
+        return 0xFFC00000 if code & 0x80 else 0x7FC00000
+    return struct.unpack("<I", struct.pack("<f", v))[0]
+
+
+f8_checks = 0
+f8_f32_samples = [
+    0x00000000, 0x80000000, 0x00000001, 0x807FFFFF, 0x3F800000, 0x7F7FFFFF, 0x7F800000,
+    0xFF800000, 0x7FC00000, 0xFFC12345, 0x7F800001, 0x43E00000, 0x43E80000, 0x43E80001,
+    0x476FFFFF, 0x47700000, 0x3A800000, 0x3A800001, 0x37000000, 0x37000001,
+]
+state = 0x243F6A88
+for _ in range(3000):
+    state = (state * 6364136223846793005 + 1442695040888963407) & (2**64 - 1)
+    f8_f32_samples.append(state >> 32)
+for fmt in F8_FORMATS:
+    values = [f8_decode(c, fmt) for c in range(0x80)]
+    for lo, hi in zip(values, values[1:]):
+        if lo is None or hi is None or math.isinf(hi):
+            continue
+        mid = (lo + hi) / 2.0
+        for x in (mid, -mid):
+            bits = struct.unpack("<I", struct.pack("<f", x))[0]
+            f8_f32_samples.extend([bits, bits + 1, bits - 1])
+for fmt in F8_FORMATS:
+    code_f32 = ctypes.CFUNCTYPE(ctypes.c_uint8, ctypes.c_void_p)(
+        engine.get_function_address(f"f8_{fmt}_code_f32")
+    )
+    code_f64 = ctypes.CFUNCTYPE(ctypes.c_uint8, ctypes.c_void_p)(
+        engine.get_function_address(f"f8_{fmt}_code_f64")
+    )
+    value = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(
+        engine.get_function_address(f"f8_{fmt}_value")
+    )
+    for c in range(256):
+        cell = (ctypes.c_uint8 * 1)(c)
+        assert value(cell) == f8_value_bits(c, fmt), ("value", fmt, hex(c), hex(value(cell)))
+        f8_checks += 1
+    for bits in f8_f32_samples:
+        cell = (ctypes.c_uint32 * 1)(bits & 0xFFFFFFFF)
+        x = struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
+        want = f8_reference_encode(x, fmt)
+        assert code_f32(cell) == want, ("code_f32", fmt, hex(bits), hex(code_f32(cell)), hex(want))
+        f8_checks += 1
+    # f64 sources round once: each midpoint, and a relative 1e-12 to either side of it (which f32
+    # cannot represent), plus f64-only extremes.
+    f64_samples = [0.0, -0.0, 1e-300, -1e-300, 5e-324, 1e300, -1e300, math.inf, -math.inf,
+                   math.nan]
+    values = [f8_decode(c, fmt) for c in range(0x80)]
+    for lo, hi in zip(values, values[1:]):
+        if lo is None or hi is None or math.isinf(hi):
+            continue
+        mid = (lo + hi) / 2.0
+        f64_samples.extend([mid, mid * (1 + 1e-12), mid * (1 - 1e-12), -mid * (1 + 1e-12)])
+    for x in f64_samples:
+        cell = (ctypes.c_double * 1)(x)
+        want = f8_reference_encode(x, fmt)
+        assert code_f64(cell) == want, ("code_f64", fmt, x, hex(code_f64(cell)), hex(want))
+        f8_checks += 1
+
 print(f"LLVM {llvm.llvm_version_info}: {len(paths)} modules verified ({len(executed)} executed); "
-      f"{cast_checks} saturating conversion, {fma_checks} exact FMA and {bf16_checks} bf16 "
-      "narrowing JIT checks passed")
+      f"{cast_checks} saturating conversion, {fma_checks} exact FMA, {bf16_checks} bf16 "
+      f"narrowing and {f8_checks} f8 codec JIT checks passed")

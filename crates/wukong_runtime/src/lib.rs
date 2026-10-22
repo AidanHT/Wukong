@@ -218,8 +218,9 @@ pub use gemv_half::{
 };
 pub mod quant;
 pub use quant::{
-    wukong_gemv_q4_0_f32, wukong_gemv_q4_0_f32_parallel, wukong_gemv_q8_0_f32,
-    wukong_gemv_q8_0_f32_parallel, wukong_quantize_q4_0_f32, wukong_quantize_q8_0_f32,
+    wukong_dequant_i4_f32, wukong_dequant_u4_f32, wukong_gemv_q4_0_f32,
+    wukong_gemv_q4_0_f32_parallel, wukong_gemv_q8_0_f32, wukong_gemv_q8_0_f32_parallel,
+    wukong_quantize_q4_0_f32, wukong_quantize_q8_0_f32,
 };
 
 mod cumprod;
@@ -230,8 +231,8 @@ pub use bias::{wukong_bias_bcast_f32, wukong_bias_bcast_f32_parallel, BIAS_ACT_N
 
 mod safety;
 pub use safety::{
-    bounds_failure_message, check_failure_message, site_str, wukong_rt_bounds_fail,
-    wukong_rt_check_fail, CHECK_RANGE_END, CHECK_RANGE_ORDER, CHECK_UTF8,
+    assert_failure_message, bounds_failure_message, check_failure_message, site_str,
+    wukong_rt_bounds_fail, wukong_rt_check_fail, CHECK_RANGE_END, CHECK_RANGE_ORDER, CHECK_UTF8,
 };
 
 /// UTF-8 validation, decoding and counting for the `str` operations, shared by the interpreter,
@@ -263,6 +264,11 @@ pub mod process;
 /// `WUKONG_MAX_ISA` (`scalar`, `avx2`, `avx2_vnni`, `avx512`), the one probe every dispatcher asks.
 pub mod isa;
 pub mod train;
+
+/// Which kernels overwrite their output buffer completely, and under which operand values: the
+/// contract the native backend's stack coloring ends a scratch array's lifetime on.
+pub mod overwrite;
+pub use overwrite::{overwrite_of, Overwrite, OVERWRITES};
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the

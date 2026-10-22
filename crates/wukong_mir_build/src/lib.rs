@@ -1206,19 +1206,22 @@ pub fn lower_program(
 /// examples, both benches, every backend's tests) want the defaults and should not have to say so.
 ///
 /// Runtime safety failures (a slice index out of bounds) carry no source location through this
-/// entry point; [`lower_program_located`] attaches one.
+/// entry point, and a failed `assert(cond)` keeps its bare one-operand call (no site operand at
+/// all, so every MIR consumer that never had a source map sees exactly the call it always did);
+/// [`lower_program_located`] attaches both.
 pub fn lower_program_with(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_located(module, sema, interner, opts, &|_| String::new())
+    lower_program_impl(module, sema, interner, opts, None, false)
 }
 
 /// [`lower_program_with`], plus the source location every runtime safety failure reports.
 /// `locate` renders a span start as `file:line:col` (an empty string means "unknown"); the driver
-/// passes its source map's view, so an out-of-bounds slice access prints where it happened on the
+/// passes its source map's view, so an out-of-bounds slice access and a failed `assert` (or a
+/// kernel builtin's extent check, which traps through it) print where they happened on the
 /// interpreter, the JIT and a linked executable alike. A separate entry point for the same reason
 /// `lower_program_with` is one: only the driver has a source map to offer.
 pub fn lower_program_located(
@@ -1228,7 +1231,7 @@ pub fn lower_program_located(
     opts: LowerOptions,
     locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_impl(module, sema, interner, opts, locate, false)
+    lower_program_impl(module, sema, interner, opts, Some(locate), false)
 }
 
 /// [`lower_program_with`], plus one `note` diagnostic per recognized kernel dispatch: at each
@@ -1242,7 +1245,7 @@ pub fn lower_program_reporting_dispatch(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_reporting_dispatch_located(module, sema, interner, opts, &|_| String::new())
+    lower_program_impl(module, sema, interner, opts, None, true)
 }
 
 /// [`lower_program_reporting_dispatch`] with [`lower_program_located`]'s source locations — what
@@ -1255,7 +1258,7 @@ pub fn lower_program_reporting_dispatch_located(
     opts: LowerOptions,
     locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_impl(module, sema, interner, opts, locate, true)
+    lower_program_impl(module, sema, interner, opts, Some(locate), true)
 }
 
 fn lower_program_impl(
@@ -1263,7 +1266,7 @@ fn lower_program_impl(
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
-    locate: &dyn Fn(Span) -> String,
+    locate: Option<&dyn Fn(Span) -> String>,
     report: bool,
 ) -> (Program, Vec<Diagnostic>) {
     // The outlined-region symbols must be interned before lowering starts (the lowerer holds only a
@@ -1291,7 +1294,7 @@ fn lower_program_pooled(
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
-    locate: &dyn Fn(Span) -> String,
+    locate: Option<&dyn Fn(Span) -> String>,
     report: bool,
     pool: usize,
 ) -> (Program, Vec<Diagnostic>, bool) {
@@ -1386,6 +1389,9 @@ fn lower_program_pooled(
         // No versioning context until `emit_alias_versioned` opens one around a single emitter.
         guard: KernelGuard::Off,
         report,
+        // A failed `assert` names its call site only when there is a source map to render one;
+        // without it the call keeps its historical one-operand form (`lower_program_with`).
+        assert_sites: locate.is_some(),
         resume: false,
         proven_end: None,
         mm: interner.intern("wukong_sgemm"),
@@ -2516,12 +2522,20 @@ fn lower_program_pooled(
     // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
-    // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
+    // Give every slice bounds failure, range and UTF-8 check failure and failed `assert` its
+    // `file:line:col` (a `.rodata` string; see `bounds.rs`). Each entry is (callee, arity, index of
+    // the site operand); an `assert` carries its site second, before an optional message.
+    let no_locator = |_: Span| String::new();
     bounds::attach_sites(
         &mut program,
         interner,
-        &[(gemm.bounds_fail, 3), (gemm.check_fail, 4)],
-        locate,
+        &[
+            (gemm.bounds_fail, 3, 2),
+            (gemm.check_fail, 4, 3),
+            (gemm.assert_fn, 2, 1),
+            (gemm.assert_fn, 3, 1),
+        ],
+        locate.unwrap_or(&no_locator),
     );
     (program, diags, par_regions.exhausted)
 }
@@ -3725,6 +3739,12 @@ struct GemmSyms {
     println_u: Symbol,
     /// The `assert` intrinsic, through which a kernel builtin's runtime extent check traps.
     assert_fn: Symbol,
+    /// Whether an `assert` call carries its source site: `assert(cond, site)` (`bounds.rs`
+    /// rewrites the placeholder into a `.rodata` `file:line:col`). Set when the caller supplied a
+    /// source locator ([`lower_program_located`]); without one the call stays `assert(cond)`.
+    /// Rides here because this struct already reaches every lowerer, the kernel-builtin checks
+    /// ([`FnLowerer::emit_builtin_checks`]) among them.
+    assert_sites: bool,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`wukong_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -22171,9 +22191,15 @@ impl FnLowerer<'_> {
         // param → an ICE the verifier/`mem2reg` rejected). A unit/statement match has no value to
         // merge and just falls through. (A genuinely value-producing match always has a
         // value-producing arm that branches to `merge`, so the merge param never lacks a provider.)
+        //
+        // The trap names the `match` (`bounds.rs`, `emit_match_fallthrough_trap`): a failed
+        // `assert` whose message is `no `match` arm matched its value`, before the `unreachable`.
         if !handled_default && !self.terminated {
             match merge_param {
-                Some(_) => self.builder.set_term(wukong_mir::Terminator::Unreachable),
+                Some(_) => {
+                    self.emit_match_fallthrough_trap(e.span);
+                    self.builder.set_term(wukong_mir::Terminator::Unreachable)
+                }
                 None => {
                     self.builder.br(merge, vec![]);
                     merge_reachable = true;
@@ -23299,9 +23325,14 @@ impl FnLowerer<'_> {
     /// interpreter's `round_bf16`/`round_f16`), and the optimizer never const-folds half arithmetic
     /// or half casts, so the rounding survives every opt level. Re-rounding an already-rounded
     /// value is the identity, so the (surviving) store's own narrowing stays byte-identical.
-    /// No-op for every non-half type.
+    /// The 8-bit floats (`f8e4m3`, `f8e5m2`) live in an `f32` register the same way and round
+    /// onto their own grid by the same cast (`wukong_runtime::fp8`'s codec in every backend).
+    /// No-op for every other type.
     fn round_half_result(&mut self, v: ValueId, ty: &MirType) -> ValueId {
-        if matches!(ty, MirType::BF16 | MirType::F16) {
+        if matches!(
+            ty,
+            MirType::BF16 | MirType::F16 | MirType::F8E4M3 | MirType::F8E5M2
+        ) {
             self.builder
                 .build(ty.clone(), Op::Cast(CastKind::FpTrunc, v, ty.clone()))
         } else {
@@ -23322,8 +23353,31 @@ impl FnLowerer<'_> {
             return self.saturate_i128_to_i64(v, signed);
         }
         let kind = cast_kind(from, to, signed);
-        self.builder
-            .build(to.clone(), Op::Cast(kind, v, to.clone()))
+        let cast = self
+            .builder
+            .build(to.clone(), Op::Cast(kind, v, to.clone()));
+        self.round_int_to_narrow_float(cast, kind, to)
+    }
+
+    /// An integer converted to a float narrower than `f32` (`bf16`, `f16`, `f8e4m3`, `f8e5m2`)
+    /// comes out of `sitofp`/`uitofp` as the `f32` the backends compute it in — rounded to `f32`,
+    /// not to the narrow grid. Round it at the value (see `round_half_result`): otherwise a later
+    /// observation that mem2reg forwards past the rounding store — `print(i as bf16)` of 257 at
+    /// `-O2` — saw `257`, where `-O0` printed the stored `256`. Both `lower_cast` (`as`) and
+    /// `coerce_to` round: the implicit conversion of an integer literal adapting to a half or f8
+    /// operand is selected and stored unrounded otherwise (`max(b, 257)`, `if c { 257 } else { b }`
+    /// printed 257 at `-O2` and 256 at `-O0`), and it makes the literal the operand type's value
+    /// before the operation, so `one_bf16 + 257` is 1 + 256. (Rounding the integer to `f32`
+    /// first costs nothing for `f16` and the 8-bit floats: their ranges end below `2^24`, where
+    /// `f32` stops holding integers exactly, and anything larger overflows either way. A `bf16`
+    /// reaches `f32`'s range, so an integer above `2^24` is rounded to `f32` and then to `bf16`,
+    /// as the conversion has always been defined on every backend.)
+    fn round_int_to_narrow_float(&mut self, v: ValueId, kind: CastKind, to: &MirType) -> ValueId {
+        if matches!(kind, CastKind::SiToFp | CastKind::UiToFp) {
+            self.round_half_result(v, to)
+        } else {
+            v
+        }
     }
 
     /// The target symbol and MIR return type of a direct user-function call. For a type-generic
@@ -23811,11 +23865,24 @@ impl FnLowerer<'_> {
                     // `cond != 0.0` (an `i1`) so a fractional `assert(0.5)` is *true* on both
                     // backends, rather than native truncating `0.5 -> 0` and trapping while the
                     // interpreter's `f != 0.0` passes. The integer/`i1` path is unchanged.
-                    if nm == "assert" && args.len() == 1 {
+                    //
+                    // A failure names its site: with a source locator the call is
+                    // `assert(cond, site)`, or `assert(cond, site, message)` for the
+                    // `assert(cond, "message")` form sema admits, whose message is the literal's
+                    // `.rodata` blob (`bounds.rs`).
+                    let message = match args.get(1).map(|a| &a.kind) {
+                        Some(ExprKind::Str(s)) => Some(*s),
+                        _ => None,
+                    };
+                    if nm == "assert" && (args.len() == 1 || (args.len() == 2 && message.is_some()))
+                    {
                         let c = self.lower_bool_cond(&args[0]);
+                        let message = message.map(|s| self.str_literal_data(s).0);
+                        let mut call_args = vec![c];
+                        call_args.extend(self.assert_site_operands(e.span, message));
                         self.builder.build_void(Op::Call {
                             func: name,
-                            args: vec![c],
+                            args: call_args,
                         });
                         return self.const_zero(MirType::I32);
                     }
@@ -24095,6 +24162,26 @@ impl FnLowerer<'_> {
     fn lower_math_intrinsic(&mut self, name: Symbol, args: &[Expr], e: &Expr) -> Option<ValueId> {
         let op = math_intrinsic(self.interner.resolve(name))?;
         let rty = self.expr_mir(e);
+        // An 8-bit float computes the function in `f32` and rounds the result once onto its grid:
+        // the polynomials and constants below would otherwise be built at the f8 type, where a
+        // constant like `+inf` does not exist (E4M3FN saturates it to 448).
+        if rty.is_f8() {
+            let v = self.lower_math_intrinsic_at(op, args, MirType::F32)?;
+            return Some(
+                self.builder
+                    .build(rty.clone(), Op::Cast(CastKind::FpTrunc, v, rty)),
+            );
+        }
+        self.lower_math_intrinsic_at(op, args, rty)
+    }
+
+    /// [`Self::lower_math_intrinsic`] computing in the result type `rty`.
+    fn lower_math_intrinsic_at(
+        &mut self,
+        op: MathIntrinsic,
+        args: &[Expr],
+        rty: MirType,
+    ) -> Option<ValueId> {
         // `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving on integers (sema types them as
         // the argument's integer type): integer abs is `select(x < 0, -x, x)`; rounding an integer is
         // the identity. Without this they would emit float ops on an int operand — MIR the verifier
@@ -24422,7 +24509,7 @@ impl FnLowerer<'_> {
     /// Absolute value clears the sign bit, including on NaNs and negative zero, matching the
     /// runtime's scalar and SIMD forms. Arithmetic comparisons cannot implement this for NaNs.
     fn emit_abs(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        if matches!(rty.lane_type(), MirType::F16 | MirType::BF16) {
+        if rty.is_sub_f32_float() {
             // Native half values use f32 registers; the interpreter also has no half/i16
             // bitcast representation. Promote before manipulating bits, then round back.
             let wide = float_ty_like(rty, MirType::F32);
@@ -24451,7 +24538,7 @@ impl FnLowerer<'_> {
 
     /// Copy the sign bit without a floating comparison, retaining negative zero and NaN signs.
     fn emit_copysign(&mut self, magnitude: ValueId, sign: ValueId, rty: &MirType) -> ValueId {
-        if matches!(rty.lane_type(), MirType::F16 | MirType::BF16) {
+        if rty.is_sub_f32_float() {
             let wide = float_ty_like(rty, MirType::F32);
             let magnitude = self.builder.build(
                 wide.clone(),
@@ -26088,7 +26175,7 @@ impl FnLowerer<'_> {
     /// Select a quieted input NaN using integer bits so its sign and payload do not depend
     /// on which operand a backend chooses for an otherwise unobserved floating operation.
     fn emit_quiet_nan(&mut self, input: ValueId, ordinary: ValueId, fty: &MirType) -> ValueId {
-        if matches!(fty.lane_type(), MirType::F16 | MirType::BF16) {
+        if fty.is_sub_f32_float() {
             let wide = float_ty_like(fty, MirType::F32);
             let input = self
                 .builder
@@ -26209,7 +26296,10 @@ impl FnLowerer<'_> {
             self.signed(operand)
         };
         let kind = cast_kind(&from, &to, signed);
-        self.builder.build(to.clone(), Op::Cast(kind, v, to))
+        let cast = self
+            .builder
+            .build(to.clone(), Op::Cast(kind, v, to.clone()));
+        self.round_int_to_narrow_float(cast, kind, &to)
     }
 }
 
@@ -26308,7 +26398,7 @@ fn mir_byte_size(t: &MirType) -> u64 {
 
 fn checked_mir_byte_size(t: &MirType) -> Option<u64> {
     Some(match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -34045,7 +34135,7 @@ fn numeric_join(a: &MirType, b: &MirType) -> MirType {
     }
     let bits = |t: &MirType| match t {
         MirType::I1 => 1,
-        MirType::I8 => 8,
+        MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 8,
         MirType::I16 | MirType::F16 | MirType::BF16 => 16,
         MirType::I32 | MirType::F32 => 32,
         MirType::I128 => 128,
@@ -34075,6 +34165,7 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
         _ => 0,
     };
     let fsz = |t: &MirType| match t {
+        MirType::F8E4M3 | MirType::F8E5M2 => 8,
         MirType::F16 | MirType::BF16 => 16,
         MirType::F32 => 32,
         MirType::F64 => 64,
@@ -34503,7 +34594,7 @@ fn parse_float(text: &str) -> f64 {
     // printed 0 on both backends with no diagnostic. Longer suffixes are tried first so `5f32`
     // strips `f32` rather than nothing (no float body ends in `f`, so the order is belt-and-braces).
     let mut core = text;
-    for suf in ["bf16", "f16", "f32", "f64", "f"] {
+    for suf in ["f8e4m3", "f8e5m2", "bf16", "f16", "f32", "f64", "f"] {
         if let Some(stripped) = core.strip_suffix(suf) {
             core = stripped;
             break;

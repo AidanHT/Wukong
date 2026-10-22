@@ -260,6 +260,8 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ("wukong_gemv_q8_0_f32_parallel", QUANTIZED),
     ("wukong_gemv_q4_0_f32", QUANTIZED),
     ("wukong_gemv_q4_0_f32_parallel", QUANTIZED),
+    ("wukong_dequant_i4_f32", QUANTIZED),
+    ("wukong_dequant_u4_f32", QUANTIZED),
     // Scratch-arena bookkeeping and the slice bounds-failure edge.
     (
         "wukong_rt_scratch_alloc",

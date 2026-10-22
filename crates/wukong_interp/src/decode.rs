@@ -1,7 +1,7 @@
 //! The interpreter twins of the decode builtins' runtime entries: KV-cache attention
 //! (`wukong_attention_kv_f32`, and its batched, padded form `wukong_attention_kv_batch_f32`), the
-//! KV append, the half-weight GEMV (`wukong_sgemv_{bf16,f16}`) and the GGML Q8_0 / Q4_0 packers and
-//! GEMV.
+//! KV append, the half-weight GEMV (`wukong_sgemv_{bf16,f16}`), the GGML Q8_0 / Q4_0 packers and
+//! GEMV, and the group-wise int4 dequantizers (`wukong_dequant_{i4,u4}_f32`).
 //!
 //! Every arm first validates the call with the runtime's own plan function (`kv_attention_plan`,
 //! `kv_batch_plan` + `kv_batch_check_lens`, `gemv_half_plan`, `quantize_plan`, …), so a malformed
@@ -18,7 +18,7 @@ use wukong_runtime::attention_kv::{
     kv_append_plan, kv_attention_plan, kv_batch_check_lens, kv_batch_plan, KV_OK,
 };
 use wukong_runtime::gemv_half::{gemv_half_plan, GEMV_OK};
-use wukong_runtime::quant::{gemv_q_plan, quantize_plan, QFormat, QUANT_OK};
+use wukong_runtime::quant::{dequant_int4_plan, gemv_q_plan, quantize_plan, QFormat, QUANT_OK};
 
 use crate::{kernel_buffer, kernel_values, marshal, Interp, Intrinsic, Value};
 
@@ -69,6 +69,8 @@ impl Interp<'_, '_> {
             I::QuantizeQ40F32 => self.dec_quantize(name, args, QFormat::Q4),
             I::GemvQ80F32 | I::GemvQ80F32Parallel => self.dec_gemv_q(name, args, QFormat::Q8),
             I::GemvQ40F32 | I::GemvQ40F32Parallel => self.dec_gemv_q(name, args, QFormat::Q4),
+            I::DequantI4F32 => self.dec_dequant_int4(name, args, true),
+            I::DequantU4F32 => self.dec_dequant_int4(name, args, false),
             _ => return None,
         })
     }
@@ -426,6 +428,87 @@ impl Interp<'_, '_> {
         marshal::write_f32(arena_mut!(self), 4, y_base, &y, name)?;
         marshal::recycle_f32(x);
         marshal::recycle_f32(y);
+        Ok(status(QUANT_OK))
+    }
+
+    /// `wukong_dequant_i4_f32(q, nq, scale, nscale, group, out, nout) -> i64` (`signed`) and
+    /// `wukong_dequant_u4_f32(q, nq, scale, nscale, zero, nzero, group, out, nout) -> i64`.
+    fn dec_dequant_int4(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        signed: bool,
+    ) -> Result<Value, String> {
+        // The unsigned form carries the zero points as operands 4 and 5, which shift the rest.
+        let (zero_at, at) = if signed { (None, 4) } else { (Some(4), 6) };
+        let zero_len = zero_at.map_or(-1, |z| arg_i64(args, z + 1));
+        let (n, group) = match dequant_int4_plan(
+            arg_i64(args, 1),
+            arg_i64(args, 3),
+            zero_len,
+            arg_i64(args, at),
+            arg_i64(args, at + 2),
+        ) {
+            Ok(ng) => ng,
+            Err(code) => return Ok(status(code)),
+        };
+        if n == 0 {
+            return Ok(status(QUANT_OK));
+        }
+        let groups = n.div_ceil(group);
+        let qb = ptr_arg(args, 0, name, "q")?;
+        let vals = kernel_values(arena!(self), 0, qb, 1, n.div_ceil(2), name)?;
+        let q: Vec<u8> = kernel_buffer(vals, name, |v| v.kernel_int(name).map(|b| b as u8))?;
+        let sb = ptr_arg(args, 2, name, "scale")?;
+        let scale = marshal::read_f32(arena!(self), 2, sb, groups, name)?;
+        let zero = match zero_at {
+            Some(z) => {
+                let zb = ptr_arg(args, z, name, "zero")?;
+                marshal::read_f32(arena!(self), z, zb, groups, name)?
+            }
+            None => Vec::new(),
+        };
+        let out_base = ptr_arg(args, at + 1, name, "out")?;
+        let mut out = marshal::output_f32(arena!(self), at + 1, out_base, n, name)?;
+        let (ql, sl, zl, ol) = (
+            q.len() as i64,
+            scale.len() as i64,
+            zero.len() as i64,
+            out.len() as i64,
+        );
+        // SAFETY: the host buffers hold exactly the validated extents and are disjoint.
+        let code = unsafe {
+            if signed {
+                wukong_runtime::wukong_dequant_i4_f32(
+                    q.as_ptr(),
+                    ql,
+                    scale.as_ptr(),
+                    sl,
+                    group as i64,
+                    out.as_mut_ptr(),
+                    ol,
+                )
+            } else {
+                wukong_runtime::wukong_dequant_u4_f32(
+                    q.as_ptr(),
+                    ql,
+                    scale.as_ptr(),
+                    sl,
+                    zero.as_ptr(),
+                    zl,
+                    group as i64,
+                    out.as_mut_ptr(),
+                    ol,
+                )
+            }
+        };
+        if code != QUANT_OK {
+            return Err(refused(name, code));
+        }
+        marshal::write_f32(arena_mut!(self), at + 1, out_base, &out, name)?;
+        marshal::recycle_f32(scale);
+        marshal::recycle_f32(zero);
+        marshal::recycle_f32(out);
         Ok(status(QUANT_OK))
     }
 }

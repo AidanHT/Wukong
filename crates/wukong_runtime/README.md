@@ -33,6 +33,13 @@ via these kernels **is** the language spec for recognized ops.
   `wukong_now_ns`, shared with the native backend's `rt_*` print/assert shims.
 - **Low-precision helpers** — shared `bf16`/`f16` round-trip definitions (`half` crate for f16) so
   interpreter and native agree bit-for-bit.
+- **Overwrite contracts** (`overwrite.rs`) — `OVERWRITES`, per exact kernel symbol: the operand it
+  writes, how many elements, and the operand values under which it writes all of them before
+  reading any (a GEMM only with `beta == 0` and `K >= 1`). The native backend's stack coloring ends
+  a scratch array's lifetime at such a call; the module's test runs every entry against its kernel
+  over four output fills (a NaN, -3e30, +3e30 and a per-element pattern, so a sum, max, min or
+  magnitude fold seeded from the output fails too) and requires bit-identical results, running each
+  `_parallel` entry past its own size gate.
 
 ## Dependencies
 

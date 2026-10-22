@@ -1642,7 +1642,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                     let narrow_float = args.first().is_some_and(|a| {
                         matches!(
                             func.value_type(*a),
-                            MirType::F32 | MirType::F16 | MirType::BF16
+                            MirType::F32
+                                | MirType::F16
+                                | MirType::BF16
+                                | MirType::F8E4M3
+                                | MirType::F8E5M2
                         )
                     });
                     if narrow_float && matches!(id, Intrinsic::Print | Intrinsic::Println) {
@@ -1709,13 +1713,15 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .get_mut(*scalar as usize)
                     .ok_or("veckernel scalar index out of bounds")? = true;
             }
-            if let VecOp::Store { stream, .. } = op {
+            // `Store`/`StoreF16` and `Load`/`LoadF16`: an f16 stream is one slot per element like
+            // any other; the recipe's evaluator rounds what it reads and writes.
+            if let Some(stream) = op.stored_stream() {
                 *stored_streams
-                    .get_mut(*stream as usize)
+                    .get_mut(stream as usize)
                     .ok_or("veckernel store stream out of bounds")? = true;
             }
-            if let VecOp::Load { stream } = op {
-                if *stream as usize >= streams {
+            if let Some(stream) = op.loaded_stream() {
+                if stream as usize >= streams {
                     return Err("veckernel load stream out of bounds".into());
                 }
             }
@@ -1739,15 +1745,16 @@ impl<'a, 'k> Interp<'a, 'k> {
             alias.push(first as u32);
         }
         for (index, op) in kern.ops.iter().enumerate() {
-            if let VecOp::Load { stream } = op {
+            if let Some(stream) = op.loaded_stream() {
                 // The evaluator forwards a preceding store to this stream's class; that load never
                 // consumes the original slot, which may be undefined.
-                let class = alias[*stream as usize];
+                let class = alias[stream as usize];
                 if !kern.ops[..index].iter().any(|previous| {
-                    matches!(previous, VecOp::Store { stream: written, .. }
-                        if alias[*written as usize] == class)
+                    previous
+                        .stored_stream()
+                        .is_some_and(|written| alias[written as usize] == class)
                 }) {
-                    read_streams[*stream as usize] = true;
+                    read_streams[stream as usize] = true;
                 }
             }
         }
@@ -1918,6 +1925,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // make -O2 disagree with -O0. Same `half`-crate path used at every bf16/f16 store/cast.
                 MirType::BF16 => wukong_runtime::round_bf16(*v as f32) as f64,
                 MirType::F16 => wukong_runtime::round_f16(*v as f32) as f64,
+                // An f8 const is the literal rounded ONCE onto the grid (from its f64 value).
+                MirType::F8E4M3 | MirType::F8E5M2 => round_f8(*v, ty),
                 _ => *v,
             }),
             // Vector arithmetic is lane-wise, each lane rounded to the lane type (so `<n x f32>`
@@ -2000,6 +2009,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                         }
                         (MirType::F16, Value::Float(f)) => {
                             Value::Float(wukong_runtime::round_f16(f as f32) as f64)
+                        }
+                        // `[f8e4m3; N]` storage holds a code: read the value it stands for.
+                        (MirType::F8E4M3 | MirType::F8E5M2, Value::Float(f)) => {
+                            Value::Float(round_f8(f, ty))
                         }
                         _ => v,
                     }
@@ -2621,7 +2634,20 @@ impl<'a, 'k> Interp<'a, 'k> {
                 if ok {
                     Ok(Value::Unit)
                 } else {
-                    Err("assertion failed".to_string())
+                    // `assert(cond, site[, message])`: the lowering appends the call's `.rodata`
+                    // `file:line:col` (when it had a source map) and the message literal (when the
+                    // program wrote one); a bare `assert(cond)` carries neither. The runtime's one
+                    // formatter words it, as for the JIT and a linked executable.
+                    let text = |i: usize| -> Result<String, String> {
+                        match args.get(i).copied() {
+                            Some(Value::Ptr(base)) if !self.is_null(base) => {
+                                file_read_path(&self.memory, base)
+                            }
+                            _ => Ok(String::new()),
+                        }
+                    };
+                    let (site, message) = (text(1)?, text(2)?);
+                    Err(wukong_runtime::assert_failure_message(&site, &message))
                 }
             }
             // `wukong_rt_bounds_fail(index, len, site)` — the failure edge of a checked slice access
@@ -6039,7 +6065,10 @@ fn uval(v: i128, bits: u32) -> u128 {
 /// computed by the caller with one Rust `as` conversion (IEEE round-to-nearest-even). Going through
 /// `f64` and re-rounding to `f32` double-rounds and disagrees with native above 2^53.
 fn int_to_float(wide: f64, narrow: f32, to: &MirType) -> f64 {
-    if matches!(to, MirType::F32 | MirType::BF16 | MirType::F16) {
+    if matches!(
+        to,
+        MirType::F32 | MirType::BF16 | MirType::F16 | MirType::F8E4M3 | MirType::F8E5M2
+    ) {
         narrow as f64
     } else {
         wide
@@ -6101,7 +6130,24 @@ fn narrow_lane(kind: wukong_mir::NarrowKind, x: Value, to: &MirType) -> Value {
 /// `f16`/`bf16`/`f32` results are rounded to `f32` precision (the interpreter promotes sub-`f32`
 /// storage types to `f32`); `f64` keeps full precision.
 fn is_narrow_float(ty: &MirType) -> bool {
-    matches!(ty, MirType::F16 | MirType::BF16 | MirType::F32)
+    matches!(
+        ty,
+        MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 | MirType::F32
+    )
+}
+
+/// `v` rounded onto the grid of the 8-bit float `ty` (nearest, ties to even, ONE rounding from
+/// the `f64` it is held as), by the bit-level codec every backend runs
+/// (`wukong_runtime::fp8`): E4M3FN saturates at ±448, E5M2 overflows to ±∞, a NaN becomes the
+/// format's canonical NaN. Any other `ty` returns `v` unchanged.
+fn round_f8(v: f64, ty: &MirType) -> f64 {
+    use wukong_runtime::fp8::{decode_f32, encode_f64, Fp8Format};
+    let fmt = match ty {
+        MirType::F8E4M3 => Fp8Format::E4M3,
+        MirType::F8E5M2 => Fp8Format::E5M2,
+        _ => return v,
+    };
+    f64::from(decode_f32(encode_f64(v, fmt), fmt))
 }
 
 /// `a * b + c` with a *single* rounding, matching the native `fma` and the front-end's float
@@ -6321,11 +6367,15 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
         FpExt => match from {
             MirType::BF16 => Value::Float(wukong_runtime::round_bf16(v.as_float() as f32) as f64),
             MirType::F16 => Value::Float(wukong_runtime::round_f16(v.as_float() as f32) as f64),
+            MirType::F8E4M3 | MirType::F8E5M2 => Value::Float(round_f8(v.as_float(), from)),
             _ => Value::Float(v.as_float()),
         },
+        // An f8 target rounds the source's exact value once — an `f64` straight to the grid, not
+        // through `f32` (which would round twice).
         FpTrunc => match to {
             MirType::BF16 => Value::Float(wukong_runtime::round_bf16(v.as_float() as f32) as f64),
             MirType::F16 => Value::Float(wukong_runtime::round_f16(v.as_float() as f32) as f64),
+            MirType::F8E4M3 | MirType::F8E5M2 => Value::Float(round_f8(v.as_float(), to)),
             _ => Value::Float(v.as_float()),
         },
         // Reinterpret the raw bits between an int and a same-width float (matches the native
@@ -7538,6 +7588,63 @@ mod tests {
         assert!(
             err.contains("null pointer dereference (atomic add)"),
             "{err}"
+        );
+    }
+
+    /// N89: a failed `assert` reports the site the lowering attached (and its message literal),
+    /// and so does a value `match` no arm matched, naming the `match`, instead of reaching a bare
+    /// `unreachable`. Without a source locator a bare `assert(cond)` keeps its old message.
+    #[test]
+    fn a_failed_assert_and_an_unmatched_match_name_their_sites() {
+        let run_src = |src: &str, located: bool| -> Result<i64, String> {
+            let mut sm = wukong_span::SourceMap::new();
+            let id = sm.add("t.wk".to_string(), src.to_string());
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(src, id, &mut interner);
+            assert!(pd.is_empty(), "parse: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+            let locate = |span: wukong_span::Span| {
+                let loc = sm.span_location(span);
+                format!("{}:{}:{}", sm.name(span.source), loc.line, loc.col)
+            };
+            let opts = wukong_mir_build::LowerOptions::default();
+            let (program, ld) = if located {
+                wukong_mir_build::lower_program_located(
+                    &module,
+                    &sema,
+                    &mut interner,
+                    opts,
+                    &locate,
+                )
+            } else {
+                wukong_mir_build::lower_program_with(&module, &sema, &mut interner, opts)
+            };
+            assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+            let main = interner.intern("main");
+            run(&program, main, &interner)
+        };
+        let bare = "fn main() -> i32 {\n    assert(1 > 2);\n    return 0;\n}\n";
+        assert_eq!(
+            run_src(bare, true),
+            Err("assertion failed at t.wk:2:5".to_string())
+        );
+        assert_eq!(run_src(bare, false), Err("assertion failed".to_string()));
+        assert_eq!(
+            run_src(
+                "fn main() -> i32 {\n    assert(1 > 2, \"one is not two\");\n    return 0;\n}\n",
+                true
+            ),
+            Err("assertion failed: one is not two at t.wk:2:5".to_string())
+        );
+        // `    return ` is 11 characters, so the `match` opens column 12 of line 4.
+        assert_eq!(
+            run_src(
+                "enum E { A = 1, B = 2 }\nfn main() -> i32 {\n    let e: E;\n    \
+                 return match e { E::A => 1, E::B => 2 };\n}\n",
+                true
+            ),
+            Err("assertion failed: no `match` arm matched its value at t.wk:4:12".to_string())
         );
     }
 }

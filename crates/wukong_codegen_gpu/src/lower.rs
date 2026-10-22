@@ -19,7 +19,9 @@
 //! - **Block params -> a register-passing convention.** Each block param gets a fixed register; every
 //!   branch edge copies its args into the target's param registers (through temporaries, so permuted
 //!   / self-referential edges are safe) and then `bra`s — exactly the role Cranelift block params play.
-//! - **`CondBr` -> predicated `bra`.** `Br`/`CondBr`/`Ret`/`Unreachable` map to `bra`/`@p bra`/`ret`.
+//! - **`CondBr` -> predicated `bra`.** `Br`/`CondBr`/`Ret` map to `bra`/`@p bra`/`ret`. A reached
+//!   `Unreachable` stops the program, not the device: it sets the context's unreachable flag and
+//!   `exit`s, never `trap`s ([`FnEmit::emit_unreachable_stop`]).
 //! - **`Alloca`/`Load`/`Store`/`Gep` -> local/global memory.** Allocas share one `.local` frame
 //!   (generic-addressed via `cvta.local`); loads/stores use generic `ld`/`st`, so the same code works
 //!   for stack locals and device-global tensor pointers.
@@ -83,14 +85,15 @@ use wukong_mir::{
 use wukong_span::{Interner, Symbol};
 
 // --- Device context-buffer layout (u64 slots) -----------------------------------------------
-// [0] = record count (atomic), [1] = assert-failed flag, [2] = exit code (i64), [3] = reserved;
-// records start at slot 4, two u64 each: [tag, payload]. tag 0 = int (payload = i64 bits), 1 =
-// f64 (payload = f64 bits), 2 = f32 (payload = the f64 bits of the exactly-widened f32, replayed at
-// f32 precision), 3 = bool (payload = 0/1, replayed as `false`/`true`). Byte offsets are what the
-// PTX uses.
+// [0] = record count (atomic), [1] = assert-failed flag, [2] = exit code (i64), [3] = unreachable-
+// reached flag; records start at slot 4, two u64 each: [tag, payload]. tag 0 = int (payload = i64
+// bits), 1 = f64 (payload = f64 bits), 2 = f32 (payload = the f64 bits of the exactly-widened f32,
+// replayed at f32 precision), 3 = bool (payload = 0/1, replayed as `false`/`true`). Byte offsets are
+// what the PTX uses.
 const CTX_COUNT_OFF: u64 = 0;
 const CTX_ASSERT_OFF: u64 = 8;
 const CTX_EXIT_OFF: u64 = 16;
+const CTX_UNREACHABLE_OFF: u64 = 24;
 const CTX_RECORDS_OFF: u64 = 32;
 const RECORD_BYTES: u64 = 16;
 /// Capacity of the print-record buffer. Generous for the test corpus; overflow is *detected* (the
@@ -101,6 +104,12 @@ const TAG_INT: u64 = 0;
 const TAG_F64: u64 = 1;
 const TAG_F32: u64 = 2;
 const TAG_BOOL: u64 = 3;
+
+/// The run error a reached `unreachable` decodes to ([`decode_ctx`]). It is the interpreter's own
+/// text for that stop (`wukong_interp`'s `Terminator::Unreachable` arm), because
+/// `run_corpus_matches_interp_oracle` compares a program-level error by **equality** against the
+/// interpreter's, exactly as it compares `"assertion failed"`.
+pub(crate) const UNREACHABLE_REACHED: &str = "execution reached `unreachable`";
 
 /// The PTX name of the launched entry kernel (a thin `.visible .entry` wrapper).
 const KERNEL_NAME: &str = "wukong_kernel";
@@ -415,10 +424,11 @@ fn reachable_from(program: &Program, entry: Symbol) -> Vec<Symbol> {
 /// fault stays a fault for the corpus gate.
 ///
 /// Only the two errors a frame can *explain* are annotated, and that narrowness is load-bearing:
-/// `decode_ctx` returns the deterministic program-level errors (`"assertion failed"`, the print-buffer
-/// overflow) through this same `map_err`, and `run_corpus_matches_interp_oracle` compares
-/// `"assertion failed"` by **equality** against the interpreter's. Appending a note to that string
-/// would turn an agreeing pair into a reported fault.
+/// `decode_ctx` returns the deterministic program-level errors (`"assertion failed"`,
+/// [`UNREACHABLE_REACHED`], the print-buffer overflow) through this same `map_err`, and
+/// `run_corpus_matches_interp_oracle` compares the first two by **equality** against the
+/// interpreter's. Appending a note to either string would turn an agreeing pair into a reported
+/// fault.
 fn annotate_local_frames(
     e: String,
     program: &Program,
@@ -796,6 +806,38 @@ fn decline_i128(func: &Function, interner: &Interner) -> Result<(), String> {
     Ok(())
 }
 
+/// An 8-bit float (`f8e4m3`, `f8e5m2`) lives in an `f32` register on its grid and is stored as
+/// its 1-byte code, which every host backend reaches with the `wukong_runtime::fp8` codec at each
+/// load, store, constant and cast. This lowering has no PTX twin of that codec yet, so a function
+/// that holds an f8 anywhere declines as a whole (a SKIP) rather than computing with unrounded
+/// `f32` values or storing a 4-byte float into a 1-byte slot.
+fn decline_f8(func: &Function, interner: &Interner) -> Result<(), String> {
+    fn mentions(t: &MirType) -> bool {
+        match t {
+            MirType::F8E4M3 | MirType::F8E5M2 => true,
+            MirType::Vec(e, _) | MirType::Array(e, _) => mentions(e),
+            _ => false,
+        }
+    }
+    let slot = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| match &i.op {
+            Op::Alloca { ty, .. } | Op::Load(_, ty) | Op::Cast(_, _, ty) => mentions(ty),
+            Op::Gep { elem, .. } => mentions(elem),
+            Op::ConstFloat(_, ty) => mentions(ty),
+            _ => false,
+        });
+    if slot || mentions(&func.ret) || func.value_types.iter().any(mentions) {
+        return Err(format!(
+            "{UNSUPPORTED} an 8-bit float in `{}` (no PTX lowering of the f8 codec)",
+            interner.resolve(func.name)
+        ));
+    }
+    Ok(())
+}
+
 fn int_bits(t: &MirType) -> u32 {
     match t {
         MirType::I1 => 1,
@@ -809,7 +851,7 @@ fn int_bits(t: &MirType) -> u32 {
 /// Size in bytes of a MIR type (for `gep` scaling and `alloca` frame sizing); mirrors Cranelift's.
 fn size_of(t: &MirType) -> u64 {
     match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -920,6 +962,7 @@ impl<'a> FnEmit<'a> {
         interner: &'a Interner,
     ) -> Result<String, String> {
         decline_i128(func, interner)?;
+        decline_f8(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -988,6 +1031,7 @@ impl<'a> FnEmit<'a> {
         interner: &'a Interner,
     ) -> Result<String, String> {
         decline_i128(func, interner)?;
+        decline_f8(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -1054,6 +1098,7 @@ impl<'a> FnEmit<'a> {
         interner: &'a Interner,
     ) -> Result<String, String> {
         decline_i128(func, interner)?;
+        decline_f8(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -2139,6 +2184,10 @@ impl<'a> FnEmit<'a> {
             }
             // `decline_i128` refuses the function before any load is lowered.
             MirType::I128 => return Err(format!("{UNSUPPORTED} load of an i128")),
+            // `decline_f8` likewise refuses any function that holds an 8-bit float.
+            MirType::F8E4M3 | MirType::F8E5M2 => {
+                return Err(format!("{UNSUPPORTED} load of an 8-bit float"))
+            }
         }
         Ok(())
     }
@@ -2266,6 +2315,10 @@ impl<'a> FnEmit<'a> {
             }
             // `decline_i128` refuses the function before any store is lowered.
             MirType::I128 => return Err(format!("{UNSUPPORTED} store of an i128")),
+            // `decline_f8` likewise refuses any function that holds an 8-bit float.
+            MirType::F8E4M3 | MirType::F8E5M2 => {
+                return Err(format!("{UNSUPPORTED} store of an 8-bit float"))
+            }
         }
         Ok(())
     }
@@ -3386,9 +3439,45 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} multi-way `switch` terminator not lowered to PTX"
                 ))
             }
-            Terminator::Unreachable => self.emit("trap;"),
+            Terminator::Unreachable => self.emit_unreachable_stop(),
         }
         Ok(())
+    }
+
+    /// A reached `unreachable` **stops the program cleanly**: set the context's unreachable flag,
+    /// then `exit` the thread.
+    ///
+    /// It used to be `trap;`, which fails the launch with a *sticky* CUDA error: the context is
+    /// lost for the rest of the process, so the corpus gate recorded a driver fault and listed
+    /// every later program as NOT RUN. That was harmless only while no corpus program reached an
+    /// `unreachable`. One now does on purpose: a value `match` sema cannot prove exhaustive falls
+    /// into `assert(false)` and then `unreachable` when no arm matches
+    /// (`tests/run/match_no_arm_trap.wk`), and the interpreter, the language's specification,
+    /// stops there with `assertion failed`.
+    ///
+    /// `exit` ends the thread from any call depth, so nothing after the `unreachable` runs in a
+    /// caller either: the device stops where the interpreter stops. The launch then completes and
+    /// [`decode_ctx`] reports the stop: `"assertion failed"` when the `assert(false)` before it has
+    /// already set that flag (checked first, since the interpreter stops at the assert), otherwise
+    /// the interpreter's own [`UNREACHABLE_REACHED`] for a bare `unreachable` (the fall-through
+    /// `emit_match_fallthrough_trap` leaves bare when a user function named `assert` shadows the
+    /// intrinsic). The flag is what keeps a bare one from reading back as a successful run with the
+    /// zeroed exit code.
+    ///
+    /// The store is deliberately **not** `tid==0`-predicated in mega mode, unlike
+    /// [`Self::lower_assert`]'s: it writes a constant, so duplicate stores are benign, and a
+    /// `@parallel` body (an ordinary `.func` every thread calls) can reach an `unreachable` on a
+    /// thread other than 0. In the megakernel's own SPMD code `fusion::analyze` admits only
+    /// data-independent control flow, so every thread reaches the same `unreachable` and exits
+    /// together; and PTX releases a `bar.sync` that is waiting only on exited threads.
+    fn emit_unreachable_stop(&mut self) {
+        let ctx = self.ctx_reg.clone();
+        let one = self.fresh(RC::Rd);
+        self.emit(&format!("mov.b64 {one}, 1;"));
+        self.emit(&format!(
+            "st.global.u64 [{ctx}+{CTX_UNREACHABLE_OFF}], {one};"
+        ));
+        self.emit("exit;");
     }
 
     /// Store the megakernel exit code (the entry's return, truncated to i64) into the context exit
@@ -5101,7 +5190,8 @@ fn run_on_device(
 }
 
 /// The zeroed host mirror of the device context buffer (record count + assert flag + exit code +
-/// reserved, then `RECORD_CAP` two-u64 print records). Shared by the single-thread and mega launchers.
+/// unreachable flag, then `RECORD_CAP` two-u64 print records). Shared by the single-thread and mega
+/// launchers.
 pub(crate) fn new_ctx_host() -> Vec<u64> {
     vec![0u64; 4 + 2 * RECORD_CAP as usize]
 }
@@ -5109,13 +5199,22 @@ pub(crate) fn new_ctx_host() -> Vec<u64> {
 /// Decode a context buffer read back from the device into `(exit_code, stdout)` — the print records
 /// replayed with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses. Shared by
 /// `run_on_device` and the megakernel launcher so both produce byte-identical output.
+///
+/// The two stop flags are read in the interpreter's order. A failed `assert` comes first: the
+/// interpreter stops at it, and the front end puts one before every `unreachable` it means a run
+/// to reach, so that pair reads back as `"assertion failed"`. Only a bare `unreachable` (no failed
+/// assert before it) reads back as [`UNREACHABLE_REACHED`].
 pub(crate) fn decode_ctx(out: &[u64]) -> Result<(i64, Vec<u8>), String> {
     let count = out[CTX_COUNT_OFF as usize / 8];
     let assert_failed = out[CTX_ASSERT_OFF as usize / 8];
+    let unreachable_reached = out[CTX_UNREACHABLE_OFF as usize / 8];
     let exit = out[CTX_EXIT_OFF as usize / 8] as i64;
 
     if assert_failed != 0 {
         return Err("assertion failed".into());
+    }
+    if unreachable_reached != 0 {
+        return Err(UNREACHABLE_REACHED.into());
     }
     if count > RECORD_CAP {
         return Err(format!(
@@ -5625,6 +5724,7 @@ fn main() -> i32 {
 
         for untouched in [
             "assertion failed",
+            UNREACHABLE_REACHED,
             "gpu-native print buffer overflow: 9 records",
         ] {
             assert_eq!(
@@ -5632,6 +5732,140 @@ fn main() -> i32 {
                 untouched,
                 "a frame note on this error would break the corpus gate's comparison"
             );
+        }
+    }
+
+    /// The `match` of `tests/run/match_no_arm_trap.wk` with its fall-through left bare: a user
+    /// function named `assert` shadows the intrinsic, so `emit_match_fallthrough_trap` emits no
+    /// `assert(false)` and the block is the `unreachable` alone. Uncalled on purpose.
+    const BARE_UNREACHABLE: &str = "module gate
+
+enum Level {
+    Low = 1,
+    High = 2,
+}
+
+fn assert(x: i32) -> i32 {
+    return x;
+}
+
+fn weight(l: Level) -> i32 {
+    let w = match l {
+        Level::Low => 10,
+        Level::High => 20,
+    };
+    return w;
+}
+
+fn main() -> i32 {
+    print(weight(Level::Low));
+    let unset: Level;
+    print(weight(unset));
+    print(99);
+    return 0;
+}
+";
+
+    /// The two programs that reach an `unreachable` at run time, each with the run error the
+    /// interpreter stops with when the MIR is built without a source locator (as every gate in
+    /// this crate builds it): the corpus fixture's `assert(false)` comes first, so it stops with
+    /// `assertion failed`, and the bare fall-through stops with [`UNREACHABLE_REACHED`].
+    fn unreachable_stop_programs() -> [(&'static str, String, &'static str); 2] {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run/match_no_arm_trap.wk");
+        [
+            (
+                "match_no_arm_trap",
+                std::fs::read_to_string(&fixture).expect("read tests/run/match_no_arm_trap.wk"),
+                "assertion failed",
+            ),
+            (
+                "bare_unreachable",
+                BARE_UNREACHABLE.to_string(),
+                UNREACHABLE_REACHED,
+            ),
+        ]
+    }
+
+    /// **A reached `unreachable` stops the program, never the device.** It used to lower to
+    /// `trap;`, which fails the launch with a sticky CUDA error, so the first corpus program to
+    /// reach one (`tests/run/match_no_arm_trap.wk`, whose value `match` takes no arm) faulted
+    /// `run_corpus_matches_interp_oracle` and left every later program NOT RUN. This pins the
+    /// emitted form at both opt levels that gate sweeps: no `trap` anywhere in the module, and the
+    /// unreachable flag stored before an `exit`. It also pins the interpreter's text for each stop,
+    /// which `decode_ctx` must reproduce, and the order `decode_ctx` reads the two flags in.
+    /// Device-free; [`a_reached_unreachable_stops_like_the_interpreter_on_the_device`] runs them.
+    #[test]
+    fn a_reached_unreachable_exits_instead_of_trapping() {
+        let flag_store = format!("+{CTX_UNREACHABLE_OFF}], ");
+        for (name, src, want) in unreachable_stop_programs() {
+            for opt in [0u8, 3u8] {
+                let (program, mut interner) =
+                    hostvec::build(&src, opt).unwrap_or_else(|| panic!("{name}@O{opt} builds"));
+                let entry = interner.intern("main");
+                let cpu = wukong_interp::run_with_output(&program, entry, &interner);
+                assert_eq!(
+                    cpu.as_ref().err().map(String::as_str),
+                    Some(want),
+                    "{name}@O{opt}: the interpreter's stop is the text decode_ctx must reproduce"
+                );
+                let ptx = emit_ptx(&program, entry, &interner)
+                    .unwrap_or_else(|e| panic!("{name}@O{opt} lowers: {e}"));
+                assert!(
+                    !ptx.contains("trap;"),
+                    "{name}@O{opt}: a `trap` fails the launch with a sticky CUDA error:\n{ptx}"
+                );
+                let lines: Vec<&str> = ptx.lines().map(str::trim).collect();
+                assert!(
+                    lines.windows(2).any(|w| {
+                        w[0].starts_with("st.global.u64 [")
+                            && w[0].contains(&flag_store)
+                            && w[1] == "exit;"
+                    }),
+                    "{name}@O{opt}: no unreachable-flag store followed by `exit`:\n{ptx}"
+                );
+            }
+        }
+
+        let mut ctx = new_ctx_host();
+        ctx[CTX_UNREACHABLE_OFF as usize / 8] = 1;
+        assert_eq!(decode_ctx(&ctx), Err(UNREACHABLE_REACHED.to_string()));
+        ctx[CTX_ASSERT_OFF as usize / 8] = 1;
+        assert_eq!(
+            decode_ctx(&ctx),
+            Err("assertion failed".to_string()),
+            "a failed assert before the `unreachable` is where the interpreter stops"
+        );
+    }
+
+    /// The device half of [`a_reached_unreachable_exits_instead_of_trapping`]: both programs stop on
+    /// the device with exactly the interpreter's run error, at both opt levels, and leave the
+    /// context usable for whatever runs next.
+    #[test]
+    fn a_reached_unreachable_stops_like_the_interpreter_on_the_device() {
+        if crate::gpu::gpu().is_none() {
+            crate::diff::skip_or_fail(
+                "a_reached_unreachable_stops_like_the_interpreter_on_the_device",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        }
+        for (name, src, want) in unreachable_stop_programs() {
+            for opt in [0u8, 3u8] {
+                let (program, mut interner) =
+                    hostvec::build(&src, opt).unwrap_or_else(|| panic!("{name}@O{opt} builds"));
+                let entry = interner.intern("main");
+                let gpu = jit_run(&program, entry, &interner);
+                assert_eq!(
+                    gpu.as_ref().err().map(String::as_str),
+                    Some(want),
+                    "{name}@O{opt}: gpu-native must stop where the interpreter stops: {gpu:?}"
+                );
+                assert!(
+                    !crate::gpu::device_lost(),
+                    "{name}@O{opt}: the stop lost the CUDA context"
+                );
+            }
         }
     }
 
@@ -6646,7 +6880,9 @@ fn main() -> i32 {
                             skipped.push(format!("{name}@O{opt}: {ge}"));
                             break;
                         }
-                        if ge != "assertion failed" {
+                        // The program-level stops `decode_ctx` reads off a healthy context: a failed
+                        // `assert`, and a reached `unreachable` (which `exit`s rather than faulting).
+                        if ge != "assertion failed" && ge != UNREACHABLE_REACHED {
                             covered_here = false;
                             faults.push(format!("{name}@O{opt}: gpu errored: {ge}"));
                             crate::gpu::reset_gpu();
@@ -6658,7 +6894,7 @@ fn main() -> i32 {
                                 .push(format!("{name}@O{opt}: cpu err `{ce}` gpu err `{ge}`"));
                             break;
                         }
-                        // Both `assertion failed` — agree.
+                        // The same program-level stop on both — agree.
                     }
                     (Ok((ce, co)), Ok((ge, go))) => {
                         if ce != ge || !outputs_match(go, co) {

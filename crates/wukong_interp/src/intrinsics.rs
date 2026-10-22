@@ -291,6 +291,8 @@ intrinsic_table! {
     GemvQ80F32Parallel = "wukong_gemv_q8_0_f32_parallel",
     GemvQ40F32 = "wukong_gemv_q4_0_f32",
     GemvQ40F32Parallel = "wukong_gemv_q4_0_f32_parallel",
+    DequantI4F32 = "wukong_dequant_i4_f32",
+    DequantU4F32 = "wukong_dequant_u4_f32",
 }
 
 #[cfg(test)]

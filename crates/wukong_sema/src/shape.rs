@@ -403,6 +403,16 @@ impl Sema<'_> {
                     ) {
                         return Ty::Unknown;
                     }
+                    // `min`/`max` take the operands' common type, so an integer literal beside an
+                    // 8-bit float converts to it, like `x * 1000` (`f8.rs`).
+                    if matches!(interner.resolve(name), "min" | "max") && args.len() == 2 {
+                        self.range_check_f8_int_operands(
+                            &args[0],
+                            &args[1],
+                            &arg_tys[0],
+                            &arg_tys[1],
+                        );
+                    }
                     // A math intrinsic operates on a scalar (an integer is coerced to float, like
                     // `sqrt(2)`), a SIMD vector, or a tensor — never an aggregate, pointer, reference,
                     // unit, or function value. Such an argument used to slip through (the result is
@@ -656,17 +666,36 @@ impl Sema<'_> {
                 // missing condition as false and trapped (exit 1) while native treated it as a no-op
                 // (exit 0) — a backend divergence. Pin the arity here (E0503), like a user fn's
                 // arg-count check; this fails compilation before either backend runs.
-                if self.sym_str(name) == "assert" && args.len() != 1 {
+                //
+                // An optional second argument is the failure's message, `assert(n > 0, "n must be
+                // positive")`: a string literal, which a failure prints after `assertion failed:`
+                // and before the call's site on every CPU backend. Anything else there is E0437,
+                // as for `static_assert`'s message.
+                if self.sym_str(name) == "assert" && !(1..=2).contains(&args.len()) {
                     self.error(
                         span,
                         "E0503",
                         format!(
-                            "`assert` takes exactly 1 argument, but {} were supplied",
+                            "`assert` takes 1 or 2 arguments (a condition and an optional \
+                             string-literal message), but {} were supplied",
                             args.len()
                         ),
                     );
                     self.types.insert(callee.id, Ty::Unknown);
                     return Ty::Unknown;
+                }
+                if self.sym_str(name) == "assert" && args.len() == 2 {
+                    if let Some(message) = args.get(1) {
+                        if !matches!(message.kind, ExprKind::Str(_)) {
+                            self.error(
+                                message.span,
+                                "E0437",
+                                "the message of `assert` must be a string literal".to_string(),
+                            );
+                            self.types.insert(callee.id, Ty::Unknown);
+                            return Ty::Unknown;
+                        }
+                    }
                 }
                 self.types.insert(callee.id, Ty::Unknown);
                 // `print`/`println`/`assert` with a valid argument list: `mir_build` lowers them.

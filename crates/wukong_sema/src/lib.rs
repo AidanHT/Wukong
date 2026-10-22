@@ -35,6 +35,7 @@ mod constraints;
 mod dependency;
 mod dtype;
 mod entry;
+mod f8;
 mod infer;
 mod instantiate;
 mod layout;
@@ -1583,6 +1584,19 @@ impl<'a> Sema<'a> {
                         format!(
                             "a SIMD vector cannot have `{}` lanes; the widest integer lane is 64 \
                              bits",
+                            s.name()
+                        ),
+                    );
+                    Ty::Error
+                }
+                // An f8 value lives in an `f32` register on its grid; no backend rounds a lane.
+                Ty::Scalar(s) if s.is_f8() => {
+                    self.error(
+                        t.span,
+                        "E0302",
+                        format!(
+                            "a SIMD vector cannot have `{}` lanes; an 8-bit float is a scalar \
+                             type (use `f32` lanes and convert with `as`)",
                             s.name()
                         ),
                     );
@@ -4262,6 +4276,14 @@ impl<'a> Sema<'a> {
             _ => {}
         }
         let Ty::Scalar(sc) = ty else { return };
+        // An f8 place rounds each adapting float literal onto its narrow grid (`f8.rs`): one that
+        // would saturate, overflow or vanish is `E0438`.
+        if sc.is_f8() {
+            if self.literal_adapts(ty, e) {
+                self.range_check_f8_literal(e, *sc);
+            }
+            return;
+        }
         // A lone literal, optionally negated, is read whole from its `u128` magnitude — exactly, at
         // every width. A suffixed one keeps its own type (it does not adapt) and was range-checked
         // against that suffix when it was typed.
@@ -4446,7 +4468,11 @@ impl<'a> Sema<'a> {
                 // the greedy suffix scan swept into one `Float` token; it parsed to 0.0 silently.
                 let text = self.sym_str(*s).to_string();
                 if float_literal_well_formed(&text) {
-                    Ty::Scalar(float_lit_scalar(&text))
+                    let sc = float_lit_scalar(&text);
+                    if sc.is_f8() {
+                        self.check_suffixed_f8_literal(e, &text, sc);
+                    }
+                    Ty::Scalar(sc)
                 } else {
                     self.error(e.span, "E0431", format!("invalid float literal `{text}`"));
                     Ty::Error
@@ -4734,6 +4760,11 @@ impl<'a> Sema<'a> {
                         ),
                     );
                     return Ty::Unknown;
+                }
+                // An integer literal beside an 8-bit float converts to it (`x * 1000`, `x < 1000`):
+                // `E0438` when the f8 cannot hold it (`f8.rs`).
+                if !matches!(op, Shl | Shr | And | Or) {
+                    self.range_check_f8_int_operands(lhs, rhs, &l, &r);
                 }
                 match op {
                     // `==`/`!=` on an aggregate (struct/tuple/array) silently lowers to a
@@ -5126,7 +5157,13 @@ impl<'a> Sema<'a> {
                     // [1024]-vs-[2] lie turns a statically-valid index into a runtime OOB segfault.
                     // Unify them — the 4th shape-bearing context, the one `check_binop_shapes` missed.
                     self.check_merge_shapes(&then_ty, &else_ty, Some(else_expr), else_expr.span);
-                    join(then_ty, else_ty)
+                    let merged = join(then_ty, else_ty);
+                    // An integer-literal arm merging into an 8-bit float converts to it (`f8.rs`).
+                    if let Some(tail) = &then_branch.tail {
+                        self.range_check_f8_int_arm(tail, &merged);
+                    }
+                    self.range_check_f8_int_arm(else_expr, &merged);
+                    merged
                 } else {
                     Ty::Unit
                 }
@@ -5162,6 +5199,10 @@ impl<'a> Sema<'a> {
                     // is an E0502 — not a silently mistyped result that mis-strides or reinterprets.
                     self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
+                }
+                // An integer-literal arm merging into an 8-bit float converts to it (`f8.rs`).
+                for arm in arms {
+                    self.range_check_f8_int_arm(&arm.body, &result);
                 }
                 // The `else` of a `let … else` (which the parser made this match's `_` arm) must
                 // diverge (`patterns.rs`).
@@ -5349,7 +5390,7 @@ fn scalar_bits(s: Scalar) -> u32 {
     use Scalar::*;
     match s {
         Bool => 1,
-        I8 | U8 => 8,
+        I8 | U8 | F8E4M3 | F8E5M2 => 8,
         I16 | U16 | F16 | Bf16 => 16,
         I32 | U32 | F32 | Char => 32,
         I64 | U64 | Usize | Isize | F64 => 64,
@@ -5644,7 +5685,11 @@ fn int_lit_scalar(text: &str) -> Scalar {
 }
 
 fn float_lit_scalar(text: &str) -> Scalar {
-    if text.ends_with("bf16") {
+    if text.ends_with("f8e4m3") {
+        Scalar::F8E4M3
+    } else if text.ends_with("f8e5m2") {
+        Scalar::F8E5M2
+    } else if text.ends_with("bf16") {
         Scalar::Bf16
     } else if text.ends_with("f16") {
         Scalar::F16
@@ -5664,7 +5709,7 @@ fn has_int_suffix(text: &str) -> bool {
 }
 
 fn has_float_suffix(text: &str) -> bool {
-    ["f16", "bf16", "f32", "f64"]
+    ["f8e4m3", "f8e5m2", "f16", "bf16", "f32", "f64"]
         .iter()
         .any(|s| text.ends_with(s))
 }
@@ -5777,7 +5822,7 @@ fn float_literal_well_formed(text: &str) -> bool {
         s = &s[1..];
     }
     // `f` alone is the C-style float suffix (`5f` -> f32); try the longer suffixes first.
-    for suf in ["bf16", "f16", "f32", "f64", "f"] {
+    for suf in ["f8e4m3", "f8e5m2", "bf16", "f16", "f32", "f64", "f"] {
         if let Some(x) = s.strip_suffix(suf) {
             s = x;
             break;

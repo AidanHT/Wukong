@@ -8,6 +8,7 @@
 //! | `gemv_bf16(w, x, y)` / `gemv_f16(w, x, y)` | `bf16`/`f16` weight `[N·K]`; `f32` `x[K]`, `y[N]` | `wukong_sgemv_{bf16,f16}` |
 //! | `quantize_q8_0(x, q, k)` / `quantize_q4_0(x, q, k)` | `f32` `x`; `u8` blocks `q`; row length | `wukong_quantize_{q8_0,q4_0}_f32` |
 //! | `gemv_q8_0(w, x, y)` / `gemv_q4_0(w, x, y)` | `u8` blocks `w`; `f32` `x[K]`, `y[N]` | `wukong_gemv_{q8_0,q4_0}_f32` |
+//! | `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)` | packed `u8` nibbles `q`; `f32` `scale`, `zero`, `out`; a group size | `wukong_dequant_{i4,u4}_f32` |
 //!
 //! Each is typed nominally here and returns `()`: a wrong arity or a turbofish is `E0503`, an
 //! operand of the wrong kind or element type `E0437`, and writing the output through a non-`mut`
@@ -63,6 +64,12 @@ pub enum DecodeBuiltin {
     QuantizeQ8,
     /// `quantize_q4_0(x, q, k)` — pack rows of `k` values into `Q4_0` blocks.
     QuantizeQ4,
+    /// `dequant_i4(q, scale, group, out)` — `out[i] = q_i · scale[i / group]` over packed signed
+    /// 4-bit values (two per byte, low nibble first).
+    DequantI4,
+    /// `dequant_u4(q, scale, zero, group, out)` — `out[i] = (q_i − zero[g]) · scale[g]`,
+    /// `g = i / group`, over packed unsigned 4-bit values.
+    DequantU4,
 }
 
 /// The decode builtin `name` denotes, or `None`.
@@ -78,6 +85,8 @@ pub fn decode_builtin(name: &str) -> Option<DecodeBuiltin> {
         "gemv_q4_0" => GemvQ4,
         "quantize_q8_0" => QuantizeQ8,
         "quantize_q4_0" => QuantizeQ4,
+        "dequant_i4" => DequantI4,
+        "dequant_u4" => DequantU4,
         _ => return None,
     })
 }
@@ -136,6 +145,21 @@ fn signature(b: DecodeBuiltin) -> Vec<Param> {
         DecodeBuiltin::QuantizeQ8 | DecodeBuiltin::QuantizeQ4 => {
             vec![f32b(false), Buf(Scalar::U8, true), Int("row length")]
         }
+        DecodeBuiltin::DequantI4 => {
+            vec![
+                Buf(Scalar::U8, false),
+                f32b(false),
+                Int("group size"),
+                f32b(true),
+            ]
+        }
+        DecodeBuiltin::DequantU4 => vec![
+            Buf(Scalar::U8, false),
+            f32b(false),
+            f32b(false),
+            Int("group size"),
+            f32b(true),
+        ],
     }
 }
 

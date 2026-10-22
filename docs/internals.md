@@ -293,7 +293,9 @@ them all, so each family's lowering refuses (`C0001`) an operand whose substitut
 wrong — `builtin_operands_are_f32` (kernel) and `MlBuiltin::buffer_elem` (I/O). The decode builtins
 have no such backstop and do not defer: a `Tensor[T, ..]` operand of one is `E0437` in the generic
 body. The **decode builtins** (`sdpa_kv`,
-`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
+`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`, and the group-wise int4
+`dequant_i4`/`dequant_u4`, whose entries in `quant.rs` are one scalar loop per group with an exact
+extent plan, `dequant_int4_plan`) are typed in
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so
 the entry validates them against the operand lengths and returns a status the lowering asserts is
@@ -550,15 +552,33 @@ land under the construct in tab-indented source. East-Asian wide characters coun
 columns past the end of a line count one each. If you touch `TAB_WIDTH`, `rendered_width` or
 `expand_tabs`, touch all three.
 
+Labels render in **one frame per source file, a source line at a time** (`render.rs`): every line
+that carries a label prints once, with all of its labels beneath it. Single-line labels on one line
+share an underline row, drawn widest first and a primary over a secondary of the same width, so a
+label nested in another stays visible inside it. The rightmost label's message ends that row when no
+underline reaches past its own; every other message hangs below on a `|` bar at its label's first
+column, the rightmost first (`single_line_rows`):
+
+```text
+18 |     return dot(a, b);
+   |                -  ^ `N` (axis 0) is Q in argument 2
+   |                |
+   |                `N` = P was fixed here, by axis 0 of argument 1
+```
+
 A multi-line span is drawn whole, with rustc-style connectors. A label ends at its *last* character,
 the one before `hi`, so a span whose `hi` is column 1 of the next line ends on the line before. A
-label is multi-line when that character is on a later line than its first. At most one label per
-diagnostic gets connectors: the primary label if it is multi-line, else the first multi-line label
-in position order. Such a diagnostic gives every echoed line and underline a 2-column margin after
-`| `. The connector label's first line is marked `/` when only whitespace precedes the span.
-Otherwise a start-marker line of `_` runs to a `^` (`-` for a secondary label) under its first
-character. Its later lines carry `|`, and an end-marker line `|___^ message` points at its last
-character:
+label is multi-line when that character is on a later line than its first. **Every** multi-line
+label gets connectors, each in a connector column of the left margin (`assign_connector_columns`:
+the leftmost column no label already there shares a line with, taking labels by first line, then
+column, then the longer first, so an enclosing label sits left of the ones it encloses and labels on
+disjoint lines share a column). The margin is one column per concurrently open label plus a space,
+on every echoed line and annotation row of the diagnostic, and absent when no label spans lines. A
+connector's first line is marked `/` when only whitespace precedes the span. Otherwise a
+start-marker row of `_` runs from its column to a `^` (`-` for a secondary label) under its first
+character. Its later lines carry `|`, and an end-marker row `|___^ message` points at its last
+character. Under one line, the single-line labels' rows come first, then the end markers (innermost
+first), then the start markers (outermost first):
 
 ```text
  9 |   fn pick(n: i32) -> i32 {
@@ -576,13 +596,14 @@ character:
    | |_^
 ```
 
-A label longer than 6 lines prints its first two and last two lines around one `...` gutter line,
-and the gutter is then at least 3 wide. The gutter also widens to fit the label's last line. Other
-labels keep their own frames at their sorted positions and are not interleaved into the connector
-frame (rustc interleaves them). Any other multi-line label is cut at the end of its first line,
-underlined to one column past it. A diagnostic with no multi-line label renders exactly as it did
-before connectors existed. Only the human form, and JSON's `rendered` copy of it, changes: the JSON
-span positions never depend on the renderer.
+The lines between two labelled lines print only when a connector spans the gap; a gap of more
+than 4 lines keeps its first and last line around one `...` gutter line (so a lone label longer than
+6 lines prints its first two and last two), and the gutter is then at least 3 wide. The gutter also
+widens to fit every printed line. A single-line label inside a connector's lines is interleaved on
+its line, under the connector's `|`, and a second multi-line label is no longer cut. A diagnostic
+whose labels are all single-line and on distinct lines renders exactly as it did before. Only the
+human form, and JSON's `rendered` copy of it, changes: the JSON span positions never depend on the
+renderer.
 
 The printed `-->`/`:::` column is the 1-based *char* column, the same number as JSON `col`. That is
 the editor/LSP jump contract, and it is kept by decision (N6): display width (tabs, wide characters)
@@ -609,7 +630,11 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Integers are signless `i1`/`i8`/`i16`/`i32`/`i64`/`i128` (signedness lives on the op, as in LLVM);
 `i128` is scalar-only — the verifier rejects a vector of `i128` lanes anywhere, and neither a
-`Switch` scrutinee nor an `AtomicAdd` value may be one. Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
+`Switch` scrutinee nor an `AtomicAdd` value may be one. Floats are `f8e4m3`/`f8e5m2`/`f16`/`bf16`/
+`f32`/`f64`; the four narrower than `f32` live in `f32` registers on their own grid
+(`MirType::is_sub_f32_float`), and the two 8-bit ones are scalar-only like `i128`: the verifier
+rejects a vector of f8 lanes and any `bitcast` to or from an f8 (its register is not its code; the
+`bits` builtin encodes instead). Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
 and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `Switch` is a multi-way
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
@@ -674,7 +699,27 @@ interpreter returns the message as its run error, the JIT records it and returns
 callers like a failed `assert` (both entries are `is_failure_intrinsic`s, so a caller of any
 function that can reach one polls the failure status after the call and stops; an entry missing
 from that list lets the caller run on), and a linked executable prints it and exits 1 (the `cc`
-fallback runtime carries C twins of both). `Op::VecKernelCall` — a call into a synthesized 256-bit
+fallback runtime carries C twins of both). A failed **`assert`** names its site the same way,
+without a failure edge of its own: with a source locator (`lower_program_located`) the intrinsic
+call is `assert(cond, site)`, or `assert(cond, site, message)` for `assert(cond, "message")` (the
+message is the literal's `.rodata` blob), and `attach_sites` rewrites the site placeholder at
+operand 1. Without a locator (`lower_program_with`, every test and the GPU device gates) a bare
+`assert(cond)` keeps its one-operand form. Every CPU path formats the failure with
+`wukong_runtime::assert_failure_message`: the interpreter's `assert` intrinsic, the JIT's
+`wukong_rt_assert(cond, site, message)` (null for a missing operand), the textual LLVM's
+declaration of the same three-parameter entry, and both link shims (Rust and `cc`). Two other
+checks trap through the same intrinsic and so name their site: a kernel builtin's run-time extent
+check (`emit_builtin_checks(checks, span)`, the builtin call) and the block a value `match` falls
+into when no arm matched (`emit_match_fallthrough_trap`, the `match`; its message is a
+compiler-made placeholder `attach_sites` turns into a blob, and the block keeps its
+`unreachable`). `--backend=gpu-native` keeps one device assert flag and declines a `GlobalAddr`, so
+the driver hands it a copy stripped of the site and message operands
+(`wukong_opt::strip_assert_sites`). It lowers a reached `unreachable` to a store of the device
+context's unreachable flag and an `exit` (`FnEmit::emit_unreachable_stop`), never to `trap`, which
+fails the launch with a sticky CUDA error that loses the context for the rest of the process.
+`decode_ctx` reads the assert flag first, so the match fall-through reports `assertion failed` as
+the interpreter does, and a bare `unreachable` reports the interpreter's own
+``execution reached `unreachable` ``. `Op::VecKernelCall` — a call into a synthesized 256-bit
 AVX2 kernel — is covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
@@ -801,10 +846,15 @@ statement window a recognizer replaces with one kernel call is attributed to its
 Each source function starts at its name (`Builder::set_decl`; a generic instance at its template's,
 a lifted closure at its literal) and an outlined `@parallel` region at its loop, so straight out of
 lowering every value of a source function is located (`crates/wukong_opt/tests/source_locations.rs`
-pins 100% over `tests/run`). Of the optimizer's passes only inlining (the callee's values keep the
-callee's spans) and loop unrolling (each copy keeps its original's) carry locations onto the values
-they create; every other new value stays unknown, and the same census pins the share that survives
-`-O2` from below. The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
+pins 100% over `tests/run`). The optimizer's passes that copy located code carry each original's
+span onto its copy (`Function::copy_value_loc`): inlining (the callee's values keep the callee's
+spans), loop unrolling and unroll-and-jam, bounds-check versioning and unswitching (each copy of a
+loop) and jump threading (each copy of a block). The vectorizer's builder has a current location,
+like `mir_build`'s: a widened step's vector values take the span of the scalar step they widen (a
+store's, its address's), a reduction's folds the span of its update, and the guard, trip and exit
+the span of the loop's exit test. Every other new value stays unknown — the unroller's wrap-safe
+limits, the bounds-check and unswitch guards, SLP packs — and the same census pins the share that
+survives `-O2` from below (96.48% over the corpus). The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
 `ValueId` (`FnTranslator::translate`): an instruction with a result carries that value when it is
 located; a store or void call, which has no table entry of its own, carries the value it reads when
 that value was lowered just before it; a terminator carries its condition, scrutinee or return
@@ -1113,14 +1163,58 @@ rounds a scalar one; Cranelift loads with `uload16x4` and a 16-bit shift, stores
 halves packed with `unarrow` into eight bytes, and rounds each lane of a bf16 `fptrunc`/`fpext` with
 the scalar path's integer round-to-nearest-even (`round_to_bf16_x4`; a NaN keeps its top half with
 the quiet bit set). The LLVM emitter already lowered half vectors, and `--backend=gpu-native`
-scalarizes them lane by lane through its scalar bf16 load, store and conversions. Only the three
-exact casts between `f32` and bf16 are lane-wise (`cast_route`); a bf16 cast through `f64`, to or
-from an integer, or a bitcast is replicated as the scalar instruction. A bf16 accumulator (it rounds
-inside its own recurrence) and a bf16 interleave group stay scalar, and `f16` stays scalar
-throughout: Cranelift has no vector half conversion, and its scalar path calls a runtime shim per
-element. Pinned by `tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the
-smallest subnormal, the largest finite value and rounding ties; every lane's bits, hand-derived)
-and `bf16_lanes_agree_with_the_scalar_loop`.
+scalarizes them lane by lane through its scalar bf16 load, store and conversions. The exact casts
+between `f32` and bf16 are lane-wise (`cast_route`), and so are the casts through `f64` and to and
+from integers (below, **half casts**); only a bitcast is replicated as the scalar instruction. A
+bf16 accumulator (it rounds inside its own recurrence) stays scalar. Pinned by
+`tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the smallest subnormal,
+the largest finite value and rounding ties; every lane's bits, hand-derived) and
+`bf16_lanes_agree_with_the_scalar_loop`.
+
+**f16 lanes** (P15.7). An `f16` lane is the same `f32` lane with a different grid, and `<4 x f16>`
+keeps the same four rounding points; the difference is the conversion. The scalar path calls the
+runtime shims `wukong_f32_to_f16_bits`/`wukong_f16_bits_to_f32` per element (the `half` crate: F16C
+`vcvtps2ph`/`vcvtph2ps` on a host that has it, an integer routine on one that does not), and
+Cranelift 0.124 has no vector half conversion, so `codegen_cranelift::half_lanes` builds both
+directions from SSE2 integer operations on four lanes at once: f16 to f32 rebiases the exponent,
+moves infinities and NaNs to exponent 255 (a NaN keeps its payload and gains the quiet bit) and
+forms a subnormal as `(2^-14 + m·2^-24) - 2^-14`, an exact `f32` subtraction; f32 to f16 rebiases
+and rounds a normal at bit 13 to nearest even with an integer add, rounds a subnormal by one `f32`
+addition of `0.5` (whose binade has the f16 subnormal spacing, so IEEE rounding is the rounding
+wanted), saturates `65520` and up to infinity, and narrows a NaN to its top ten payload bits with
+the quiet bit — F. Giesen's branch-free `float_to_half_fast3_rtne`/`half_to_float` with the `half`
+crate's NaN rule. A load is `uload16x4` plus the decode, a store the encode plus `unarrow`, and a
+`<4 x f16>` `fptrunc`/`fpext` the two back to back. Nothing depends on the host's half
+instructions, so `--target-cpu=x86-64` computes the same bits. `half_lane_tests` JIT-compiles the
+three under the host ISA and the SSE2 baseline and compares them bit for bit with the shim and with
+a transcription of the `half` crate's software routine: f16 to f32 on all 65536 encodings, f32 to
+f16 on every sign and exponent with a one, a run or a tie at every rounding position, every f16
+value's midpoint to the next and the `f32` neighbours of both, every NaN payload and a million
+random patterns. `tests/run/vec_f16_lanes.wk` is the program-level twin of the bf16 fixture (NaN
+payloads quiet and signalling, both zeros and infinities, subnormal inputs and results, overflow to
+infinity, ties at both ends; every lane's bits, hand-derived) on interp and native at `-O0` and
+`-O2`. An f16 accumulator stays scalar, like a bf16 one.
+
+**Half casts and interleave groups** (P15.7). A cast with a half end used to be replicated unless
+it only rounded between `f32` and a half grid. Every one but a bitcast now has a lane-wise route
+(`cast_route`), built from the scalar cast's own steps: `fpext` out of a half type into `f64` is the
+lane-wise round to the source grid (an `fpext .. to <4 x f32>`) and then the `f32 -> f64` widen
+(`CastRoute::HalfToF64`); `fptrunc` from `f64` into a half type is the `f64 -> f32` narrow and then
+the round to the target grid (`CastRoute::F64ToHalf`) — the scalar cast demotes, then rounds; and a
+cast between a half type and an integer is the `f32` route with the half lane type at the half end,
+because the scalar cast rounds nothing at the half grid there (`sitofp .. to f16` is an `f32`
+conversion, and `mir_build` rounds `i as f16` at the value with the same-type `fptrunc` it places
+right after it, which widens as the rounding cast above, so `i32 -> bf16` rounds twice; `x as i32`
+truncates the `f32` register), and so does every backend's vector `sitofp`/`fptosi` on an `f32x4`
+register. A bf16 or f16 **interleave group** (`o[2i]`, `o[2i + 1]`: a complex multiply over
+interleaved parts) widens like a 32-bit one: the group's contiguous `<4 x half>` loads and stores
+round where the scalar ones do, and the lane shuffles between them move `f32` lanes, which changes
+no bits. `tests/run/vec_half_casts.wk` prints every lane of ten casts (both directions through
+`f64`, both half types to `i32`, f16 to `u8`, `i32` and `i16` to both, ties and saturations at the
+half ranges, the double rounding of `2^24 + 2^16 + 1` into bf16) and of a stride-2 complex multiply
+in each half type, hand-derived, on interp and native at `-O0` and `-O2` and at
+`--target-cpu=x86-64`; `half_casts_through_f64_and_integers_convert_lane_wise` asserts that none of
+them replicates a lane.
 
 **256-bit kernels from the optimizer** (`src/vec256.rs`, a child module of `vectorize`). A loop the
 128-bit plan widens whose body also has a raw-AVX2 recipe form takes the same `Op::VecKernelCall`
@@ -1137,7 +1231,7 @@ stored) becomes a reduction recipe whose wrapping result `kc` adds to the accumu
 the resumed loop through a block parameter of `kj` — integer addition is associative, so the
 kernel's canonical grouping is the scalar loop's sum bit for bit (`tests/run/vec256_opt_int_sum.wk`,
 every trip from 2040 to 2064). Anything else — a float sum (the recipe would reassociate it), any
-other reduction kind, a cast, a gather or scatter, a shift or bitwise op, the counter read as a
+other reduction kind, a cast (but the f16 grid roundings below), a gather or scatter, a shift or bitwise op, the counter read as a
 value, a countdown, a search loop, an interleave group, an unsigned compare, an `i64` multiply —
 keeps the 128-bit loop. One rule is added: every object the
 loop stores is accessed **only at the stored element** (`o[i] = o[i] * 2` is fine), because the
@@ -1151,6 +1245,29 @@ buffer (`guard_allows_equal`) are two streams that may share a base: the interpr
 per base), so every load reads the lane's latest earlier store to *any* stream of its class, its
 own included, as the machine code does by re-reading memory (`tests/run/vec256_opt_aliased.wk`; a
 reload of a stored stream after a store to its twin, `tests/run/vec256_opt_aliased_reload.wk`).
+**f16 bodies** take the recipe as an `f32` one: an f16 element is an `f32` lane between its
+conversions, so a recipe gains three ops (`wukong_mir::VecOp`) — `LoadF16` (`vcvtph2ps`, eight
+halves widened exactly), `StoreF16` (`vcvtps2ph` with imm8 0, round to nearest even whatever
+`MXCSR` holds) and `RoundF16` (both, for an `fptrunc .. to f16` or an `fpext` out of f16) — and a
+stream is f16 or `f32` throughout (`validate`), its group 16 bytes or 32 wide. F16C is used because
+it is the scalar path: the runtime shims are the `half` crate, which is `vcvtps2ph`/`vcvtph2ps` on
+an F16C host and an integer routine that agrees with them on every input elsewhere. The reference
+evaluator rounds through that integer routine (`VecValue::round_f16`), transcribed in
+`wukong_mir::f16_bits` so the IR crate keeps its two workspace dependencies, and tested there bit for
+bit against `half`'s host and software paths (all 65536 f16 encodings; every sign, exponent and
+value of the eleven mantissa bits a result keeps or rounds on): a `LoadF16` rounds whatever the
+slot or a forwarded store holds (the interpreter stores a scalar f16 as is and rounds on load), and
+a `StoreF16` writes and forwards the rounded lane. The kernel needs F16C as well as AVX2+FMA
+(`host_supports_f16c_kernels`, asked by the optimizer and refused by the assembler without it;
+x86-64-v3 includes it); a host without it keeps the 128-bit `<4 x f16>` loop. One rule is added: an
+f16 invariant reaches the kernel through its `f32` scalar table by an `fpext`, which rounds, so only
+an invariant known to lie on the f16 grid is splatted (a constant, an f16 load, a cast into f16) —
+an f16 parameter need not (`n as f16` converts to `f32` without rounding, and `-O2` forwards the
+register past the store that would round it), and keeps the 128-bit loop. Pinned by the AVX2 tests
+in `avx2_f16_tests` (all 65536 encodings widened, the dense `f32` cover narrowed and rounded, a
+mixed body at unrolled and single-group trips on unaligned buffers, each against the shims and the
+evaluator) and `tests/run/vec256_f16_lanes.wk` (five kernels over 2048 lanes each, every lane's
+bits, hand-derived).
 The rewrite: a guard block computes `n`, the trip rounded down to the recipe's lanes and
 zero below the gate or when the alias check fails, and `start + n`; a call block (entered only when
 `n != 0`) rebuilds each stream's address and each invariant from the body's own scalar steps with
@@ -1650,6 +1767,52 @@ unsuffixed literal is typed by its value (`i64` for exactly 2^63, else `i128`; p
 `E0431`). An array length that is a literal past `u64` saturates in both mirrors
 (`eval_usize_depth`, `const_usize_depth`) so it is out of range rather than `0`.
 
+### 8-bit floats (`fp8.rs` in three crates)
+
+`f8e4m3` (OCP E4M3FN) and `f8e5m2` (OCP E5M2) are `Scalar::F8E4M3`/`F8E5M2` (one byte, byte-aligned)
+and `MirType::F8E4M3`/`F8E5M2`. They follow the `f16`/`bf16` model rather than being erased to `i8`
+storage in `mir_build`: a value is an `f32` register on the format's grid, stored as its 1-byte
+code, so every arithmetic, compare and select site that already handles the narrow floats handles
+them, and the grid is reached at the same observation boundaries — a `ConstFloat`, a `Load` (decode
+the byte), a `Store` (encode the register), an `FpTrunc` to an f8 (the source rounded once, an
+`f64` from its own bits) and an `FpExt` from one (the source re-rounded before widening, so a value
+an optimizer forwarded past its store is still on the grid). `mir_build` rounds every arithmetic
+result with a same-type `FpTrunc` (`round_half_result`), and an integer converted to a narrow float
+— an `f8` or a half — too (`round_int_to_narrow_float`: `sitofp` produces the `f32`, not the narrow
+grid, and an `-O2` forward of `257 as bf16` used to print 257 where `-O0` printed the stored 256),
+at an `as` (`lower_cast`) and at an implicit conversion (`coerce_to`) alike: an integer literal
+adapting to a half operand is the half's value, so `max(b, 257)` no longer splits the same way and
+`one_bf16 + 257` is 1 + 256.
+The math intrinsics compute an f8 operand in `f32` and round the result once
+(`lower_math_intrinsic_at`), since their constants would otherwise be built at the f8 type, where
+`+inf` does not exist; `isnan`/`isinf`/… widen the operand first for the same reason. The optimizer
+folds neither f8 arithmetic nor f8 comparisons and never forwards an f8 store into a load
+(`simplify`, `cse::forwardable`), as for the halves; `lane_bytes`/`vector_width` have no f8 lane.
+Unlike a half's, an f8 constant stays at its exact literal value in the fold table
+(`round_float_to_ty`): the backends round it once from the `f64`, and rounding it to `f32` first can
+land it on an f8 midpoint, so the one fold it reaches, a unary minus, would round twice
+(`-1.12500001f8e5m2` printed `-1` at `-O2` and `-1.25` at `-O0`). In sema (`f8.rs`), `E0438`
+judges a float literal where it adapts to an f8 and an unsuffixed integer literal where it converts
+to one beside an f8 value — the binary operators, compound assignment, `min`/`max`, `sb_adapt`
+(`clamp`, `fma`, `copysign`, `logaddexp`) and `if`/`match` arms (`range_check_f8_int_literal`) —
+since `mir_build` converts such an integer with `sitofp` and rounds it onto the f8 grid silently.
+
+The codec is `wukong_runtime::fp8`'s bit-level `encode_f32`/`encode_f64`/`decode_f32`: a normal
+result rounds on the source's bit pattern (add `half − 1` plus the kept lsb below the format's last
+mantissa bit, so a carry bumps the exponent), rebiases and clamps to the largest code (448's `0x7E`
+for E4M3FN, the infinity `0x7C` for E5M2); one below the least normal scales `|x|` by `2^k` (exact)
+and rounds that to an integer, ties to even; a NaN gets the format's NaN code with its sign. The
+interpreter calls it (`round_f8`); Cranelift (`wukong_codegen_cranelift/src/fp8.rs`) and the LLVM
+emitter (`wukong_codegen_llvm/src/fp8.rs`, which declares `llvm.roundeven` and `llvm.fptosi.sat` for
+the subnormal branch) emit the same instructions inline, so there is no runtime call and no new
+link symbol. Its oracles: the runtime's own tests pin it to the exact reference encoder on every code,
+every midpoint and both neighbours, and a sweep of 262144 `f32` patterns and `f64` near-midpoints;
+`wukong_codegen_cranelift`'s `fp8_tests` run the type on the interpreter and natively at `-O0`/`-O2`
+against the runtime (every code through `from_bits`/`bits`/memory/`f64`, every midpoint, 4096
+patterns, an `f64` sweep and strided arithmetic); and `semantic_tests::f8_codec_modules` exports the
+LLVM codec for `tools/verify_semantics.py` to JIT against a transcription of the reference.
+`--backend=gpu-native` declines a function holding an f8 (`decline_f8`).
+
 ### Debug info (`-g`) and the JIT perf map
 
 Both consume one record, `debuginfo::CodeLog`, that `populate_module` fills only when asked: each
@@ -1745,13 +1908,23 @@ and the exit code diverges from the oracle.
 one Cranelift stack slot, so a frame holds the largest set of simultaneously live slots rather than
 every slot the function declares; the JIT and the object path share the lowering, so both get it.
 Lifetimes come from `wukong_opt::slot_lifetime`, a pure MIR analysis — no lifetime-marker op exists:
-a slot is live at a point that is reachable from one of its uses and can reach one (so a slot used
-inside a loop is live around the whole loop), where a use is any instruction that handles its
-address or a pointer derived from it (`gep`, `select`, block parameters, pointer casts, a value
-loaded back out of a slot the address was stored into). The backward half stops on entry to a
-counted loop that writes every byte of the slot before anything reads it — the `[v; N]`
-initializer of a `let` inside a loop body — so per-iteration scratch arrays declared one after
-another stop overlapping. An address the analysis loses (stored to untracked memory, returned,
+a slot is live at a point that is reachable from one of its uses and can reach a *read* of it (so a
+slot read inside a loop is live around the whole loop), and at every point that uses it, where a use
+is any instruction that handles its address or a pointer derived from it (`gep`, `select`, block
+parameters, pointer casts, a value loaded back out of a slot the address was stored into) and a read
+is any use but a store into it or an address computation. The backward half stops at a **full
+overwrite** — a point after which the old contents can never be read (`slot_lifetime/kills.rs`): a
+region of counted loops, run one after another, that only write the slot and between them write
+every byte of it (the `[v; N]` initializer of a `let`, a `for` over the whole array, a nest whose
+iteration space tiles it in either loop order — a mixed-radix coverage proof whose index arithmetic
+is range-checked against its integer types — and the vector bodies, unrolled bodies, row vector
+kernels and remainder loops the vectorizers and the unroller leave; induction variables are block
+parameters or, at `-O0`, the counter slots `for` loops keep their variable in), a runtime kernel call
+that overwrites its output (from `wukong_runtime::OVERWRITES`, a per-symbol contract table checked
+against the kernels by its own test: a GEMM with `beta = 0`, GEMV, the elementwise maps, norms, bias,
+transpose, cumsum, column reductions, attention), and a synthesized vector kernel's write-only
+stream. So per-iteration scratch arrays stop overlapping, and so do arrays zeroed at the top of a
+kernel and rewritten later. An address the analysis loses (stored to untracked memory, returned,
 `ptrtoint`, passed to an `extern "C"` function, to a user function whose parameter may retain it —
 `CaptureSummary`, a bottom-up greatest fixpoint over the call graph — or to a call that also takes a
 function address, i.e. an outlined `@parallel` region's environment) keeps its slot live for the
@@ -1760,17 +1933,15 @@ into another's memory. The coloring is greedy (largest slot first, layout order 
 whose members it does not interfere with); a shared slot is as large and aligned as its largest and
 most aligned member, and an over-aligned member still rounds its own address up inside it. At
 `-O1`+ a color holds only private stack slots (Cranelift's `Vmctx` alias region) or only non-private
-ones, because Cranelift's alias analysis requires one location to be accessed under one region; at
+ones, because Cranelift's IR contract requires one location to be accessed under one region; at
 `-O0` Cranelift runs no alias analysis, so colors mix and a private member is demoted to the default
-region. A function in which nothing shares lowers to byte-identical code. The interpreter keeps one
-slot per alloca — it is the oracle, and `native_matches_interpreter` over the run corpus is what
+region (mixing at `-O1`+ would save 0.2% more of the `-O2` corpus — `stack_color.rs` explains why it
+is not done). A function in which nothing shares lowers to byte-identical code. The interpreter keeps
+one slot per alloca — it is the oracle, and `native_matches_interpreter` over the run corpus is what
 would see a wrong coloring. `WUKONG_STACK_COLOR=0` turns coloring off (a kill switch that can only
-change frame sizes). Over `tests/run` (557 programs) the static slot bytes drop 5.8% at `-O0` and
-4.8% at `-O2`; `cargo test -p wukong_codegen_cranelift --lib corpus_frame_bytes -- --ignored
---nocapture` prints the report. Kernels that declare and zero all their scratch at the top of the
-function (`examples/llama_block.wk`) gain almost nothing: their slots are live from the top, because
-the later full overwrites are 2-D loop nests, runtime kernels or, at `-O2`, unrolled and fused loops
-the kill test does not recognize.
+change frame sizes). Over `tests/run` (609 programs) the static slot bytes drop 6.5% at `-O0` and
+5.2% at `-O2`, and `examples/llama_block.wk`'s kernel frame by 27.5%; `cargo test -p
+wukong_codegen_cranelift --lib corpus_frame_bytes -- --ignored --nocapture` prints the report.
 
 SIMD **auto-vectorization** happens in `wukong_mir_build` while lowering a `for` loop: a
 straight-line elementwise body over unit-stride array accesses (plus loop-invariant splats, and
