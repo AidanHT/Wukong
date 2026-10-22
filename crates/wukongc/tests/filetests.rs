@@ -24,7 +24,9 @@
 //!   `--implicit-check-not=<pattern>`, `--allow-empty`, `--strict-whitespace`;
 //! - `diff <a> <b>` — the two files must be byte-identical;
 //! - `not <command>` — the command must fail *cleanly*: a non-zero exit that is not a crash (exit
-//!   101, a signal, or `panicked at` on stderr).
+//!   101, a signal, or a Rust panic message in its stderr). The panic message is looked for
+//!   wherever the RUN line sent stderr — captured, a `2>` file, or merged into stdout by `2>&1` —
+//!   because `wukongc` exits 1, not 101, after a panic on its compile thread.
 //!
 //! Redirections: `> <file>`, `< <file>`, `2> <file>`, and `2>&1` (stderr goes where stdout goes).
 //! Substitutions: `%s` the test file, `%S` its directory, `%t` a path unique to the test in a
@@ -416,13 +418,26 @@ struct StageResult {
     code: Option<i32>,
     /// What flows to the next stage (empty when stdout was redirected to a file).
     stdout: Vec<u8>,
-    /// Captured stderr (empty when redirected).
+    /// What the stage wrote to stderr, wherever the RUN line sent it: captured, read back from its
+    /// `2>` file, or, under `2>&1`, the stream it shares with stdout. The crash check reads this,
+    /// so no redirection can hide a panic from `not`.
     stderr: Vec<u8>,
 }
 
-/// Did a stage do what the RUN line asked? `None` = yes, `Some(why)` = no.
+/// Does `text` hold a Rust panic message (`thread '<name>' panicked at ..`, or
+/// `thread '<name>' (<id>) panicked at ..` on a newer toolchain)?
+fn shows_panic(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.find("thread '")
+            .is_some_and(|at| l[at..].contains(" panicked at "))
+    })
+}
+
+/// Did a stage do what the RUN line asked? `None` = yes, `Some(why)` = no. `stderr` is everything
+/// the stage wrote there ([`StageResult::stderr`]). `wukongc` turns a panic on its compile thread
+/// into exit 1, so the panic message is the only sign of that crash.
 fn verdict(negate: bool, code: Option<i32>, stderr: &str) -> Option<String> {
-    let crashed = code.is_none() || code == Some(101) || stderr.contains("panicked at");
+    let crashed = code.is_none() || code == Some(101) || shows_panic(stderr);
     match (negate, code) {
         (false, Some(0)) => None,
         (false, _) => Some(format!("exit {}", show_code(code))),
@@ -439,11 +454,32 @@ fn show_code(code: Option<i32>) -> String {
     code.map_or_else(|| "by signal".to_string(), |c| c.to_string())
 }
 
+/// The program a `wukongc` stage runs: the real compiler, or — in the harness's own tests — a
+/// stand-in that fails the way the compiler can.
+struct Compiler {
+    exe: PathBuf,
+    /// Placed before the stage's own arguments.
+    args: Vec<String>,
+    /// Added to the child's environment.
+    env: Vec<(String, String)>,
+}
+
+impl Compiler {
+    fn wukongc() -> Compiler {
+        Compiler {
+            exe: PathBuf::from(env!("CARGO_BIN_EXE_wukongc")),
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+}
+
 struct Ctx<'a> {
     file: &'a Path,
     display: &'a str,
     scratch: &'a Path,
     counter: AtomicUsize,
+    compiler: &'a Compiler,
 }
 
 impl Ctx<'_> {
@@ -474,12 +510,16 @@ impl Ctx<'_> {
             "diff" => self.diff(&stage.argv[1..]),
             _ => unreachable!("commands are validated when parsed"),
         };
-        // A builtin's streams are in memory: route them as the redirections say.
+        // A builtin's streams are in memory: route them as the redirections say, keeping in
+        // `stderr` what went there (under `2>&1`, the merged stream, as for `wukongc`).
         match &stage.stderr {
             ErrTo::Capture => {}
-            ErrTo::Stdout => res.stdout.append(&mut res.stderr),
+            ErrTo::Stdout => {
+                res.stdout.append(&mut res.stderr);
+                res.stderr = res.stdout.clone();
+            }
             ErrTo::File(f) => {
-                std::fs::write(self.path(f), std::mem::take(&mut res.stderr))
+                std::fs::write(self.path(f), &res.stderr)
                     .map_err(|e| format!("cannot write `{f}`: {e}"))?;
             }
         }
@@ -492,11 +532,14 @@ impl Ctx<'_> {
 
     fn run_wukongc(&self, stage: &Stage, input: &[u8]) -> Result<StageResult, String> {
         let io = |e: std::io::Error| format!("scratch file: {e}");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+        let mut cmd = Command::new(&self.compiler.exe);
         for v in COMPILER_ENV {
             cmd.env_remove(v);
         }
-        cmd.args(&stage.argv[1..]).current_dir(self.scratch);
+        cmd.envs(self.compiler.env.iter().map(|(k, v)| (k, v)));
+        cmd.args(&self.compiler.args)
+            .args(&stage.argv[1..])
+            .current_dir(self.scratch);
         if input.is_empty() {
             cmd.stdin(Stdio::null());
         } else {
@@ -523,14 +566,17 @@ impl Ctx<'_> {
         let status = cmd
             .status()
             .map_err(|e| format!("cannot spawn wukongc: {e}"))?;
+        let written = std::fs::read(&out_path).map_err(io)?;
+        // Read stderr back wherever it went: a panic on the compile thread exits 1, and its
+        // message is all that tells the crash from a clean failure.
+        let stderr = match &err_path {
+            Some(p) => std::fs::read(p).map_err(io)?,
+            None => written.clone(),
+        };
         let stdout = if stage.stdout.is_some() {
             Vec::new()
         } else {
-            std::fs::read(&out_path).map_err(io)?
-        };
-        let stderr = match (&stage.stderr, &err_path) {
-            (ErrTo::Capture, Some(p)) => std::fs::read(p).map_err(io)?,
-            _ => Vec::new(),
+            written
         };
         Ok(StageResult {
             code: status.code(),
@@ -686,12 +732,19 @@ impl Ctx<'_> {
             if let Some(why) = verdict(stage.negate, res.code, &stderr) {
                 failed = true;
                 report.push_str(&format!("--- stage {} `{shown}`: {why}\n", i + 1));
+                // Under `2>&1` the stderr text is the merged stream, stdout included.
+                let merged = stage.stderr == ErrTo::Stdout;
                 if !stderr.is_empty() {
-                    report.push_str(&format!("--- its stderr:\n{stderr}\n"));
+                    let what = if merged {
+                        "its stdout and stderr (2>&1)"
+                    } else {
+                        "its stderr"
+                    };
+                    report.push_str(&format!("--- {what}:\n{stderr}\n"));
                 }
                 // A failed compile's stdout, or what a failed diff printed.
                 let out = String::from_utf8_lossy(&res.stdout);
-                if !out.is_empty() && stage.argv[0] != "filecheck" {
+                if !merged && !out.is_empty() && stage.argv[0] != "filecheck" {
                     report.push_str(&format!("--- its stdout:\n{out}\n"));
                 }
             }
@@ -817,6 +870,11 @@ fn display_name(path: &Path) -> String {
 
 /// Run every RUN line of one test file.
 fn run_file(path: &Path, scratch_root: &Path) -> Outcome {
+    run_file_with(path, scratch_root, &Compiler::wukongc())
+}
+
+/// [`run_file`], its `wukongc` stages running `compiler`.
+fn run_file_with(path: &Path, scratch_root: &Path, compiler: &Compiler) -> Outcome {
     let display = display_name(path);
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -884,6 +942,7 @@ fn run_file(path: &Path, scratch_root: &Path) -> Outcome {
         display: &display,
         scratch: &scratch,
         counter: AtomicUsize::new(0),
+        compiler,
     };
     for run in &header.runs {
         if let Err(report) = ctx.run_line(run) {
@@ -1135,6 +1194,19 @@ fn not_needs_a_clean_failure() {
     assert!(verdict(true, Some(1), "thread 'x' panicked at src/a.rs")
         .unwrap()
         .contains("crashed"));
+    // A newer toolchain puts the thread id between the name and `panicked`.
+    assert!(verdict(
+        true,
+        Some(1),
+        "fn main\nthread 'x' (7) panicked at src/a.rs:1:2:\nmsg"
+    )
+    .unwrap()
+    .contains("crashed"));
+    // Text that merely says "panicked at" is no panic message.
+    assert_eq!(
+        verdict(true, Some(1), "error: the pass panicked at v3"),
+        None
+    );
 }
 
 #[test]
@@ -1150,11 +1222,16 @@ fn directives_for_an_unchecked_prefix_are_errors() {
 
 /// Write `body` as a filetest in a fresh directory and run it.
 fn run_scratch_test(name: &str, body: &str) -> Outcome {
+    run_scratch_test_with(name, body, &Compiler::wukongc())
+}
+
+/// [`run_scratch_test`], its `wukongc` stages running `compiler`.
+fn run_scratch_test_with(name: &str, body: &str, compiler: &Compiler) -> Outcome {
     let dir = scratch_root("selftest").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{name}.wk"));
     std::fs::write(&path, body).unwrap();
-    let outcome = run_file(&path, &dir.join("scratch"));
+    let outcome = run_file_with(&path, &dir.join("scratch"), compiler);
     let _ = std::fs::remove_dir_all(&dir);
     outcome
 }
@@ -1230,4 +1307,99 @@ fn the_harness_refuses_a_test_that_checks_nothing() {
         report.contains("`O2:` is a directive for the prefix `O2`"),
         "{report}"
     );
+}
+
+/// Set in the child [`stand_in_compiler`] runs as: `panic` or `error`.
+const STAND_IN: &str = "WUKONG_FILETESTS_STAND_IN";
+
+/// The message both stand-in modes print, as the MIR verifier words it.
+const ICE: &str = "internal compiler error (MIR verify): use of undefined value v7";
+
+/// A no-op in the suite. Run as a child of this test binary with [`STAND_IN`] set, it fails the
+/// way `wukongc` does: `panic` panics on a thread named like the compile thread and exits 1, just
+/// as `run_compile` turns a panicked join into a compile error, so the exit code cannot tell the
+/// crash apart and only the panic message on stderr can; `error` prints the message as a
+/// diagnostic and exits 1, a clean failure.
+#[test]
+fn stand_in_compiler() {
+    let Some(mode) = std::env::var_os(STAND_IN) else {
+        return;
+    };
+    if mode == "panic" {
+        let joined = std::thread::Builder::new()
+            .name("wukongc-compile".into())
+            .spawn(|| panic!("{ICE}"))
+            .unwrap()
+            .join();
+        assert!(joined.is_err());
+    } else {
+        eprintln!("error: {ICE}");
+    }
+    std::process::exit(1);
+}
+
+/// This test binary, run as [`stand_in_compiler`] in `mode`.
+fn stand_in(mode: &str) -> Compiler {
+    Compiler {
+        exe: std::env::current_exe().expect("the test binary's path"),
+        args: [
+            "--exact",
+            "stand_in_compiler",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .map(String::from)
+        .to_vec(),
+        env: vec![(STAND_IN.to_string(), mode.to_string())],
+    }
+}
+
+#[test]
+fn not_rejects_a_crash_wherever_stderr_was_sent() {
+    let check = format!("// CHECK: {ICE}\n");
+    let cases = [
+        (
+            "merged",
+            format!("// RUN: not wukongc 2>&1 | filecheck %s\n{check}"),
+        ),
+        (
+            "merged_to_file",
+            format!(
+                "// RUN: not wukongc > %t.out 2>&1\n\
+                 // RUN: filecheck %s --input-file=%t.out\n{check}"
+            ),
+        ),
+        (
+            "to_file",
+            format!(
+                "// RUN: not wukongc 2> %t.err\n\
+                 // RUN: filecheck %s --input-file=%t.err\n{check}"
+            ),
+        ),
+        (
+            "captured",
+            "// RUN: not wukongc\n// RUN: diff %s %s\n".to_string(),
+        ),
+    ];
+    for (name, body) in cases {
+        // A diagnostic and exit 1: the clean failure `not` accepts.
+        match run_scratch_test_with(&format!("clean_{name}"), &body, &stand_in("error")) {
+            Outcome::Pass => {}
+            other => panic!("{name}: a clean failure must pass `not`: {other:?}"),
+        }
+        // The same exit 1 after a panic is a crash, wherever the panic message went.
+        let Outcome::Fail(report) =
+            run_scratch_test_with(&format!("crash_{name}"), &body, &stand_in("panic"))
+        else {
+            panic!("{name}: a panic must fail `not` even when it exits 1");
+        };
+        assert!(
+            report.contains("`not` needs a clean failure, but the command crashed (exit 1)"),
+            "{name}: {report}"
+        );
+        assert!(
+            report.contains("panicked at"),
+            "{name}: the report shows the panic: {report}"
+        );
+    }
 }

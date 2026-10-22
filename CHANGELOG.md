@@ -13,7 +13,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `cargo test -p wukongc --test filetests` (`WUKONG_FILETESTS=<substring>` runs a subset). The
   differential gates prove an optimization changes no output; nothing proved one still *fires*.
   A filetest does: the invariant load sits in the preheader and not in the loop body, the tail
-  call became a branch, the four stores became one `<4 x f32>` store.
+  call became a branch, the four stores became one `<4 x f32>` store. `not` demands a *clean*
+  failure: a Rust panic message fails it wherever the `RUN:` line sent stderr (captured, `2>`,
+  or merged by `2>&1`), because `wukongc` exits 1, not 101, when its compile thread panics.
 - **Added: an in-tree FileCheck** (`crates/wukongc/tests/filecheck/`, no new dependency: the
   workspace locks no `regex` crate, so a small backtracking engine handles the POSIX-ERE subset
   patterns use). LLVM FileCheck's semantics for `CHECK`, `-NEXT`, `-SAME`, `-NOT` (between the
@@ -24,8 +26,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `file:line:col`, where the scan started, the input line most like the pattern ("possible
   intended match"), the variables it used, and the whole input, numbered. A misspelled directive
   (`CHECK-NXT:`, `CHECK-NEXT` without its colon) and a comment directive for a prefix no `RUN:`
-  line checks are errors, not silently ignored lines. 41 unit tests pin the matcher and the
-  harness, including a wrong `CHECK` that must fail with its location.
+  line checks are errors, not silently ignored lines. 43 unit tests pin the matcher and the
+  harness, including a wrong `CHECK` that must fail with its location and a stand-in compiler
+  that panics and exits 1, which `not` must reject under every redirection.
 - **Seeded with 37 files.** 24 under `opt/`, each a pass's essential property (most with a
   hand-written `.mir` input run through that one pass, so the lowering cannot drift under it):
   constant folding, GVN and load forwarding through joins, alias-based forwarding, LICM (an

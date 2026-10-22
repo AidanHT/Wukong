@@ -3124,9 +3124,11 @@ measurement reports retain the corpus sizes used for those runs.
   rejections of invalid `.mir` input and a `--verify-each -O2` run that must equal plain `-O2`,
   `cli/` `--print-after` and the pass-list errors. A failure prints the directive's
   `file:line:col`, where the search began, the input line most like the pattern, and the whole
-  input. Directives are written from the pass's semantics and confirmed, never pasted from output,
-  and a comment directive for a prefix no `RUN:` line checks fails the file
-  (`CONTRIBUTING.md`, "Writing a filetest").
+  input. `not` wants a clean failure: a panic message fails it wherever the `RUN:` line sent
+  stderr, `2>&1` included, since `wukongc` exits 1, not 101, after a compile-thread panic.
+  Directives are written from the pass's semantics and confirmed, never pasted from output, and a
+  comment directive for a prefix no `RUN:` line checks fails the file (`CONTRIBUTING.md`,
+  "Writing a filetest").
 
 - **GPU corpus coverage** (`--features gpu`, device required): `lower.rs` and `megakernel.rs` each
   sweep the whole `tests/run` corpus against the interpreter oracle at two `-O` levels and assert a

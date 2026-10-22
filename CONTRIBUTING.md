@@ -312,9 +312,11 @@ search started, the input line most like the pattern, and the whole input number
   emit-changing `WUKONG_*` switches cleared), `filecheck <checkfile> [--check-prefix=P]
   [--check-prefixes=P,Q] [--implicit-check-not=pat] [--input-file=f] [--allow-empty]
   [--strict-whitespace]`, `diff <a> <b>` and `not <command>` (a clean non-zero exit; a crash or a
-  panic fails it). Pipes run with `pipefail`; redirections are `>`, `<`, `2>` and `2>&1`. `%s` is
-  the test file, `%S` its directory, `%t` a scratch path unique to the test — give it a `.mir`
-  extension (`%t.mir`) when `wukongc` will read it back.
+  panic fails it — `wukongc` exits 1 after a panic on its compile thread, so the harness looks
+  for the panic message wherever `2>` or `2>&1` sent stderr). Pipes run with `pipefail`;
+  redirections are `>`, `<`, `2>` and `2>&1`. `%s` is the test file, `%S` its directory, `%t` a
+  scratch path unique to the test — give it a `.mir` extension (`%t.mir`) when `wukongc` will
+  read it back.
 - **Directives** are LLVM FileCheck's: `CHECK:`, `-NEXT:`, `-SAME:`, `-NOT:`, `-DAG:`, `-LABEL:`,
   `-EMPTY:`, `-COUNT-<n>:`; `{{regex}}`, `[[NAME:regex]]` / `[[NAME]]`, `[[@LINE+k]]`. A run of
   blanks matches any run of blanks, and a pattern never spans lines. Give each function its own
