@@ -1073,8 +1073,10 @@ all. The region is straight-line code: a listed access the if-conversion predica
 scatter in an `if` arm), or any synthesized step (a masked, merged or predicated store, a merge, a
 predicated load) between the first and the last listed access, declines the loop; an if-converted
 step outside the span widens beside it (it is independent of the region's accesses, like every
-other step). Under `WUKONG_NO_LANE_SERIAL` the vectorizer asks for the plain dependence verdict
-(`DepFacts::serial` off), which restores both declines, the header-read exemption's included.
+other step). A step running lane by lane reads a compare widened outside it as each lane's `bool`
+(`scalar_lanes`, the same `lane != 0` a predicated store reads), never the raw mask lane. Under
+`WUKONG_NO_LANE_SERIAL` the vectorizer asks for the plain dependence verdict (`DepFacts::serial`
+off), which restores both declines, the header-read exemption's included.
 
 **Outer-loop vectorization** (`outer_vec.rs`, a child module): a two-deep nest — outer header, one
 straight block before the inner loop, a one-block inner loop, the outer latch after it — is widened

@@ -15,8 +15,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   nothing (a sum). At most one call that may trap or never return may sit in a widened body (it is
   then the one step that can stop the program, and stops it at the scalar loop's iteration), and
   only a speculatable call may run before a lane test. A call with an effect — `print`, a write —
-  still declines. `bce` now versions a loop whose calls are side-effect free and always return
-  (`tests/run/vec7_call_lanes.wk`).
+  still declines. A compare passed as a `bool` argument reaches each lane's call as that lane's
+  truth, never as the raw lane of the widened mask. `bce` now versions a loop whose calls are
+  side-effect free and always return (`tests/run/vec7_call_lanes.wk`).
 - **Checked gathers widen.** `t[q[i]]` over a `[]T` keeps a bounds check `bce` cannot prove (the
   index is data), which used to be a second loop exit the vectorizer refused. A body that passes
   checks on every iteration is now flattened: a check on `i + k` is discharged once in the vector
