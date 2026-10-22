@@ -31,16 +31,16 @@ fn lower_assertion_fixture(src: &str) -> (wukong_mir::Program, wukong_span::Inte
 fn assertion_aot_rust_and_c_shims_stop_before_trailing_effects() {
     let scratch = ScratchDir::new("assertion_aot").unwrap();
     let dir = &scratch.path;
-    let rustc = link_rustc();
-    // Unit-test executables live under <profile>/deps. Use the real runtime and production
-    // archive selection: COFF carries all declared imports, including unused runtime symbols.
+    // Unit-test executables live under <profile>/deps. Link through the production entry points
+    // (runtime archive selection, the runtime cache, the driver crate) against the build's own
+    // runtime: COFF carries all declared imports, including unused runtime symbols. A private
+    // cache inside the scratch directory: the first link builds each entry, the rest reuse it.
     let current = std::env::current_exe().unwrap();
     let deps = current.parent().unwrap();
     let profile = deps.parent().unwrap();
-    let rust_shim = dir.join("shim.rs");
-    std::fs::write(&rust_shim, WUKONG_RT_SHIM).unwrap();
-    let c_shim = dir.join("shim.c");
-    std::fs::write(&c_shim, WUKONG_RT_C).unwrap();
+    let cache = aot_cache::RuntimeCache::at(&dir.join("cache"));
+    let opts = Options::default();
+    let mut timer = report::PassTimer::new(&opts);
     // Every site below is the `assert` call's (or the slice access's) line and column in its
     // source text: `fn main() -> i32 { print(10); ` is 30 characters, so `assert` opens column 31.
     const ASSERTION: &str = "error: assertion failed at t.wk:1:31";
@@ -103,38 +103,25 @@ fn assertion_aot_rust_and_c_shims_stop_before_trailing_effects() {
         for flavor in ["rust", "c"] {
             let executable = dir.join(format!("{name}_{flavor}{}", std::env::consts::EXE_SUFFIX));
             let linked = if flavor == "rust" {
-                try_runtime_rlibs(runtime_rlib_candidates(profile), |runtime| {
-                    let mut command = Command::new(&rustc);
-                    command
-                        .arg(&rust_shim)
-                        .args(["--edition", "2021", "-C", "panic=abort"]);
-                    if rlib_holds_bitcode_members(runtime) {
-                        command.args(["-C", "lto=thin", "-C", "opt-level=3"]);
-                    }
-                    command
-                        .arg("--extern")
-                        .arg(format!("wukong_runtime={}", runtime.display()))
-                        .arg("-L")
-                        .arg(format!("dependency={}", deps.display()))
-                        .arg("-C")
-                        .arg(format!("link-arg={}", object.display()))
-                        .arg("-o")
-                        .arg(&executable)
-                        .output()
-                })
-                .unwrap()
-                .expect("the test build must provide a runtime archive")
-                .1
+                matches!(
+                    rustc_link_in(
+                        profile,
+                        &cache,
+                        Some(&scratch),
+                        name,
+                        &object,
+                        &executable,
+                        false,
+                        &mut timer,
+                    ),
+                    LinkOutcome::Linked
+                )
             } else {
-                Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
-                    .args(cc_link_args(&object, &c_shim, &executable))
-                    .output()
-                    .expect("C assertion-shim regression requires the configured CC or cc")
+                cc_link(&cache, &opts, name, &object, &executable, &mut timer) == exit::OK
             };
             assert!(
-                linked.status.success(),
-                "{name}/{flavor}: {}",
-                String::from_utf8_lossy(&linked.stderr)
+                linked,
+                "{name}/{flavor}: the link failed (its diagnostics are above)"
             );
             let ran = Command::new(&executable).output().unwrap();
             assert_eq!(ran.status.code(), Some(status), "{name}/{flavor}");

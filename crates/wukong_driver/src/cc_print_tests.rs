@@ -32,7 +32,14 @@ fn link_with_cc_and_run(program: &Program, interner: &Interner, stem: &str) -> (
         ..Options::default()
     };
     assert_eq!(
-        cc_link(&opts, Some(&scratch), stem, &object, &out),
+        cc_link(
+            &aot_cache::RuntimeCache::from_env(),
+            &opts,
+            stem,
+            &object,
+            &out,
+            &mut report::PassTimer::new(&opts),
+        ),
         exit::OK,
         "this regression requires the configured CC or cc"
     );

@@ -73,6 +73,13 @@ It exits non-zero on any divergence, and it is the only opt-invariance gate over
 Run tests unpiped, as their own step: `cargo test … | grep X && git commit` takes *grep's* exit
 status and commits on a failing suite.
 
+`--emit=exe` builds its runtime half (the generated shim, or the C runtime) once into the AOT
+runtime cache (`docs/internals.md`, "The AOT runtime cache"). The `wukongc` integration tests that
+link point `WUKONG_CACHE_DIR` at `<target>/tmp/wukong-runtime-cache`, so a test run never writes
+your own cache; a new test that spawns `wukongc --emit=exe` must do the same (`tests/exe.rs`'s
+`wukongc()` helper). Editing `WUKONG_RT_SHIM`, the C runtime or the runtime crate changes the
+entry's key, so nothing needs clearing by hand; `WUKONG_CACHE_TRACE=1` shows each decision.
+
 ## Where things live
 
 See [`docs/internals.md`](docs/internals.md) for the crate layering and pipeline. In short:

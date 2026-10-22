@@ -59,7 +59,13 @@ backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `p
 several artifacts from one compile — on stdout under `==> <stage> <==` headers, or each at
 `<stem>.<ext>` with `-o <stem>` (language guide, "Several artifacts at once"); `wukongc --repl` is an
 interactive session: items are kept, statements run, an expression prints its value, and
-`:type <expr>` asks sema (language guide, "The REPL").
+`:type <expr>` asks sema (language guide, "The REPL"). `--emit=exe` builds the program-independent
+runtime half of the link once — the generated runtime shim and, against a release-profile runtime,
+one fat-LTO static library of it (formerly a whole-runtime LTO on every link) — into the AOT runtime
+cache and reuses it on every later link: `wukongc --print=runtime-cache` prints where it is
+(`WUKONG_CACHE_DIR`, else `%LOCALAPPDATA%\wukong\cache` or `~/.cache/wukong`), `wukongc
+--clear-cache` empties it, and `WUKONG_CACHE_TRACE=1` traces each hit, miss and rebuild
+(`docs/internals.md`, "The AOT runtime cache").
 
 ## Why Wukong
 

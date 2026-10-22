@@ -201,6 +201,11 @@ fn wukongc(dir: &Path, args: &[String], extra: &[&str], source: &Path) -> Output
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
     // Autodiff differentiates the recognized kernels; the instrument would make every model refuse.
     cmd.env_remove(wukong_driver::NO_RECOGNIZE_ENV);
+    // Link through a runtime cache under the target directory, never the user's own.
+    cmd.env(
+        wukong_driver::CACHE_DIR_ENV,
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("wukong-runtime-cache"),
+    );
     cmd.current_dir(dir)
         .args(args)
         .args(extra)

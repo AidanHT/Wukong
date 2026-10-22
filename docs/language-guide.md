@@ -3117,6 +3117,13 @@ wukongc --repl [OPTIONS]         an interactive session on standard input (see "
                       works too; an unknown lint is a usage error (exit 2). See "Warnings (lints)"
 --error-limit=<n>     print at most n errors before suppressing the rest (0 = unlimited; default)
 --explain [CODE]      print an extended explanation for an error code; no code lists every code
+--print=runtime-cache print the --emit=exe runtime cache directory and exit. The first link builds
+                      the program-independent runtime half there (the runtime shim; with a
+                      release-profile runtime, one fat-LTO static library of it) and every later
+                      link reuses it. WUKONG_CACHE_DIR sets the location (empty: no cache), else
+                      %LOCALAPPDATA%\wukong\cache, $XDG_CACHE_HOME/wukong or ~/.cache/wukong;
+                      WUKONG_CACHE_TRACE=1 prints each hit, miss and rebuild on stderr
+--clear-cache         remove every runtime cache entry and exit (the next link rebuilds it)
 --color=<when>        auto | always | never   (default: auto)
                       auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
 --remarks=dispatch    print a note (stderr) at every statement — or function — the compiler replaced
@@ -3144,6 +3151,16 @@ callee's). The machine code is the same with and without `-g`. Locals, types and
 described yet, so a debugger cannot print a variable. For profiling the JIT,
 `WUKONG_PERF_MAP=1 wukongc --run --backend=native prog.wk` writes `perf-<pid>.map`, which Linux
 `perf report` uses to name samples in JIT-compiled functions.
+
+**✅ The AOT runtime cache:** an `--emit=exe` link builds the part that does not depend on the
+program — the generated runtime shim compiled against `wukong_runtime` (with a release-profile
+runtime, one fat-LTO static library of shim, runtime and `std`), or the C runtime on the `cc`
+fallback — once, into a cache, and every later link only links against it. The first release link
+after a runtime rebuild therefore takes its LTO time once (about a minute at most) instead of on
+every link. `wukongc --print=runtime-cache` prints the directory (`WUKONG_CACHE_DIR`, else the
+platform cache directory; an empty `WUKONG_CACHE_DIR` turns the cache off), `wukongc --clear-cache`
+empties it, and `WUKONG_CACHE_TRACE=1` reports every hit, miss and rebuild. A damaged entry is
+detected and rebuilt, and concurrent compiles share the cache safely.
 
 Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and
 a diagnostic may carry a `help:` suggestion (a concrete replacement). A source line prints once

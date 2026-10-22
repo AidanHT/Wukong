@@ -2117,12 +2117,17 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `wukong_runtime` as a dependency; a generated shim supplies the `wukong_rt_*` runtime), which also
   links the string `.rodata` relocations — neither of which the MinGW `cc` path on this host can do.
   It falls back to the C-runtime `cc` link (scalar, no-data, no-kernel programs) when rustc or the
-  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. The generated
-  link inputs (`{stem}_shim.rs` for the rustc path, `{stem}_rt.c` for the `cc` fallback) are written
+  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. **The runtime
+  half of the link is cached** (N51, `gap7/aot-link-cache`): the shim compiled against the runtime (a
+  fat-LTO static library of shim, runtime and `std` for a release-profile runtime, which used to be
+  re-LTO'd on every link at 35-40 s each), or the C runtime compiled to an object, is built once into
+  the AOT runtime cache (`wukongc --print=runtime-cache`, `--clear-cache`, `WUKONG_CACHE_DIR`,
+  `WUKONG_CACHE_TRACE=1`) and every later link only compiles an empty driver crate and links. The
+  per-link inputs (the object and that driver crate, `{stem}_main.rs`) are written
   into a **pid-keyed temporary scratch directory that is removed when the link finishes**, not into the
   working directory — they used to overwrite and then delete any user file of the same name, and two
   concurrent links on one stem raced on them; the working directory is used only if the temp directory
-  cannot be created. The intermediate `{stem}.o` is still written beside the invocation. The rustc link
+  cannot be created. The rustc link
   passes `-C panic=abort` because the workspace release profile sets `panic = "abort"`, and a strategy
   mismatch is a hard metadata error that rejects the link outright. **The executable's entry
   matches `--run`**: the object's C `main` is synthesized, calls the program's `main` (now the

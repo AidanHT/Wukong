@@ -311,6 +311,11 @@ fn every_trap_names_its_site_in_a_linked_executable() {
             .join(format!("{}{}", case.name, std::env::consts::EXE_SUFFIX));
         let built = outcome(
             Command::new(env!("CARGO_BIN_EXE_wukongc"))
+                // A runtime cache under the target directory, never the user's own.
+                .env(
+                    wukong_driver::CACHE_DIR_ENV,
+                    Path::new(env!("CARGO_TARGET_TMPDIR")).join("wukong-runtime-cache"),
+                )
                 .current_dir(&scratch.0)
                 .arg("--emit=exe")
                 .arg("-o")

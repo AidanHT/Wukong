@@ -1634,9 +1634,12 @@ drift; only when it finds nothing does the driver report that path unavailable a
 `wukong_rt_fmod_*` over `fmod`/`fmodf` and glibc keeps those in libm. The rustc invocation passes
 `-C panic=abort`,
 because the workspace's release profile sets `panic = "abort"` and rustc would otherwise reject the
-shim's default `unwind` strategy against that rlib. The generated link inputs (the Rust shim, or the C
-runtime for the fallback) are written into a pid-keyed scratch directory that is deleted when the link
-finishes — never into the process's working directory, unless that directory cannot be created.
+shim's default `unwind` strategy against that rlib. The per-link inputs (the object and the empty
+driver crate rustc compiles to drive the link) are written into a pid-keyed scratch directory that is
+deleted when the link finishes — never into the process's working directory, unless that directory
+cannot be created. The program-independent inputs (the Rust shim compiled against the runtime, or the
+C runtime compiled to an object for the fallback) are **built once into the AOT runtime cache** and
+reused by every later link; see *The AOT runtime cache* below.
 
 **The rlib's shape decides the rest of the link line, and the release shape is not the debug one.**
 The workspace `[profile.release]` sets `lto = "thin"`, so cargo compiles every *dependency* of an LTO
@@ -1650,17 +1653,94 @@ objects). `wukong_driver::rlib_holds_bitcode_members` walks the archive's member
 whether any member *starts* with the LLVM bitcode magic — the right question, because on an MSVC
 target the `lib.rmeta` member is a COFF wrapper in **both** shapes, and cargo's `ObjectAndBitcode`
 shape keeps its bitcode in a `.llvmbc` section *inside* a real object. When the answer is yes,
-`rustc_link` adds `-C lto=thin -C opt-level=3`, mirroring the profile the rlib was built under and
-letting rustc do the LTO that the bitcode was emitted for. `opt-level` is load-bearing, not cosmetic:
-the LTO backend re-codegens imported modules at the *linking* crate's level, and at rustc's default
+the runtime is LTO'd the only way bitcode can be consumed — by rustc — into a **fat-LTO static
+library** of the shim, the runtime and `std` at `-C opt-level=3` (mirroring the profile the rlib was
+built under), built once into the AOT runtime cache. `opt-level` is load-bearing, not cosmetic: the
+LTO backend re-codegens imported modules at the *linking* crate's level, and at rustc's default
 `-C opt-level=0` the AVX2 kernels come out as `vfmadd213ps %ymm2,%ymm1,%ymm0` fed by stack reloads
-instead of the release form `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0`. The path rustc is given for `-o`
-is absolutized for the same reason the LTO flag exists: with `-C lto=thin`, rustc 1.97.1 names its
-per-module LTO objects from the output *stem* and hands the linker a path only valid relative to its
-own temp directory, so a relative `-o hello.exe` fails with `LNK1181: cannot open input file
-'hello.<crate>…rcgu.o.rcgu.o'`. Nothing here touches the debug path: a native rlib links exactly as
-before, with neither flag. The cost is confined to release AOT, where the link is a whole LTO of the
-runtime and std — tens of seconds per executable rather than under a second.
+instead of the release form `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0`. Until N51 this LTO ran on
+**every** release link (`-C lto=thin` over the whole runtime and std, 35-40 s per executable on the
+development host); it now runs once per runtime build and toolchain. The path rustc is given for
+`-o` is still absolutized: with `-C lto=thin`, rustc 1.97.1 named its per-module LTO objects from the
+output *stem* and handed the linker a path only valid relative to its own temp directory, so a
+relative `-o hello.exe` failed with `LNK1181: cannot open input file 'hello.<crate>…rcgu.o.rcgu.o'`.
+The debug path never LTOs: a native rlib is linked as one, as before.
+
+### The AOT runtime cache (`wukong_driver/src/aot_cache.rs`)
+
+An `--emit=exe` link joins the program's object (different every time) with the runtime half
+(identical for every program a given compiler builds). The runtime half is an **entry** in a cache
+directory, built on the first link and reused by every later one; a warm link only lets rustc
+*drive* the platform linker — it compiles an empty driver crate, so no platform-linker locator is
+needed and nothing is LTO'd. Three flavours, named by the entry's prefix:
+
+| entry | when | holds | each link compiles |
+|---|---|---|---|
+| `rust-native-<key>` | dev-profile runtime rlib (native objects) | the shim as an rlib (`libwukong_aot_shim.rlib`) | `#![no_main] extern crate wukong_aot_shim;` (links shim + runtime rlib + `std` exactly as the old per-link shim binary did) |
+| `rust-lto-<key>` | release-profile runtime rlib (bitcode members) | a fat-LTO static library (`wukong_aot_rt.lib` / `libwukong_aot_rt.a`) + the `--print native-static-libs` list | a `#![no_std] #![no_main]` driver; the archive, then its native libraries, follow the object as link args |
+| `cc-<key>` | the `cc` fallback | the C runtime compiled once to `wukong_rt.o` | nothing (`cc <object> wukong_rt.o …`) |
+
+**Why fat LTO and a `no_std` driver.** Thin LTO leaves cross-module symbols of `core` global in the
+archive, so the driver's own `libcore` collides with them (`LNK2005 … already defined in
+libcore-*.rlib`); fat LTO internalizes every Rust symbol, leaving the `#[no_mangle]` C entry points,
+`compiler_builtins`, and exactly two `std` symbols (`rust_eh_personality`,
+`std::panicking::EMPTY_PANIC`) global — which still collide with a *second* `std`, hence the
+`#![no_std]` driver (its panic handler is never called; the archive panics through its own
+internalized `std`). A dev-profile runtime cannot be LTO'd (cargo builds it with
+`-C embed-bitcode=no`), and a non-LTO static library would leave all of `std` global, so that flavour
+keeps the rlib-based link instead.
+
+**Why that rlib-based link holds under GNU `ld`.** The `rust-native` driver references nothing in
+the shim rlib, and rustc places the Cranelift object (`-C link-arg`) after every rlib, so a
+positional linker sees the shim's archive before the only object that calls it. It still extracts
+the shim because rustc puts a synthetic `symbols.o` first on every executable link, with an
+undefined reference to each `#[no_mangle]` export of each statically linked upstream crate (the
+same mechanism that already pulled the runtime's kernels in when the shim was the main crate).
+Checked with GNU ld 2.43.1 (`--target x86_64-pc-windows-gnu`): the shape links and runs, and the
+same link line minus `symbols.o` fails with `undefined reference` to the shim and kernel symbols.
+
+**Key.** An entry's name is its flavour plus a 128-bit hash of its *key material*, which is stored in
+the entry (`material.txt`) and compared byte for byte on every hit: the format version, the host,
+the toolchain (`rustc -vV` — release, commit, host triple, LLVM; or `$CC` and its `--version` text),
+the runtime rlib's absolute path, length and modification time (not its content: hashing the
+80+ MB dev-profile rlib would cost a debug compiler about 0.3 s per link, more than half the link,
+while cargo writes a new file whenever the rlib changes), the hash of the shim (or C runtime) source,
+and the build recipe's arguments.
+
+**Location.** `WUKONG_CACHE_DIR` when set (an empty value disables the cache: the entry is built
+privately for the one link and removed), else `%LOCALAPPDATA%\wukong\cache` on Windows and
+`$XDG_CACHE_HOME/wukong` (absolute only) or `~/.cache/wukong` elsewhere; entries live in its
+`aot-runtime/` subdirectory. `wukongc --print=runtime-cache` prints that directory and
+`wukongc --clear-cache` removes the entries (only names the cache creates). The driver's own unit
+tests default to a temp-dir cache, and every `--emit=exe` the `wukongc` integration tests spawn sets
+`WUKONG_CACHE_DIR` under `CARGO_TARGET_TMPDIR`, so no test writes the user's cache.
+
+**Atomicity, concurrency, corruption.** An entry is built in a `.tmp-<key>-<pid>-…` directory beside
+the final one and published with one directory `rename`, so a reader sees a complete entry or none.
+Two processes that miss together both build; the first rename wins and the loser *adopts* the
+winner's entry (its own build is discarded). The `manifest` — written last — lists every file with
+its length and content hash and ends with an `end` line; a hit re-validates all of it (cheap: the
+shim rlib is ~140 KB, the release archive ~8 MB) plus the key material, so a truncated, edited or
+foreign entry is reported and rebuilt in place. A build that fails publishes nothing (no negative
+caching). At most 8 entries are kept; publishing evicts the least recently used beyond that (the
+manifest's mtime is the "last used" stamp) but never one used in the last ten minutes, and removes
+`.tmp-*` directories abandoned for an hour. Use and eviction are ordered so a concurrent link keeps
+its entry: a hit stamps the manifest *before* validating the entry (stamping after left the stamp
+stale for the whole validation, and a publish in another process could delete an entry a link had
+just validated); eviction re-reads a victim's stamp immediately before acting, keeps it if it was
+used since the plan was made, and renames it to `.tmp-evicted-*` before deleting it, so readers see
+an entry whole or not at all; and a link whose cached entry vanished anyway (that race, or a
+`--clear-cache`) obtains it again — rebuilding it — and links once more instead of failing.
+
+**Observing it.** `WUKONG_CACHE_TRACE=1` prints one `wukongc: runtime cache: …` line per decision
+(`miss`, `hit`, `invalid entry … (why); rebuilding it`, `built <key> in <ms> ms`, `published`,
+`adopted`, `not cached (why)`, `evicted`, `kept … (used since eviction began)`, `… vanished during
+the link`) on stderr, and `--time-passes` splits the old `link`
+stage into `runtime-cache` (rlib selection, `rustc -vV`, entry validation or build) and `link`.
+Debug-build indication on the development host (rustc 1.97.1, not a measurement): a dev-profile
+runtime links in ~0.5 s cold or warm (cold adds the ~0.2 s shim rlib build; there was never an LTO
+to save), while a release-profile runtime went from 35-40 s per link to one ~23-48 s archive build
+and then ~0.2-0.3 s per link.
 
 ### 128-bit integers on Cranelift (`int128.rs`)
 
@@ -3246,8 +3326,22 @@ measurement reports retain the corpus sizes used for those runs.
   neither does; a failure of the compiler's own link is reported with its captured stderr. **Run it under `--release` as well as the default profile** — the two profiles hand
   the linker archives of different shapes (see the bitcode/LTO paragraph in *Native backend* above), so
   a green debug run says nothing about release; `cargo test -p wukongc --release --test exe` is the only
-  gate that has ever exercised the release AOT link, and it is minutes of wall time because each fixture
-  is a full LTO of the runtime.
+  gate that has ever exercised the release AOT link. Every link the file spawns goes through one
+  runtime cache under `CARGO_TARGET_TMPDIR` (never the user's), so only the first builds the runtime
+  entry (in release, the one fat-LTO archive). The N51 tests give the cache its own empty directory
+  each: `runtime_cache_second_link_reuses_the_entry` (a miss that builds and publishes, then a `hit`
+  that builds nothing with identical executable behaviour, `--print=runtime-cache`, the key material
+  naming the toolchain and runtime, `--clear-cache` forcing a rebuild),
+  `runtime_cache_concurrent_links_into_an_empty_cache_both_succeed` (two compilers at once: both
+  link, one entry, no build directory left), `runtime_cache_rebuilds_a_corrupted_entry` (a truncated
+  artifact and a deleted manifest are each detected and rebuilt) and
+  `an_empty_cache_dir_disables_the_runtime_cache`; the key mechanism, eviction (including
+  `eviction_rechecks_the_stamp_before_removing_an_entry`, a hit landing between the eviction's plan
+  and its removal), the vanished-entry link retry and the in-process race are unit tests in
+  `aot_cache.rs`, and `aot_material_tests.rs` pins that the *production* key
+  builders (`aot_runtime_material`, `cc_runtime_material`) put every input into the key - the
+  toolchain text, the rlib's path, length and mtime, the shim or C runtime source hash and the
+  recipe - so dropping one from a builder fails a test instead of reusing a stale entry.
 - **Examples** (`crates/wukongc/tests/examples.rs`): every `examples/*.wk` program is an
   interpreter-vs-native differential fixture *and* carries a declared execution class (`Runs`,
   `NotLowered`, `NoEntry`, `DataGuarded`), because a program that fails to compile trivially satisfies
