@@ -232,6 +232,45 @@ fn a_product_addend_keeps_the_sources_rounding() {
     assert!(!casts.contains(&CastKind::SiToFp), "{casts:?}");
 }
 
+/// `@tile` on a `@parallel` `f32` reduction is `E0309`. The strip-miner lowers the fold body one
+/// statement at a time, in source order, so tiling used to turn the tree into a left fold: a
+/// scheduling hint changed the bits. The loop itself still takes the tree. A `@strict_fp` function
+/// (whose reductions fold in source order anyway) and a function without `@parallel` still tile.
+#[test]
+fn tile_on_a_parallel_reduction_is_refused() {
+    let lower_diags = |src: &str| {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        par_reduce::take_trace();
+        let (_, diags) = lower_program_with(&module, &sema, &mut interner, LowerOptions::default());
+        let errors: Vec<Option<&str>> = diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.code)
+            .collect();
+        (errors, par_reduce::take_trace())
+    };
+    let bodies = [
+        "for i in 0..n { s += x[i]; }",
+        "for i in 1..n { s = s + x[i] * y[i]; }",
+        "for i in 0..n { s = fmax(s, x[i]); }",
+    ];
+    for body in bodies {
+        let tiled = format!("@tile(64)\n    {body}");
+        let (errors, trace) = lower_diags(&par_fn("@parallel", &tiled));
+        assert_eq!(errors, [Some("E0309")], "{body}");
+        assert_eq!(trace.len(), 1, "{body}: the loop must still take the tree");
+        for attrs in ["@parallel\n@strict_fp", ""] {
+            let (errors, trace) = lower_diags(&par_fn(attrs, &tiled));
+            assert!(errors.is_empty(), "{attrs} {body}: {errors:?}");
+            assert!(trace.is_empty(), "{attrs} {body}: {trace:?}");
+        }
+    }
+}
+
 /// The chunk buffer is one chunk, or the whole trip when that is a smaller constant: an inner
 /// 64-element reduction must not carry a 32 KB frame.
 #[test]

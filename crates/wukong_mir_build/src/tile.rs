@@ -211,10 +211,7 @@ impl FnLowerer<'_> {
         pat: &Pattern,
         loop_span: Span,
     ) {
-        let span = stmt_attrs
-            .iter()
-            .find(|a| self.interner.resolve(a.name.sym) == "tile")
-            .map_or(loop_span, |a| a.span);
+        let span = self.tile_span(stmt_attrs, loop_span);
         // Two different rules reach this decline and they used to share one label, so a loop that
         // WAS written `for <i> in <start>..<end>` was told that only that form can be strip-mined.
         // Name the rule the loop actually broke.
@@ -226,6 +223,40 @@ impl FnLowerer<'_> {
         push_unique(
             &mut *self.diags,
             tile_error(span, "`@tile` cannot strip-mine this loop", label),
+        );
+    }
+
+    /// Where an `E0309` about this loop points: the statement's own `@tile`, or the loop itself when
+    /// the width came from the function item's queue.
+    fn tile_span(&self, stmt_attrs: &[Attr], loop_span: Span) -> Span {
+        stmt_attrs
+            .iter()
+            .find(|a| self.interner.resolve(a.name.sym) == "tile")
+            .map_or(loop_span, |a| a.span)
+    }
+
+    /// Report a `@tile` on a `@parallel` `f32` reduction loop (P13.7, `par_reduce.rs`). That loop's
+    /// value is the parallel reduction tree, whichever lowering computes it; the strip-miner lowers
+    /// the fold body statement by statement, which is the source's left fold. Tiling it would change
+    /// the result bits, not just the schedule, and `@parallel` and `@strict_fp` are the only switches
+    /// that choose a reduction's order. So the width has nowhere to go: `E0309`, nothing consumed,
+    /// exactly as for a loop form the strip-miner cannot take.
+    pub(super) fn tile_on_parallel_reduction(&mut self, stmt_attrs: &[Attr], loop_span: Span) {
+        let span = self.tile_span(stmt_attrs, loop_span);
+        push_unique(
+            &mut *self.diags,
+            Diagnostic::error("`@tile` cannot strip-mine this loop".to_string())
+                .with_code("E0309")
+                .primary(
+                    span,
+                    "a `@parallel` `f32` reduction folds by the parallel reduction tree; strip-mining \
+                     would fold it in source order",
+                )
+                .help(
+                    "drop the `@tile` (the tree already walks the loop in fixed 8,192-element \
+                     chunks), or mark the function `@strict_fp`, whose reductions fold in source \
+                     order and can be strip-mined",
+                ),
         );
     }
 

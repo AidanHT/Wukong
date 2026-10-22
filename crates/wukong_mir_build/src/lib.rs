@@ -14428,6 +14428,13 @@ impl FnLowerer<'_> {
         // the wrong tile. A width with nowhere to go is `E0309` and stays at the head of the queue.
         if self.tile_requested(stmt_attrs) {
             match tile::tileable_range(pat, iter) {
+                // A `@parallel` `f32` reduction's value is the parallel reduction tree (P13.7), and
+                // the strip-miner folds its body in source order, so the two do not compose: the
+                // width is reported and left where it is (`E0309`), and the loop lowers below as
+                // it would without `@tile`.
+                Some(_) if self.is_parallel_tree_reduction(pat, iter, body) => {
+                    self.tile_on_parallel_reduction(stmt_attrs, pat.span);
+                }
                 Some((start, end)) => {
                     if let Some(tile) = self.take_tile_size(stmt_attrs) {
                         if self.lower_tiled_range_for(label, pat, start, end, body, tile) {

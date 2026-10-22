@@ -39,6 +39,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   its half type first, as the source does. A narrow-integer addend (`i8`/`u8`/`i16`/`u16`, which sema
   promotes into the `f32` fold exactly) takes the tree too, converted with its own signedness,
   instead of the source's left fold.
+- **Changed: `@tile` on a `@parallel` `f32` reduction loop is `E0309`.** The strip-miner runs
+  before every reduction lowering and lowers the fold body one statement at a time, so
+  `@tile(64) for i in 0..n { s += x[i]; }` folded in source order: 3700.2056 on the data of
+  `parallel_reduce_order.wk`, where the same loop without `@tile` gives the tree's 3704.34375. A
+  scheduling hint changed the bits. The width is now refused (not consumed), the loop keeps the
+  tree, and `@strict_fp` — whose reductions fold in source order — keeps such a loop tileable
+  (`tests/fail/tile_on_parallel_reduction.wk`; `--explain E0309` lists the case).
 - **Fixed: a reduction kernel no longer fires on a range whose end reads the accumulator**
   (`for k in 0..(s as i64) { s += x[k] }`): the source re-evaluates the end every iteration, the kernel
   read it once.

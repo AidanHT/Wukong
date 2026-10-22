@@ -1646,7 +1646,7 @@ cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`
 (`'outer: for i in 0..n` is strip-mined and keeps its label). Fixture:
 `tests/run/lang_tile_saxpy.wk` (`@tile(2)`, `n=5`, remainder lane prints 3).
 
-**A `@tile` that cannot be applied is `E0309`, not silence.** Four conditions reach it:
+**A `@tile` that cannot be applied is `E0309`, not silence.** Five conditions reach it:
 
 - the **loop form** — anything other than one identifier over an exclusive, step-less range with a
   known end. `for i in 0..=n`, a stepped range, an open range and `for x in xs` cannot be strip-mined
@@ -1665,7 +1665,13 @@ cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`
   whole-function `@parallel` outliner rewrites the loop into runtime chunks
   (`tests/fail/tile_on_parallel_fn.wk`). Both build their lowerer with no tile queue, so `@generic`
   — which keeps the loops — is what makes `@tile` apply. Composing `@parallel` with `@tile` means
-  writing the nest yourself, as `tests/run/lang_tiled_transpose.wk` does.
+  writing the nest yourself, as `tests/run/lang_tiled_transpose.wk` does;
+- a **`@parallel` `f32` reduction** — its value is the parallel reduction tree (see *Reduction
+  order* under [Floating-point semantics](#floating-point-semantics-)), and a strip-mined body folds
+  one statement at a time, in source order, so the width would change the result, not the
+  schedule. Drop the `@tile` (the tree already works in fixed 8,192-element chunks), or mark the
+  function `@strict_fp`, whose reductions fold in source order and can be strip-mined
+  (`tests/fail/tile_on_parallel_reduction.wk`).
 
 A refused width is **not** consumed, so the function-item queue does not shift: it stays at the head
 for the next loop that can take it. Before `E0309`, an unsupported first loop discarded its width

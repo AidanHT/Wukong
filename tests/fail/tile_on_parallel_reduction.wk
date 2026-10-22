@@ -1,0 +1,37 @@
+// EXPECT-CODE: E0309
+// EXPECT-COUNT: 1
+module tests.fail.tile_on_parallel_reduction
+
+// In a `@parallel` function an `f32` reduction loop has ONE value, the parallel reduction tree
+// (tests/run/parallel_reduce_order.wk), and only `@parallel` and `@strict_fp` choose a reduction's
+// order. `@tile` used to strip-mine this loop before the reduction lowering ever saw it, lowering the
+// fold one statement at a time — the source's left fold. On the 20000 cancelling values of
+// parallel_reduce_order.wk that printed 3700.2056 where the same loop without `@tile` prints
+// 3704.34375: a scheduling hint changed the result bits. The two do not compose, so the width has
+// nowhere to go. `@strict_fp` makes the loop tileable again (its reductions fold in source order).
+
+@parallel
+fn total(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    @tile(64) //~ E0309
+    for i in 0..n {
+        s += x[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let n: i64 = 256;
+    let mut x: []f32 = alloc_f32(n);
+    let mut i: i64 = 0;
+    while i < n {
+        x[i] = 1.0;
+        i = i + 1;
+    }
+    let t: f32 = total(x, n);
+    free(x);
+    if t > 0.0 {
+        return 0;
+    }
+    return 1;
+}

@@ -372,6 +372,18 @@ impl FnLowerer<'_> {
         })
     }
 
+    /// Is this loop a `@parallel` `f32` reduction whose value is the parallel tree — whether a
+    /// kernel arm or this module's fallback ends up lowering it? Pure. `@tile` asks it before
+    /// strip-mining, because a strip-mined body folds statement by statement, in source order.
+    pub(super) fn is_parallel_tree_reduction(
+        &self,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+    ) -> bool {
+        self.gemm.par_reduce && self.tree_plan(pat, iter, body).is_some()
+    }
+
     /// Lower a `@parallel` `f32` reduction loop that no kernel took through the chunk-buffer
     /// fallback (see the module docs). Returns false, having emitted nothing, when this is not a
     /// fast-mode `@parallel` function or the loop is not such a reduction.
