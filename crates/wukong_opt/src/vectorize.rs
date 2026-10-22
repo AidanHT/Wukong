@@ -116,10 +116,11 @@
 //! Every half cast but a bitcast is lane-wise ([`cast_route`]) in the scalar cast's own steps: the
 //! grid-rounding casts between `f32`, bf16 and f16 directly, a cast through `f64` as that rounding
 //! plus the `f32 <-> f64` widen or narrow, and a cast to or from an integer as the `f32` one (the
-//! scalar cast rounds nothing at the half grid there). Half interleave groups widen like 32-bit
-//! ones: their loads and stores round where the scalar ones do, and the shuffles between them move
-//! `f32` lanes. Reductions with a half accumulator (it rounds inside its own recurrence) stay
-//! scalar.
+//! scalar `sitofp`/`fptosi` rounds nothing at the half grid; `mir_build` rounds an integer
+//! converted to a half type with the `fptrunc` it places after it, which widens like any other).
+//! Half interleave groups widen like 32-bit ones: their loads and stores round where the scalar
+//! ones do, and the shuffles between them move `f32` lanes. Reductions with a half accumulator (it
+//! rounds inside its own recurrence) stay scalar.
 //!
 //! # Reading `WUKONG_VEC_TRACE=1`
 //!
@@ -4266,9 +4267,10 @@ fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute>
     // Through `f64` the cast is that rounding and the `f32 <-> f64` lane-count change, in the
     // scalar cast's order (`HalfToF64`, `F64ToHalf`). To and from an integer, a half lane converts
     // exactly as an `f32` lane does — the scalar cast rounds nothing at the half grid there (an
-    // integer becomes an `f32` and is rounded only when stored or cast again; a half value is
-    // truncated from its `f32` register) — so the `f32` route serves, with the half lane type at the
-    // half end. A bitcast has no lane-wise form and is replicated.
+    // integer becomes an `f32`, and `mir_build` rounds it to the half grid with the same-type
+    // `fptrunc` it places right after the conversion, which takes the rounding route above; a half
+    // value is truncated from its `f32` register) — so the `f32` route serves, with the half lane
+    // type at the half end. A bitcast has no lane-wise form and is replicated.
     if is_half(from) || is_half(to) {
         let float32 = |t: &MirType| *t == MirType::F32 || is_half(t);
         let as_f32 = |t: &MirType| {

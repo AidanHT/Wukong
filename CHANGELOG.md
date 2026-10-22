@@ -182,24 +182,24 @@ All notable changes to Wukong are documented here. The format is loosely based o
   bit-identical to the scalar shims on every input class — on an F16C host the `half` crate *is*
   those instructions — and the AVX2 tests check the machine code against the shims and the recipe's
   reference evaluator on every f16 encoding and the dense `f32` cover. The kernel needs F16C beside
-  AVX2+FMA (`wukong_mir::host_supports_f16c_kernels`); an f16 invariant that may lie off the f16
-  grid (a parameter: an integer converted to f16 is not rounded until it is stored) keeps the
-  128-bit loop. The interpreter marshals f16 streams like any other, its evaluator rounding where
-  the instructions do; the LLVM emitter lowers the three ops through `half`. The evaluator's
-  rounding is the `half` crate's software routine transcribed in `wukong_mir::f16_bits`, tested bit
-  for bit against `half` (a dev-dependency), so `wukong_mir` still depends on `wukong_span` and
-  `wukong_types` only, which a test now pins.
-  `tests/run/vec256_f16_lanes.wk` runs five f16 kernels over 2048 lanes each and prints every
-  lane's bits (hand-derived). Census: `vec256_f16_lanes`, `vec_f16_lanes` (a runtime trip) and
-  `cov4_par_lowp_dot` gain kernels; nothing is lost.
+  AVX2+FMA (`wukong_mir::host_supports_f16c_kernels`); an f16 invariant the loop cannot show is on
+  the f16 grid (a parameter, a carried value, a bare `sitofp` result) keeps the 128-bit loop. The
+  interpreter marshals f16 streams like any other, its evaluator rounding where the instructions do;
+  the LLVM emitter lowers the three ops through `half`. The evaluator's rounding is the `half`
+  crate's software routine transcribed in `wukong_mir::f16_bits`, tested bit for bit against `half`
+  (a dev-dependency), so `wukong_mir` still depends on `wukong_span` and `wukong_types` only, which
+  a test now pins. `tests/run/vec256_f16_lanes.wk` runs five f16 kernels over 2048 lanes each and
+  prints every lane's bits (hand-derived). Census: `vec256_f16_lanes`, `vec_f16_lanes` (a runtime
+  trip) and `cov4_par_lowp_dot` gain kernels; nothing is lost.
 - **Half casts through `f64` and integers, and half interleave groups, vectorize.** A bf16 or f16
   cast through `f64` or to or from an integer used to run lane by lane (extract, scalar cast,
   insert), and a bf16/f16 interleave group (`o[2i]`, `o[2i + 1]`) declined the loop. The casts now
-  convert lane-wise in the scalar cast's own steps — the half-grid rounding, then the
-  `f32 <-> f64` widen or narrow; or the `f32` integer route, since an integer-to-half cast rounds
-  only when stored — and the groups widen like 32-bit ones. `tests/run/vec_half_casts.wk` (ten
-  casts and a complex multiply in each half type; every lane's bits, hand-derived; interp and native
-  at `-O0` and `-O2`). No corpus program's `-O2` MIR changes but the new fixture's.
+  convert lane-wise in the scalar cast's own steps — the half-grid rounding, then the `f32 <-> f64`
+  widen or narrow; or the `f32` integer route, since `sitofp` itself rounds nothing at the half grid
+  and the rounding `fptrunc` `mir_build` places after an integer-to-half conversion widens on its
+  own — and the groups widen like 32-bit ones. `tests/run/vec_half_casts.wk` (ten casts and a
+  complex multiply in each half type; every lane's bits, hand-derived; interp and native at `-O0`
+  and `-O2`). No corpus program's `-O2` MIR changes but the new fixture's.
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

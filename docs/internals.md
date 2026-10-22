@@ -1151,8 +1151,9 @@ lane-wise round to the source grid (an `fpext .. to <4 x f32>`) and then the `f3
 (`CastRoute::HalfToF64`); `fptrunc` from `f64` into a half type is the `f64 -> f32` narrow and then
 the round to the target grid (`CastRoute::F64ToHalf`) — the scalar cast demotes, then rounds; and a
 cast between a half type and an integer is the `f32` route with the half lane type at the half end,
-because the scalar cast rounds nothing at the half grid there (`i as f16` is an `f32` conversion,
-rounded to the half grid only when stored or cast again, so `i32 -> bf16` rounds twice; `x as i32`
+because the scalar cast rounds nothing at the half grid there (`sitofp .. to f16` is an `f32`
+conversion, and `mir_build` rounds `i as f16` at the value with the same-type `fptrunc` it places
+right after it, which widens as the rounding cast above, so `i32 -> bf16` rounds twice; `x as i32`
 truncates the `f32` register), and so does every backend's vector `sitofp`/`fptosi` on an `f32x4`
 register. A bf16 or f16 **interleave group** (`o[2i]`, `o[2i + 1]`: a complex multiply over
 interleaved parts) widens like a 32-bit one: the group's contiguous `<4 x half>` loads and stores

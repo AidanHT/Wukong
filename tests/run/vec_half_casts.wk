@@ -21,12 +21,12 @@ module tests.run.vec_half_casts
 // bf16/f16 casts through f64 and to and from integers, and bf16/f16 interleave groups, widened by
 // the general vectorizer (-O2) with no lane replicated: a half lane is an f32 lane, so a cast
 // through f64 is the half grid rounding plus the f32 <-> f64 widen or narrow (in the scalar cast's
-// order), a cast to or from an integer is the f32 one (the scalar cast rounds nothing at the half
-// grid there: an integer becomes an f32 and is rounded to the half grid when stored, so i32 -> bf16
-// rounds twice), and a stride-2 group is split and merged by lane shuffles. n = 21: five groups of
-// four lanes and one scalar lane, except where a narrower lane sets the group (sixteen lanes and
-// five scalar ones for the u8 loop, eight and five for the i16 one). Every lane is printed, floats
-// as raw bits.
+// order), a cast to or from an integer is the f32 one (the sitofp rounds nothing at the half grid:
+// an integer becomes an f32 and the fptrunc mir_build places after it rounds it to the half grid,
+// so i32 -> bf16 rounds twice), and a stride-2 group is split and merged by lane shuffles. n = 21:
+// five groups of four lanes and one scalar lane, except where a narrower lane sets the group
+// (sixteen lanes and five scalar ones for the u8 loop, eight and five for the i16 one). Every lane
+// is printed, floats as raw bits.
 //
 // Each kernel calls itself when `z > 0` (never, here), so the inliner keeps it out of `main` and
 // its trip a runtime value.
