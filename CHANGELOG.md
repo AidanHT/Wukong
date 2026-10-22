@@ -200,6 +200,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   own — and the groups widen like 32-bit ones. `tests/run/vec_half_casts.wk` (ten casts and a
   complex multiply in each half type; every lane's bits, hand-derived; interp and native at `-O0`
   and `-O2`). No corpus program's `-O2` MIR changes but the new fixture's.
+
 ### Stack-slot coloring ends lifetimes at full overwrites (`gap7/slot-coloring-2`, N86)
 
 - **Scratch zeroed at the top of a kernel and filled for real later no longer stays live from the
