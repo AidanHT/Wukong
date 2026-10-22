@@ -879,14 +879,20 @@ fn runtime_cache_second_link_reuses_the_entry() {
                 entries[0].starts_with("rust-native-") || entries[0].starts_with("rust-lto-"),
                 "{entries:?}"
             );
-            // The key names the toolchain (`rustc -vV`) and the runtime rlib it was built from.
+            // The key names the toolchain (`rustc -vV`), the runtime rlib it was built from, the
+            // shim source and the build recipe (each pinned against the production builder in
+            // `wukong_driver`'s `aot_material_tests`).
             assert!(material.contains("\nrustc release: "), "{material}");
             assert!(material.contains("\nruntime "), "{material}");
             assert!(material.contains("libwukong_runtime"), "{material}");
+            assert!(material.contains("\nshim "), "{material}");
+            assert!(material.contains("\nrecipe "), "{material}");
         }
         LinkPath::CcFallback(_) => {
             assert!(entries[0].starts_with("cc-"), "{entries:?}");
             assert!(material.contains("\ncc-version "), "{material}");
+            assert!(material.contains("\nsource "), "{material}");
+            assert!(material.contains("\nrecipe "), "{material}");
         }
         LinkPath::None => unreachable!(),
     }

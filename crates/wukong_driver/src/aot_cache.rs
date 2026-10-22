@@ -887,6 +887,8 @@ mod tests {
         assert_eq!(base.len(), 32);
     }
 
+    /// The key MECHANISM (`Material` + `key_of`) over hand-written lines. That the production
+    /// builders put every input into those lines is `crate::aot_material_tests`.
     #[test]
     fn keys_differ_whenever_an_input_differs() {
         let material = |flavor, rustc: &str, rlib: &str, shim: &str, recipe: &str| {

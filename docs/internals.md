@@ -3187,8 +3187,11 @@ measurement reports retain the corpus sizes used for those runs.
   `runtime_cache_concurrent_links_into_an_empty_cache_both_succeed` (two compilers at once: both
   link, one entry, no build directory left), `runtime_cache_rebuilds_a_corrupted_entry` (a truncated
   artifact and a deleted manifest are each detected and rebuilt) and
-  `an_empty_cache_dir_disables_the_runtime_cache`; the key's sensitivity to each input, eviction and
-  the in-process race are unit tests in `aot_cache.rs`.
+  `an_empty_cache_dir_disables_the_runtime_cache`; the key mechanism, eviction and the in-process
+  race are unit tests in `aot_cache.rs`, and `aot_material_tests.rs` pins that the *production* key
+  builders (`aot_runtime_material`, `cc_runtime_material`) put every input into the key - the
+  toolchain text, the rlib's path, length and mtime, the shim or C runtime source hash and the
+  recipe - so dropping one from a builder fails a test instead of reusing a stale entry.
 - **Examples** (`crates/wukongc/tests/examples.rs`): every `examples/*.wk` program is an
   interpreter-vs-native differential fixture *and* carries a declared execution class (`Runs`,
   `NotLowered`, `NoEntry`, `DataGuarded`), because a program that fails to compile trivially satisfies

@@ -2211,19 +2211,7 @@ fn cc_link(
         Err(_) => return cc_unavailable(&cc, stem, obj_path),
     };
     let source = c_runtime_source();
-    let recipe =
-        cc_runtime_compile_args(Path::new(CC_RUNTIME_SOURCE), Path::new(CC_RUNTIME_OBJECT))
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-    let mut material = aot_cache::Material::new(aot_cache::Flavor::Cc);
-    material
-        .line("cc", &cc)
-        .line("cc-version", &version)
-        .line("source", &aot_cache::hash_bytes(source.as_bytes()))
-        .line("recipe", &recipe);
-    let material = material.finish();
+    let material = cc_runtime_material(&cc, &version, &source);
     let mut build = |dir: &Path, _cached: bool| -> std::io::Result<aot_cache::Built> {
         let src = dir.join(CC_RUNTIME_SOURCE);
         if let Err(e) = std::fs::write(&src, &source) {
@@ -2296,6 +2284,25 @@ fn cc_link(
 /// The C runtime's file names inside its cache entry.
 const CC_RUNTIME_SOURCE: &str = "wukong_rt.c";
 const CC_RUNTIME_OBJECT: &str = "wukong_rt.o";
+
+/// The key material of the `cc` fallback's runtime entry: the compiler as named (`$CC` or `cc`),
+/// its `--version` text, the hash of the generated C runtime `source` and the compile recipe
+/// ([`cc_runtime_compile_args`]). `aot_material_tests` pins that each of them is in the key.
+fn cc_runtime_material(cc: &str, cc_version: &str, source: &str) -> String {
+    let recipe =
+        cc_runtime_compile_args(Path::new(CC_RUNTIME_SOURCE), Path::new(CC_RUNTIME_OBJECT))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+    let mut material = aot_cache::Material::new(aot_cache::Flavor::Cc);
+    material
+        .line("cc", cc)
+        .line("cc-version", cc_version)
+        .line("source", &aot_cache::hash_bytes(source.as_bytes()))
+        .line("recipe", &recipe);
+    material.finish()
+}
 
 /// How the cached C runtime object is compiled (in the entry's directory). The flags are the ones
 /// the one-step `cc <object> <runtime.c>` link compiled it with — `-O2`, `-ffp-contract=off` (no
@@ -2843,7 +2850,8 @@ fn aot_driver_source(flavor: aot_cache::Flavor) -> &'static str {
 
 /// The key material of the rustc-built runtime entry for `rlib`: the toolchain (`rustc -vV`, which
 /// names the release, commit, host triple and LLVM version), the runtime rlib's identity
-/// ([`aot_cache::file_identity`]), the shim source and the build recipe.
+/// ([`aot_cache::file_identity`]), the shim source and the build recipe. `aot_material_tests`
+/// pins that each of them is in the key.
 fn aot_runtime_material(
     flavor: aot_cache::Flavor,
     rustc_version: &str,
@@ -5523,6 +5531,9 @@ mod region_grad_tests;
 
 #[cfg(test)]
 mod cc_print_tests;
+
+#[cfg(test)]
+mod aot_material_tests;
 
 #[cfg(test)]
 mod native_link_tests {
