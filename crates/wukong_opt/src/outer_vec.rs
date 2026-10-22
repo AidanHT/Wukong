@@ -260,9 +260,7 @@ pub(super) fn plan(
         }
     }
     for (k, p) in inner_params.iter().enumerate() {
-        if carried_vec[k]
-            && (lane_bytes(f.value_type(*p)).is_none() || *f.value_type(*p) == MirType::BF16)
-        {
+        if carried_vec[k] && (lane_bytes(f.value_type(*p)).is_none() || is_half(f.value_type(*p))) {
             return Err("a row-varying inner value has no vector lane type");
         }
     }
@@ -566,10 +564,10 @@ fn classify_inst(
     };
     let vary_ty = |w: &mut Walk, t: &MirType| -> Result<(), &'static str> {
         lane_bytes(t).ok_or("a row-varying value has no vector lane type")?;
-        // A bf16 value rounds to its grid at every cast, inside a row's recurrence too; the
-        // inner path keeps such an accumulate scalar, and so does this one.
-        if *t == MirType::BF16 {
-            return Err("a row-varying bf16 value");
+        // A bf16 or f16 value rounds to its grid at every cast, inside a row's recurrence too;
+        // the inner path keeps such an accumulate scalar, and so does this one.
+        if is_half(t) {
+            return Err("a row-varying half-precision value");
         }
         w.vec_tys.push(t.clone());
         Ok(())

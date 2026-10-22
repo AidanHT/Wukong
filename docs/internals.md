@@ -1140,7 +1140,9 @@ row's own element, in objects provably apart from everything else (the same elem
 row excepted); a slice data pointer `licm` hoisted under a first-iteration guard
 (`select(c, hdr, dummy)`) is read as `hdr`'s. Taken only when the inner loop carries a strict-order
 reduction, or a recurrence over rows a group can load as whole vectors (over gathered rows,
-`unroll_jam` already runs four scalar chains). `WUKONG_NO_OUTER_VEC` turns it off.
+`unroll_jam` already runs four scalar chains). A row-varying `bf16` or `f16` value declines: it
+rounds to its grid inside each row's chain, which the inner path's half accumulates also keep
+scalar. `WUKONG_NO_OUTER_VEC` turns the outer path off.
 
 **Countdowns** (`VecPlan::dir`): `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1
 }` widen with the group walking down. Lane `k` is still the group's `k`-th iteration (counter

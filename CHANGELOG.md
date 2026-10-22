@@ -49,12 +49,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the original nest. A recurrence over row-major (gathered) rows stays with unroll-and-jam.
   `WUKONG_NO_OUTER_VEC` turns it off.
 - **Still scalar:** a predicated or checked scatter, a lane test inside a lane-serial region or
-  after a store, an if-converted body or a call inside the outer path, an `i32` outer counter
-  indexing through a widening cast, a lane-serial region in a search loop, and one that contains
-  or spans an if-converted step (a listed access the if-conversion predicated or merged, such as a
-  scatter in an `if` arm, or any masked, merged or predicated step between the first and the last
-  listed access; an if-converted step outside that span widens beside the region); no AVX2 gather
-  or scatter is emitted (every per-lane access is a scalar load or store).
+  after a store, an if-converted body, a call or a row-varying `bf16`/`f16` value inside the outer
+  path, an `i32` outer counter indexing through a widening cast, a lane-serial region in a search
+  loop, and one that contains or spans an if-converted step (a listed access the if-conversion
+  predicated or merged, such as a scatter in an `if` arm, or any masked, merged or predicated step
+  between the first and the last listed access; an if-converted step outside that span widens
+  beside the region); no AVX2 gather or scatter is emitted (every per-lane access is a scalar load
+  or store).
   None of these forms has been timed: each is a rule, not a measured win.
 
 ### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)

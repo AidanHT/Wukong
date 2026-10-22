@@ -11761,4 +11761,30 @@ mod tests {
             "an integer row sum took the outer path"
         );
     }
+
+    /// A half-precision row recurrence rounds to its grid inside every row's chain (`mir_build`
+    /// places an `fptrunc` after each half operation). The inner path keeps such an accumulate
+    /// scalar, and so does the outer one, for `f16` exactly as for `bf16`: `f16` became a vector
+    /// lane type with `gap7/f16-vec`, after the outer path's `bf16` rule was written. The shape is
+    /// the column-major recurrence that widens across its rows in `f32`.
+    #[test]
+    fn a_half_precision_row_recurrence_stays_off_the_outer_path() {
+        for half in ["f16", "bf16"] {
+            let src = format!(
+                "@unchecked fn k(a: []{half}, x: []{half}, @noalias mut y: []{half}, rows: i64, \
+                 cols: i64, z: i64) {{ if z > 0 {{ again(z - 1); return; }} \
+                 let t: {half} = 0.75 as {half}; let mut r: i64 = 0; \
+                 while r < rows {{ let mut h: {half} = x[0]; let mut c: i64 = 0; \
+                   while c < cols {{ h = h * t + a[c * rows + r]; c = c + 1; }} \
+                   y[r] = h; r = r + 1; }} }} \
+                 fn again(z: i64) {{ let mut t: []{half} = alloc_{half}(1); \
+                   let mut u: []{half} = alloc_{half}(1); k(t, t, u, 1, 1, z); }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            assert!(
+                !outer_widened(&src, "k"),
+                "a {half} row recurrence took the outer path"
+            );
+        }
+    }
 }
