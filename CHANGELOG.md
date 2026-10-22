@@ -68,6 +68,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the
   address of a higher-order function had no compiled instance) and resolved its name in the scope
   of each use. `tests/fail/fn_value_const.wk`.
+- The `E0429` explanation (`--explain`) now covers a function with a run-time-extent (`?`) tensor
+  parameter, which it already refused.
 - **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
   value; a closure that captures still has no run-time value (no heap environment).
 

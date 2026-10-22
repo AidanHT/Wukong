@@ -814,10 +814,12 @@ fn main() -> i32 {
          (with type or dimension parameters) has no single address: it is compiled once per \
          instantiation, chosen at each call from the arguments. An `extern` function, or one \
          declared without a body, belongs to C, which the interpreter cannot call through a \
-         pointer. Neither can be stored, returned or passed as a value (a generic function is \
-         also refused as the argument of a function-typed parameter). Wrap it in a non-generic \
-         function of the concrete type (`fn id_i32(x: i32) -> i32 { return id(x); }`) and use \
-         that.",
+         pointer. A function with a tensor parameter of run-time extent (`Tensor[f32, ?]`) \
+         receives each such extent as a hidden argument that a direct call reads off the tensor \
+         it passes, which a call through a pointer cannot pass. None of these can be stored, \
+         returned or passed as a value (a generic function is also refused as the argument of a \
+         function-typed parameter). Wrap it in a function of a concrete, fixed-extent signature \
+         (`fn id_i32(x: i32) -> i32 { return id(x); }`) and use that.",
         bad: "module ex.e0429\nfn id<T>(x: T) -> T {\n    return x;\n}\nfn main() -> i32 {\n    let f: fn(i32) -> i32 = id;\n    return f(1);\n}\n",
         good: "module ex.e0429\nfn id<T>(x: T) -> T {\n    return x;\n}\nfn id_i32(x: i32) -> i32 {\n    return id(x);\n}\nfn main() -> i32 {\n    let f: fn(i32) -> i32 = id_i32;\n    return f(1);\n}\n"
     ),
