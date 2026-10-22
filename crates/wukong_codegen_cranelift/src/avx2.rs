@@ -22,6 +22,13 @@
 //! the complement of `==`, `>` and `<` and the consuming blend swaps its operands instead of spending a
 //! register on a `not`.
 //!
+//! An `f32` kernel may also hold **f16 streams**: two-byte elements a `LoadF16` widens with F16C's
+//! `vcvtph2ps` (eight halves, one `xmmword`, at half the `f32` stride) and a `StoreF16` narrows with
+//! `vcvtps2ph` under imm8 0 (round to nearest even, `MXCSR` not consulted); a `RoundF16` does both
+//! through its result register. These are exactly the conversions the scalar path's runtime shims
+//! perform (the `half` crate is these instructions on an F16C host), checked on every f16 encoding
+//! and a dense `f32` cover (`avx2_f16_tests`). An f16 stream never takes the non-temporal store.
+//!
 //! ABI of an assembled kernel: `fn(ptrs: *const *mut u8, scalars: *const T, n: u64)`, returning
 //! nothing for an elementwise body and the horizontal fold of lane type `T` (XMM0 for a float lane,
 //! RAX/EAX for an integer one) for a reduction — the Cranelift side declares the signatures
@@ -130,6 +137,25 @@ fn cmp_imm(p: VecCmp) -> u32 {
         VecCmp::Ne => 0x04, // NEQ_UQ (unordered ⇒ true on NaN, matching Rust `!=`)
         VecCmp::Ge => 0x0d, // GE_OS
         VecCmp::Gt => 0x0e, // GT_OS
+    }
+}
+
+/// `vcvtps2ph`'s imm8 for round to nearest, ties to even: bits 1:0 = 00 (nearest) with bit 2 clear,
+/// so the immediate, not `MXCSR.RC`, picks the mode — the `half` crate's (and the scalar shims')
+/// rounding whatever the caller left in MXCSR.
+const F16_RNE: u32 = 0;
+
+/// The bytes one element of stream `s` occupies: two for an f16 stream (`LoadF16`/`StoreF16`), the
+/// lane's width otherwise.
+fn stream_bytes(k: &VecKernel, s: u32) -> u32 {
+    let f16 = k
+        .ops
+        .iter()
+        .any(|o| o.is_f16() && (o.loaded_stream() == Some(s) || o.stored_stream() == Some(s)));
+    if f16 {
+        2
+    } else {
+        k.lane.bytes()
     }
 }
 
@@ -250,15 +276,14 @@ fn plan_registers(k: &VecKernel) -> Result<Plan, String> {
     let nt_streams: Vec<u32> = if is_reduction || std::env::var_os("WUKONG_P4_NO_NT").is_some() {
         Vec::new()
     } else {
+        // An f16 stream never qualifies: its store converts (`vcvtps2ph`), which has no
+        // non-temporal form, and it is never a `Store` (one element width per stream).
         (0..k.streams)
             .filter(|&s| {
                 k.ops
                     .iter()
                     .any(|o| matches!(*o, VecOp::Store { stream, .. } if stream == s))
-                    && !k
-                        .ops
-                        .iter()
-                        .any(|o| matches!(*o, VecOp::Load { stream } if stream == s))
+                    && !k.ops.iter().any(|o| o.loaded_stream() == Some(s))
             })
             .collect()
     };
@@ -298,6 +323,10 @@ pub(crate) fn assemble_kernel_with_nt_threshold(
         return Err(
             "avx2: host lacks AVX2+FMA3 under the Win64 ABI these kernels encode".to_string(),
         );
+    }
+    // The f16 operations are F16C encodings (`vcvtph2ps`/`vcvtps2ph`), a CPUID bit of their own.
+    if k.uses_f16() && !wukong_mir::host_supports_f16c_kernels() {
+        return Err("avx2: host lacks the F16C conversions this kernel's f16 streams need".into());
     }
     let plan = plan_registers(k)?;
     emit(k, &plan, nt_min_bytes).map_err(|e| format!("avx2 encode: {e}"))
@@ -390,7 +419,7 @@ fn emit(k: &VecKernel, plan: &Plan, nt_min_bytes: u64) -> Result<Vec<u8>, IcedEr
     let mut finish = a.create_label();
     if !plan.nt_streams.is_empty() {
         let mut cached = a.create_label();
-        let traffic_per_elem = k.streams as u64 * lane.bytes() as u64;
+        let traffic_per_elem: u64 = (0..k.streams).map(|s| u64::from(stream_bytes(k, s))).sum();
         let nt_min_elems = nt_min_bytes
             .div_ceil(traffic_per_elem)
             .clamp(1, i32::MAX as u64) as i32;
@@ -544,8 +573,10 @@ fn emit_group(
     let bank_base = bank as u8 * plan.per_group;
     let mut free: Vec<u8> = (0..plan.per_group).map(|r| bank_base + r).collect();
     let mut vreg: Vec<Option<u8>> = vec![None; k.ops.len()];
-    // The element of stream `s` this group touches.
+    // The element of stream `s` this group touches. An f16 stream's elements are two bytes, so its
+    // group is half as far along and half as wide (eight halves, one `xmmword`).
     let at = |s: u32| ymmword_ptr(base_gpr(s) + rcx * scale + disp);
+    let at_f16 = |s: u32| xmmword_ptr(base_gpr(s) + rcx * 2 + disp / 2);
 
     // The register currently holding value `v` (a hoisted scalar resolves to its fixed register).
     let reg_of = |vreg: &[Option<u8>], v: u32| -> u8 {
@@ -583,6 +614,14 @@ fn emit_group(
             let rv = reg_of(&vreg, val);
             let streaming = nt && plan.nt_streams.contains(&stream);
             emit_store(a, lane, at(stream), rv, streaming)?;
+            free_after(&mut free, &mut vreg, i, val);
+            continue;
+        }
+        // Eight lanes rounded to the nearest f16, ties to even (imm8 0: round to nearest, and bit 2
+        // clear so MXCSR's mode is not consulted), stored as 16 bytes.
+        if let VecOp::StoreF16 { stream, val } = *op {
+            let rv = reg_of(&vreg, val);
+            a.vcvtps2ph(at_f16(stream), ymm(rv), F16_RNE)?;
             free_after(&mut free, &mut vreg, i, val);
             continue;
         }
@@ -695,7 +734,25 @@ fn emit_group(
                 free_after(&mut free, &mut vreg, i, x);
                 free_after(&mut free, &mut vreg, i, y);
             }
-            VecOp::Store { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => unreachable!(),
+            // Eight f16 elements widened exactly (a NaN keeps its payload, quieted).
+            VecOp::LoadF16 { stream } => {
+                let d = free.pop().expect("free reg");
+                a.vcvtph2ps(ymm(d), at_f16(stream))?;
+                vreg[i] = Some(d);
+            }
+            // Round to the f16 grid through the low half of the result register, then widen back.
+            VecOp::RoundF16 { a: x } => {
+                let rx = reg_of(&vreg, x);
+                let d = free.pop().expect("free reg");
+                a.vcvtps2ph(xmm(d), ymm(rx), F16_RNE)?;
+                a.vcvtph2ps(ymm(d), xmm(d))?;
+                vreg[i] = Some(d);
+                free_after(&mut free, &mut vreg, i, x);
+            }
+            VecOp::Store { .. }
+            | VecOp::StoreF16 { .. }
+            | VecOp::Splat { .. }
+            | VecOp::Const { .. } => unreachable!(),
         }
     }
     // A reduction folds this group's addend into this copy's accumulator. A fused product folds in one

@@ -1112,14 +1112,57 @@ rounds a scalar one; Cranelift loads with `uload16x4` and a 16-bit shift, stores
 halves packed with `unarrow` into eight bytes, and rounds each lane of a bf16 `fptrunc`/`fpext` with
 the scalar path's integer round-to-nearest-even (`round_to_bf16_x4`; a NaN keeps its top half with
 the quiet bit set). The LLVM emitter already lowered half vectors, and `--backend=gpu-native`
-scalarizes them lane by lane through its scalar bf16 load, store and conversions. Only the three
-exact casts between `f32` and bf16 are lane-wise (`cast_route`); a bf16 cast through `f64`, to or
-from an integer, or a bitcast is replicated as the scalar instruction. A bf16 accumulator (it rounds
-inside its own recurrence) and a bf16 interleave group stay scalar, and `f16` stays scalar
-throughout: Cranelift has no vector half conversion, and its scalar path calls a runtime shim per
-element. Pinned by `tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the
-smallest subnormal, the largest finite value and rounding ties; every lane's bits, hand-derived)
-and `bf16_lanes_agree_with_the_scalar_loop`.
+scalarizes them lane by lane through its scalar bf16 load, store and conversions. The exact casts
+between `f32` and bf16 are lane-wise (`cast_route`), and so are the casts through `f64` and to and
+from integers (below, **half casts**); only a bitcast is replicated as the scalar instruction. A
+bf16 accumulator (it rounds inside its own recurrence) stays scalar. Pinned by
+`tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the smallest subnormal,
+the largest finite value and rounding ties; every lane's bits, hand-derived) and
+`bf16_lanes_agree_with_the_scalar_loop`.
+
+**f16 lanes** (P15.7). An `f16` lane is the same `f32` lane with a different grid, and `<4 x f16>`
+keeps the same four rounding points; the difference is the conversion. The scalar path calls the
+runtime shims `wukong_f32_to_f16_bits`/`wukong_f16_bits_to_f32` per element (the `half` crate: F16C
+`vcvtps2ph`/`vcvtph2ps` on a host that has it, an integer routine on one that does not), and
+Cranelift 0.124 has no vector half conversion, so `codegen_cranelift::half_lanes` builds both
+directions from SSE2 integer operations on four lanes at once: f16 to f32 rebiases the exponent,
+moves infinities and NaNs to exponent 255 (a NaN keeps its payload and gains the quiet bit) and
+forms a subnormal as `(2^-14 + m·2^-24) - 2^-14`, an exact `f32` subtraction; f32 to f16 rebiases
+and rounds a normal at bit 13 to nearest even with an integer add, rounds a subnormal by one `f32`
+addition of `0.5` (whose binade has the f16 subnormal spacing, so IEEE rounding is the rounding
+wanted), saturates `65520` and up to infinity, and narrows a NaN to its top ten payload bits with
+the quiet bit — F. Giesen's branch-free `float_to_half_fast3_rtne`/`half_to_float` with the `half`
+crate's NaN rule. A load is `uload16x4` plus the decode, a store the encode plus `unarrow`, and a
+`<4 x f16>` `fptrunc`/`fpext` the two back to back. Nothing depends on the host's half
+instructions, so `--target-cpu=x86-64` computes the same bits. `half_lane_tests` JIT-compiles the
+three under the host ISA and the SSE2 baseline and compares them bit for bit with the shim and with
+a transcription of the `half` crate's software routine: f16 to f32 on all 65536 encodings, f32 to
+f16 on every sign and exponent with a one, a run or a tie at every rounding position, every f16
+value's midpoint to the next and the `f32` neighbours of both, every NaN payload and a million
+random patterns. `tests/run/vec_f16_lanes.wk` is the program-level twin of the bf16 fixture (NaN
+payloads quiet and signalling, both zeros and infinities, subnormal inputs and results, overflow to
+infinity, ties at both ends; every lane's bits, hand-derived) on interp and native at `-O0` and
+`-O2`. An f16 accumulator stays scalar, like a bf16 one.
+
+**Half casts and interleave groups** (P15.7). A cast with a half end used to be replicated unless
+it only rounded between `f32` and a half grid. Every one but a bitcast now has a lane-wise route
+(`cast_route`), built from the scalar cast's own steps: `fpext` out of a half type into `f64` is the
+lane-wise round to the source grid (an `fpext .. to <4 x f32>`) and then the `f32 -> f64` widen
+(`CastRoute::HalfToF64`); `fptrunc` from `f64` into a half type is the `f64 -> f32` narrow and then
+the round to the target grid (`CastRoute::F64ToHalf`) — the scalar cast demotes, then rounds; and a
+cast between a half type and an integer is the `f32` route with the half lane type at the half end,
+because the scalar cast rounds nothing at the half grid there (`i as f16` is an `f32` conversion,
+rounded to the half grid only when stored or cast again, so `i32 -> bf16` rounds twice; `x as i32`
+truncates the `f32` register), and so does every backend's vector `sitofp`/`fptosi` on an `f32x4`
+register. A bf16 or f16 **interleave group** (`o[2i]`, `o[2i + 1]`: a complex multiply over
+interleaved parts) widens like a 32-bit one: the group's contiguous `<4 x half>` loads and stores
+round where the scalar ones do, and the lane shuffles between them move `f32` lanes, which changes
+no bits. `tests/run/vec_half_casts.wk` prints every lane of ten casts (both directions through
+`f64`, both half types to `i32`, f16 to `u8`, `i32` and `i16` to both, ties and saturations at the
+half ranges, the double rounding of `2^24 + 2^16 + 1` into bf16) and of a stride-2 complex multiply
+in each half type, hand-derived, on interp and native at `-O0` and `-O2` and at
+`--target-cpu=x86-64`; `half_casts_through_f64_and_integers_convert_lane_wise` asserts that none of
+them replicates a lane.
 
 **256-bit kernels from the optimizer** (`src/vec256.rs`, a child module of `vectorize`). A loop the
 128-bit plan widens whose body also has a raw-AVX2 recipe form takes the same `Op::VecKernelCall`
@@ -1136,7 +1179,7 @@ stored) becomes a reduction recipe whose wrapping result `kc` adds to the accumu
 the resumed loop through a block parameter of `kj` — integer addition is associative, so the
 kernel's canonical grouping is the scalar loop's sum bit for bit (`tests/run/vec256_opt_int_sum.wk`,
 every trip from 2040 to 2064). Anything else — a float sum (the recipe would reassociate it), any
-other reduction kind, a cast, a gather or scatter, a shift or bitwise op, the counter read as a
+other reduction kind, a cast (but the f16 grid roundings below), a gather or scatter, a shift or bitwise op, the counter read as a
 value, a countdown, a search loop, an interleave group, an unsigned compare, an `i64` multiply —
 keeps the 128-bit loop. One rule is added: every object the
 loop stores is accessed **only at the stored element** (`o[i] = o[i] * 2` is fine), because the
@@ -1150,6 +1193,29 @@ buffer (`guard_allows_equal`) are two streams that may share a base: the interpr
 per base), so every load reads the lane's latest earlier store to *any* stream of its class, its
 own included, as the machine code does by re-reading memory (`tests/run/vec256_opt_aliased.wk`; a
 reload of a stored stream after a store to its twin, `tests/run/vec256_opt_aliased_reload.wk`).
+**f16 bodies** take the recipe as an `f32` one: an f16 element is an `f32` lane between its
+conversions, so a recipe gains three ops (`wukong_mir::VecOp`) — `LoadF16` (`vcvtph2ps`, eight
+halves widened exactly), `StoreF16` (`vcvtps2ph` with imm8 0, round to nearest even whatever
+`MXCSR` holds) and `RoundF16` (both, for an `fptrunc .. to f16` or an `fpext` out of f16) — and a
+stream is f16 or `f32` throughout (`validate`), its group 16 bytes or 32 wide. F16C is used because
+it is the scalar path: the runtime shims are the `half` crate, which is `vcvtps2ph`/`vcvtph2ps` on
+an F16C host and an integer routine that agrees with them on every input elsewhere. The reference
+evaluator rounds through that integer routine (`VecValue::round_f16`), transcribed in
+`wukong_mir::f16_bits` so the IR crate keeps its two workspace dependencies, and tested there bit for
+bit against `half`'s host and software paths (all 65536 f16 encodings; every sign, exponent and
+value of the eleven mantissa bits a result keeps or rounds on): a `LoadF16` rounds whatever the
+slot or a forwarded store holds (the interpreter stores a scalar f16 as is and rounds on load), and
+a `StoreF16` writes and forwards the rounded lane. The kernel needs F16C as well as AVX2+FMA
+(`host_supports_f16c_kernels`, asked by the optimizer and refused by the assembler without it;
+x86-64-v3 includes it); a host without it keeps the 128-bit `<4 x f16>` loop. One rule is added: an
+f16 invariant reaches the kernel through its `f32` scalar table by an `fpext`, which rounds, so only
+an invariant known to lie on the f16 grid is splatted (a constant, an f16 load, a cast into f16) —
+an f16 parameter need not (`n as f16` converts to `f32` without rounding, and `-O2` forwards the
+register past the store that would round it), and keeps the 128-bit loop. Pinned by the AVX2 tests
+in `avx2_f16_tests` (all 65536 encodings widened, the dense `f32` cover narrowed and rounded, a
+mixed body at unrolled and single-group trips on unaligned buffers, each against the shims and the
+evaluator) and `tests/run/vec256_f16_lanes.wk` (five kernels over 2048 lanes each, every lane's
+bits, hand-derived).
 The rewrite: a guard block computes `n`, the trip rounded down to the recipe's lanes and
 zero below the gate or when the alias check fails, and `start + n`; a call block (entered only when
 `n != 0`) rebuilds each stream's address and each invariant from the body's own scalar steps with

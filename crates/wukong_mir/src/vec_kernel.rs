@@ -138,6 +138,13 @@ pub trait VecValue: Copy {
     fn fold(op: VecRedOp, acc: Self, x: Self) -> Self;
     /// The placeholder a `Store` leaves in the value list (stores carry no value; never read).
     fn unused() -> Self;
+    /// The value rounded to the IEEE f16 grid and widened back (`vcvtps2ph` with round-to-nearest-
+    /// even, then `vcvtph2ps`): what an f16 element stored from this lane reads back as. Only an
+    /// `f32` lane has f16 operations ([`VecKernel::validate`]); every other lane keeps the value,
+    /// total but unreachable on a validated recipe.
+    fn round_f16(self) -> Self {
+        self
+    }
 }
 
 impl VecValue for f32 {
@@ -183,6 +190,11 @@ impl VecValue for f32 {
     }
     fn unused() -> Self {
         f32::NAN
+    }
+    fn round_f16(self) -> Self {
+        // Exactly as the runtime's scalar shims (the `half` crate) convert: its integer routine,
+        // which agrees with F16C on every input (see `f16_bits`).
+        crate::f16_bits::round_f16(self)
     }
 }
 
@@ -405,6 +417,44 @@ pub enum VecOp {
     Select { mask: u32, a: u32, b: u32 },
     /// Unit-stride vector store of value `val` to stream `s`.
     Store { stream: u32, val: u32 },
+    /// Unit-stride load of stream `s`, whose elements are IEEE f16 (two bytes each), every element
+    /// widened to the lane's `f32` exactly (`vcvtph2ps`; a NaN keeps its payload and gains the quiet
+    /// bit) - the scalar f16 load. `f32` lane only.
+    LoadF16 { stream: u32 },
+    /// Unit-stride store of value `val` to the f16 stream `s`, every lane rounded to the nearest
+    /// f16, ties to even (`vcvtps2ph` with imm8 0; from 65520 up is infinity; a NaN keeps its top
+    /// ten payload bits with the quiet bit) - the scalar f16 store. `f32` lane only.
+    StoreF16 { stream: u32, val: u32 },
+    /// Every lane of `a` rounded to the f16 grid and held as an `f32` (`vcvtps2ph` then
+    /// `vcvtph2ps`) - the scalar `fptrunc .. to f16`, and the rounding an `fpext` out of f16
+    /// applies to its source. `f32` lane only.
+    RoundF16 { a: u32 },
+}
+
+impl VecOp {
+    /// The stream this op reads from memory: a `Load`'s or a `LoadF16`'s.
+    pub fn loaded_stream(&self) -> Option<u32> {
+        match *self {
+            VecOp::Load { stream } | VecOp::LoadF16 { stream } => Some(stream),
+            _ => None,
+        }
+    }
+
+    /// The stream this op writes to memory: a `Store`'s or a `StoreF16`'s.
+    pub fn stored_stream(&self) -> Option<u32> {
+        match *self {
+            VecOp::Store { stream, .. } | VecOp::StoreF16 { stream, .. } => Some(stream),
+            _ => None,
+        }
+    }
+
+    /// Is this one of the three f16 operations (the F16C instructions)?
+    pub fn is_f16(&self) -> bool {
+        matches!(
+            self,
+            VecOp::LoadF16 { .. } | VecOp::StoreF16 { .. } | VecOp::RoundF16 { .. }
+        )
+    }
 }
 
 /// The fold of a reduction kernel. `Fmax`/`Fmin` use the x86 `vmaxps`/`vminps` operand order
@@ -512,14 +562,19 @@ impl VecKernel {
                 && self
                     .ops
                     .get(v as usize)
-                    .is_some_and(|o| !matches!(o, VecOp::Store { .. }))
+                    .is_some_and(|o| o.stored_stream().is_none())
         };
         if self.unroll == 0 {
             errors.push("unroll must be positive".into());
         }
         for (i, op) in self.ops.iter().enumerate() {
             match *op {
-                VecOp::Load { stream } | VecOp::Store { stream, .. } if stream >= self.streams => {
+                VecOp::Load { stream }
+                | VecOp::Store { stream, .. }
+                | VecOp::LoadF16 { stream }
+                | VecOp::StoreF16 { stream, .. }
+                    if stream >= self.streams =>
+                {
                     errors.push(format!("op {i} stream {stream} is out of range"));
                 }
                 VecOp::Splat { scalar } if scalar >= self.scalars => {
@@ -528,12 +583,17 @@ impl VecKernel {
                 _ => {}
             }
             let operands = match *op {
-                VecOp::Load { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => [None; 3],
+                VecOp::Load { .. }
+                | VecOp::LoadF16 { .. }
+                | VecOp::Splat { .. }
+                | VecOp::Const { .. } => [None; 3],
                 VecOp::Bin { a, b, .. } | VecOp::Cmp { a, b, .. } => [Some(a), Some(b), None],
                 VecOp::Fma { a, b, c } => [Some(a), Some(b), Some(c)],
                 VecOp::Select { mask, a, b } => [Some(mask), Some(a), Some(b)],
-                VecOp::Sqrt { a } | VecOp::Neg { a } => [Some(a), None, None],
-                VecOp::Store { val, .. } => [Some(val), None, None],
+                VecOp::Sqrt { a } | VecOp::Neg { a } | VecOp::RoundF16 { a } => {
+                    [Some(a), None, None]
+                }
+                VecOp::Store { val, .. } | VecOp::StoreF16 { val, .. } => [Some(val), None, None],
             };
             for operand in operands.into_iter().flatten() {
                 if !value_exists(operand, i) {
@@ -545,8 +605,12 @@ impl VecKernel {
                     errors.push(format!("op {i} select mask must be a compare result"));
                 }
             }
-            if self.reduce.is_some() && matches!(op, VecOp::Store { .. }) {
+            if self.reduce.is_some() && op.stored_stream().is_some() {
                 errors.push(format!("reduction contains store at op {i}"));
+            }
+            // An f16 element converts to and from an `f32` lane; no other lane has a conversion.
+            if self.lane != VecLane::F32 && op.is_f16() {
+                errors.push(format!("op {i} is an f16 operation on a non-f32 lane"));
             }
             // An immediate is an f32 bit pattern; on any other lane it has no single meaning.
             if self.lane != VecLane::F32 && matches!(op, VecOp::Const { .. }) {
@@ -566,6 +630,19 @@ impl VecKernel {
                 )
             {
                 errors.push(format!("op {i} needs a float lane"));
+            }
+        }
+        // One element width per stream: an f16 stream's elements are two bytes and an `f32`
+        // stream's four, so one stream read or written both ways has no single address stride.
+        for s in 0..self.streams {
+            let widths: Vec<bool> = self
+                .ops
+                .iter()
+                .filter(|o| o.loaded_stream() == Some(s) || o.stored_stream() == Some(s))
+                .map(VecOp::is_f16)
+                .collect();
+            if widths.iter().any(|&h| h) && widths.iter().any(|&h| !h) {
+                errors.push(format!("stream {s} is accessed both as f16 and as f32"));
             }
         }
         if let Some(red) = self.reduce {
@@ -702,9 +779,29 @@ impl VecKernel {
                     store(stream, x);
                     T::unused() // stores carry no value; never referenced
                 }
+                // An f16 element holds the f16 grid: a load rounds whatever the slot (or the
+                // forwarded store) holds, and a store writes, and forwards, the rounded lane -
+                // exactly what the machine code's `vcvtps2ph` leaves in memory. Rounding is
+                // idempotent, so a forwarded value read back is unchanged.
+                VecOp::LoadF16 { stream } => stored[class(stream)]
+                    .unwrap_or_else(|| load(stream))
+                    .round_f16(),
+                VecOp::StoreF16 { stream, val } => {
+                    let x = vals[val as usize].round_f16();
+                    stored[class(stream)] = Some(x);
+                    store(stream, x);
+                    T::unused()
+                }
+                VecOp::RoundF16 { a } => vals[a as usize].round_f16(),
             };
             vals.push(v);
         }
+    }
+
+    /// Does the recipe convert to or from f16 anywhere ([`VecOp::is_f16`]) — does it need F16C
+    /// ([`host_supports_f16c_kernels`])?
+    pub fn uses_f16(&self) -> bool {
+        self.ops.iter().any(VecOp::is_f16)
     }
 
     /// The number of accumulators `U` of a reduction's canonical tree (module docs): exactly the
@@ -965,6 +1062,22 @@ pub fn host_supports_vec_kernels() -> bool {
     }
 }
 
+/// Whether this host can also run a recipe's f16 operations (`LoadF16`, `StoreF16`, `RoundF16`):
+/// the F16C conversions `vcvtph2ps`/`vcvtps2ph`, on top of [`host_supports_vec_kernels`]. Every
+/// AVX2 processor has shipped with F16C, and x86-64-v3 includes it, but it is its own CPUID bit, so
+/// both the optimizer that builds such a recipe and the assembler that encodes it ask for it. A
+/// host without it keeps the 128-bit `<4 x f16>` loop, which computes the same bits.
+pub fn host_supports_f16c_kernels() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        host_supports_vec_kernels() && std::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 /// Does `WUKONG_MAX_ISA` allow AVX2 code? Mirrors `wukong_runtime::isa::IsaLevel::parse` (this
 /// crate sits beside the runtime, not above it): only the spellings of the `scalar` tier forbid it,
 /// and an unset or unrecognized value is no cap. Read once per process.
@@ -1018,12 +1131,14 @@ impl VecPressure {
 /// The operand value-indices an op reads (for liveness). `Load`/`Splat`/`Const` read nothing.
 pub fn op_operands(op: &VecOp) -> Vec<u32> {
     match *op {
-        VecOp::Load { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => vec![],
+        VecOp::Load { .. } | VecOp::LoadF16 { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => {
+            vec![]
+        }
         VecOp::Bin { a, b, .. } | VecOp::Cmp { a, b, .. } => vec![a, b],
         VecOp::Fma { a, b, c } => vec![a, b, c],
         VecOp::Select { mask, a, b } => vec![mask, a, b],
-        VecOp::Sqrt { a } | VecOp::Neg { a } => vec![a],
-        VecOp::Store { val, .. } => vec![val],
+        VecOp::Sqrt { a } | VecOp::Neg { a } | VecOp::RoundF16 { a } => vec![a],
+        VecOp::Store { val, .. } | VecOp::StoreF16 { val, .. } => vec![val],
     }
 }
 
@@ -1031,7 +1146,7 @@ pub fn op_operands(op: &VecOp) -> Vec<u32> {
 pub fn op_produces_value(op: &VecOp) -> bool {
     !matches!(
         op,
-        VecOp::Store { .. } | VecOp::Splat { .. } | VecOp::Const { .. }
+        VecOp::Store { .. } | VecOp::StoreF16 { .. } | VecOp::Splat { .. } | VecOp::Const { .. }
     )
 }
 

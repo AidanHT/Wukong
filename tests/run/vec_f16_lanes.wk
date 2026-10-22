@@ -1,0 +1,202 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 32257 32512 32768 65024 65024 64512 17536 50304 3 31744 16386 17590 32258 13312 31744 20351
+// EXPECT-OUT: 32257 32512 32768 65024 65024 64512 17536 50304 3 31744 16386 17590 32258 13312 31744 20351
+// EXPECT-OUT: 32257 32512 32768 65024 65024
+// EXPECT-OUT: 0 33280 32768 64512 31744 64512 49152 48127 49152 31743 48129 16968 65026 13312 60416 18688
+// EXPECT-OUT: 0 33280 32768 64512 31744 64512 49152 48127 49152 31743 48129 16968 65026 13312 60416 18688
+// EXPECT-OUT: 0 33280 32768 64512 31744
+// EXPECT-OUT: 32257 32512 65024 0 64512 65024 14848 49281 0 31743 15360 17992 32258 31744 10240 17665
+// EXPECT-OUT: 32257 32512 65024 0 64512 65024 14848 49281 0 31743 15360 17992 32258 31744 10240 17665
+// EXPECT-OUT: 32257 32512 65024 0 64512
+// EXPECT-OUT: 2143297536 2145386496 2147483648 0 2139095040 4286578688 1061158912 3213885440
+// EXPECT-OUT: 855638016 1191174144 1056972800 1070137344 3204448256 1040187392 1115684864 1084227584
+// EXPECT-OUT: 2143297536 2145386496 2147483648 0 2139095040 4286578688 1061158912 3213885440
+// EXPECT-OUT: 855638016 1191174144 1056972800 1070137344 3204448256 1040187392 1115684864 1084227584
+// EXPECT-OUT: 2143297536 2145386496 2147483648 0 2139095040
+// EXPECT-OUT: 32257 32512 32768 0 31744 64512 16512 49856 2 31744 15874 17590 48640 13824 23040 19328
+// EXPECT-OUT: 32257 32512 32768 0 31744 64512 16512 49856 2 31744 15874 17590 48640 13824 23040 19328
+// EXPECT-OUT: 32257 32512 32768 0 31744
+module tests.run.vec_f16_lanes
+
+// f16 loops widened by the general vectorizer (-O2) as `<4 x f16>` - four f16 lanes in an f32
+// register - every lane printed as its raw bits (`bits`), so a payload, a sign, a subnormal or a
+// rounding tie cannot hide behind a decimal rendering. An f16 value is computed in f32 and rounded
+// to the f16 grid at a load, a store, a constant and a cast (`fptrunc .. to f16`, which follows
+// every f16 operation, and `fpext` out of f16); the vector form keeps those four points lane by
+// lane, converting four lanes at once where the scalar loop calls a runtime shim per element.
+// n = 37: nine groups of four, then one scalar lane.
+//
+// Each kernel calls itself when `d > 0` (never, here), so the inliner keeps it out of `main` and
+// its trip a runtime value.
+//
+// x[i] = X[i % 16], y[i] = Y[(5i + 3) % 16] (f16 bits):
+//   X = 7e01 (qNaN, payload 1), 7d00 (sNaN, payload 0x100), 8000 (-0), 0000, 7c00 (+inf),
+//       fc00 (-inf), 3e00 (1.5), c080 (-2.25), 0001 (2^-24, the smallest subnormal),
+//       7bff (65504, the largest finite), 3c01 (1.0009765625), 4248 (3.140625), bc00 (-1),
+//       3400 (0.25), 5800 (128), 4900 (10)
+//   Y = 3c00 (1), 4000 (2), 7c00 (+inf), 8000 (-0), 0000, 3c01, 3bff (0.99951171875), c200 (-3),
+//       0200 (2^-15, a subnormal), 6c00 (4096), 3800 (0.5), 4000 (2), 7c00 (+inf), 0000,
+//       3fff (1.9990234375), 7e02 (qNaN, payload 2)
+// Every expected lane is derived by hand under IEEE 754 binary32 and binary16 (round to nearest
+// even; past 65504 an f16 result is infinite from 65520 up), the half-precision NaN rule (an f16
+// NaN widens with its payload and the quiet bit set, so the sNaN 7d00 reads back as 7f00; an f32
+// NaN narrows to its top ten payload bits with the quiet bit) and x86's NaN rules (one NaN operand:
+// that NaN; an invalid operation: the default NaN, ffc00000 in f32 and fe00 in f16):
+//   k1: o = f16(fma(x, y, x))            - the contracted `x * y + x`, rounded once in f32,
+//                                          then to f16: 0 * inf and -inf + inf are invalid,
+//                                          65504 * 1 + 65504 overflows to 7c00, and
+//                                          2^-24 * 2 + 2^-24 is the subnormal 0003
+//   k2: o = x > y ? x : -y               - an ordered compare (false on NaN) and a negation
+//                                          (the subnormal 0200 comes back as 8200)
+//   k3: o = f16(x / y)                   - including -0/0, -inf/inf, 0.25/0, 0/inf, and
+//                                          2^-24 / 2, a tie at the bottom that goes to 0
+//   k4: f = (x as f32) * 0.5             - an f32 output, printed as f32 bits
+//   k5: o = (f * 3) as f16               - f32 to f16 rounding: 1.5 * 1.0009765625 and
+//                                          1.5 * 2^-24 are exact ties and go to even (3e02, 0002)
+// Each f16 array prints 16 lanes to a line, the f32 one 8.
+
+fn pick(a: f16, b: f16) -> f16 {
+    if a > b {
+        return a;
+    }
+    return -b;
+}
+
+@unchecked
+fn k1(x: []f16, y: []f16, mut o: []f16, n: i64, d: i64) {
+    if d > 0 {
+        k1(x, y, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * y[i] + x[i];
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn k2(x: []f16, y: []f16, mut o: []f16, n: i64, d: i64) {
+    if d > 0 {
+        k2(x, y, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = pick(x[i], y[i]);
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn k3(x: []f16, y: []f16, mut o: []f16, n: i64, d: i64) {
+    if d > 0 {
+        k3(x, y, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] / y[i];
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn k4(x: []f16, mut f: []f32, n: i64, d: i64) {
+    if d > 0 {
+        k4(x, f, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        f[i] = x[i] as f32 * 0.5;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn k5(f: []f32, mut o: []f16, n: i64, d: i64) {
+    if d > 0 {
+        k5(f, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = (f[i] * 3.0) as f16;
+        i = i + 1;
+    }
+}
+
+fn xs(r: i64) -> u16 {
+    let t: [u16; 16] = [
+        32257, 32000, 32768, 0, 31744, 64512, 15872, 49280, 1, 31743, 15361, 16968, 48128, 13312,
+        22528, 18688,
+    ];
+    return t[r];
+}
+
+fn ys(r: i64) -> u16 {
+    let t: [u16; 16] = [
+        15360, 16384, 31744, 32768, 0, 15361, 15359, 49664, 512, 27648, 14336, 16384, 31744, 0,
+        16383, 32258,
+    ];
+    return t[r];
+}
+
+fn show(v: []f16, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        print_raw(bits(v[i]));
+        if (i + 1) % 16 == 0 || i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let n: i64 = 37;
+    let mut x: []f16 = alloc_f16(n);
+    let mut y: []f16 = alloc_f16(n);
+    let mut o1: []f16 = alloc_f16(n);
+    let mut o2: []f16 = alloc_f16(n);
+    let mut o3: []f16 = alloc_f16(n);
+    let mut o5: []f16 = alloc_f16(n);
+    let mut f: []f32 = alloc_f32(n);
+    let mut i: i64 = 0;
+    while i < n {
+        x[i] = f16_from_bits(xs(i % 16));
+        y[i] = f16_from_bits(ys((5 * i + 3) % 16));
+        i = i + 1;
+    }
+    k1(x, y, o1, n, 0);
+    k2(x, y, o2, n, 0);
+    k3(x, y, o3, n, 0);
+    k4(x, f, n, 0);
+    k5(f, o5, n, 0);
+    show(o1, n);
+    show(o2, n);
+    show(o3, n);
+    i = 0;
+    while i < n {
+        print_raw(bits(f[i]));
+        if (i + 1) % 8 == 0 || i + 1 == n {
+            print_raw("\n");
+        } else {
+            print_raw(" ");
+        }
+        i = i + 1;
+    }
+    show(o5, n);
+    free(x);
+    free(y);
+    free(o1);
+    free(o2);
+    free(o3);
+    free(o5);
+    free(f);
+    return 0;
+}

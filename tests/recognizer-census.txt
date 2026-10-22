@@ -124,7 +124,7 @@ cov4_par_dequant.wk: wukong_dequant_f32_parallel wukong_dequant_perchan_f32_para
 cov4_par_gemm.wk: wukong_sgemm_tn_parallel wukong_sgemv_alpha_parallel wukong_sgevm_f32_parallel
 cov4_par_i8gemm_deq.wk: wukong_i8gemm_nt_deq_parallel
 cov4_par_loss.wk: wukong_entropy_f32_parallel wukong_kd_loss_f32_parallel wukong_kldiv_f32_parallel wukong_logsumexp_f32_parallel wukong_xent_bwd_f32_parallel
-cov4_par_lowp_dot.wk: wukong_dot_f16_parallel wukong_sum_f16_parallel
+cov4_par_lowp_dot.wk: veckernel*1 wukong_dot_f16_parallel wukong_sum_f16_parallel
 cov4_par_lowp_gemm.wk: wukong_sgemm_bf16_nt_epi_parallel wukong_sgemm_bf16_nt_parallel wukong_sgemm_bf16_tn_parallel wukong_sgemm_f16_nt_epi_parallel wukong_sgemm_f16_nt_parallel wukong_sgemm_f16_tn_parallel
 cov4_par_norm.wk: veckernel*1 wukong_norm_affine_f32_parallel wukong_norm_f32_parallel
 cov4_par_norm_bwd.wk: wukong_layernorm_bwd_f32_parallel wukong_rmsnorm_bwd_f32_parallel wukong_softmax_bwd_f32_parallel
@@ -572,6 +572,7 @@ unroll_jam_nests.wk:
 unsigned.wk:
 unsigned_print.wk:
 variant_payload_slice_pattern.wk:
+vec256_f16_lanes.wk: veckernel*5 wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_fmt_int wukong_rt_fmt_int*2 wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_rt_free wukong_rt_free*7
 vec256_general.wk: veckernel*1 wukong_velem_f32 wukong_velem_f32*2
 vec256_lane_types.wk: veckernel*2
 vec256_opt_aliased.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_fmt_int wukong_rt_fmt_int*4 wukong_rt_fmt_str wukong_rt_fmt_str*8 wukong_rt_free wukong_rt_free*5
@@ -592,8 +593,10 @@ vec5_slp_bundles.wk:
 vec_argmax_reductions.wk: wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_free wukong_rt_free*5
 vec_bf16_lanes.wk: wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_fmt_int wukong_rt_fmt_int*5 wukong_rt_fmt_str wukong_rt_fmt_str*10 wukong_rt_free wukong_rt_free*7
 vec_exp.wk:
+vec_f16_lanes.wk: veckernel*5 wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_fmt_int wukong_rt_fmt_int*2 wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_rt_free wukong_rt_free*7
 vec_find_last.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
 vec_guarded_shifted_read.wk:
+vec_half_casts.wk: wukong_rt_alloc wukong_rt_alloc*21 wukong_rt_fmt_int wukong_rt_fmt_int*9 wukong_rt_fmt_str wukong_rt_fmt_str*18
 vec_int_div.wk: veckernel*1
 vec_kernel_zero_trip.wk: veckernel*2 wukong_rt_alloc
 vec_math.wk: veckernel*1

@@ -8,6 +8,7 @@
 //! type's note before building on the two-level design).
 
 mod builder;
+pub mod f16_bits;
 mod inst;
 #[cfg(test)]
 mod lane_op_tests;
@@ -22,9 +23,9 @@ pub use inst::{
     IntUnOp, NarrowKind, Op, RoundMode, SwitchCase, Terminator, MAX_ALLOCA_ALIGN,
 };
 pub use vec_kernel::{
-    host_supports_vec_kernels, op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecLane,
-    VecOp, VecPressure, VecRedOp, VecReduce, VecValue, VEC_BYTES, VEC_LANES, VEC_MAX_STREAMS,
-    VEC_NREG,
+    host_supports_f16c_kernels, host_supports_vec_kernels, op_operands, op_produces_value, VecBin,
+    VecCmp, VecKernel, VecLane, VecOp, VecPressure, VecRedOp, VecReduce, VecValue, VEC_BYTES,
+    VEC_LANES, VEC_MAX_STREAMS, VEC_NREG,
 };
 
 use wukong_span::{Span, Symbol};
