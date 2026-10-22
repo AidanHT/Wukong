@@ -254,13 +254,20 @@ fn line_of(src: &str, offset: u32) -> usize {
         + 1
 }
 
+/// `line` without its indentation: leading ASCII spaces and tabs only, as in `Docs::unindented`
+/// and CommonMark. A Unicode space (U+00A0, U+3000) is text, and stripping by byte count across
+/// one would cut it in half.
+fn unindent(line: &str) -> &str {
+    line.trim_start_matches([' ', '\t'])
+}
+
 /// The examples in one doc comment: its fenced blocks whose info string names the language.
 fn examples_in(docs: &Docs, owner: &str, src: &str, out: &mut Vec<Example>) {
     let lines = docs.unindented();
     let mut i = 0;
     while i < lines.len() {
         let (text, offset) = lines[i];
-        let trimmed = text.trim_start();
+        let trimmed = unindent(text);
         let Some((fence, n)) = fence_open(trimmed) else {
             i += 1;
             continue;
@@ -271,11 +278,12 @@ fn examples_in(docs: &Docs, owner: &str, src: &str, out: &mut Vec<Example>) {
         let mut j = i + 1;
         while j < lines.len() {
             let (t, o) = lines[j];
-            let tt = t.trim_start();
+            let tt = unindent(t);
             if is_fence_close(tt, fence, n) {
                 break;
             }
-            // A fence indented by k spaces strips up to k from each line of its block.
+            // A fence indented by k spaces strips up to k from each line of its block. Both counts
+            // are ASCII bytes, so the cut is always on a character boundary.
             let strip = indent.min(t.len() - tt.len());
             code.push((t[strip..].to_string(), o + strip as u32));
             j += 1;
@@ -752,5 +760,29 @@ mod tests {
             layout(src, &ex[0].code),
             "\n\n    let x = 1;\n        f(x);\n"
         );
+    }
+
+    /// Indentation is ASCII spaces and tabs, as in `Docs::unindented` and CommonMark: a code line
+    /// that starts with a multi-byte space (U+00A0) under a fence indented by one space keeps it as
+    /// code — cutting one byte into it panicked the whole run — and a fence led by one is prose.
+    #[test]
+    fn only_ascii_whitespace_indents_an_example() {
+        let src = "/// Example:\n///  ```wk\n/// \u{a0}let x = 1;\n///  ```\nfn f() {}\n";
+        let mut i = Interner::new();
+        let (m, d) = wukong_parser::parse_module(src, SourceId(0), &mut i);
+        assert!(d.is_empty(), "{d:?}");
+        let ex = collect(&m, &i, src);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].code.len(), 1);
+        assert_eq!(ex[0].code[0].0, "\u{a0}let x = 1;");
+        // The code line's offset is that of its first byte, the U+00A0 (`/// ` is 4 bytes in).
+        let at = src.find('\u{a0}').unwrap() as u32;
+        assert_eq!(ex[0].code[0].1, at);
+        assert_eq!(layout(src, &ex[0].code), "\n\n    \u{a0}let x = 1;\n");
+
+        let src = "/// \u{a0}```wk\n/// let x = 1;\n/// ```\nfn f() {}\n";
+        let (m, d) = wukong_parser::parse_module(src, SourceId(0), &mut i);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(collect(&m, &i, src).is_empty());
     }
 }
