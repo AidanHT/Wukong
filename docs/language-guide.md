@@ -212,7 +212,9 @@ fn main() -> i32 {
   a function-typed parameter); neither is a generic function, nor one with a tensor parameter of
   run-time extent (`?`), nor an `extern` one (`E0429`). A function that itself takes
   function-typed parameters is a value too: its address is the instance that takes each of them
-  at run time.
+  at run time. A value is made in a function body: a `const` cannot hold one (`E0411`), because a
+  `const` initializer is evaluated again at each use rather than stored — bind the function with
+  `let` where it is used.
 - **What one does.** Called (`f(x)`, `ops[i](a, b)`, `pick(1)(3)`, `s.apply(x)` for a field that
   is no method), passed to a function-typed parameter, copied, stored, returned, captured by a
   closure (copied like a pointer). Comparing two (`==`, `<`) is `E0428`: which functions share an

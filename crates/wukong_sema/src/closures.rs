@@ -830,10 +830,47 @@ impl Sema<'_> {
             self.fn_value_locals.insert(e.id);
             return t;
         }
+        if !self.in_fn_body && self.reject_fn_value_outside_body(name, span) {
+            return Ty::Error;
+        }
         if self.reject_fn_item_value(name, span) {
             return Ty::Error;
         }
         t
+    }
+
+    /// `E0411`: the top-level function `name` used as a value outside a function body — in a
+    /// `const` initializer, which is not one value but an expression lowered again at every use.
+    /// A function value made there would escape the whole-program analyses that must see every
+    /// function used as a value (which buffers a call through a pointer may alias, which instance
+    /// of a function with function-typed parameters has an address) and would resolve its name in
+    /// the scope of each use. Returns whether it was refused.
+    fn reject_fn_value_outside_body(&mut self, name: Symbol, span: Span) -> bool {
+        if !matches!(
+            self.defs.lookup(name).map(|d| &d.kind),
+            Some(DefKind::Fn(_))
+        ) {
+            return false;
+        }
+        if self.inst_subst.is_empty() {
+            let nm = self.sym_str(name).to_string();
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "the function `{nm}` cannot be used as a value outside a function body"
+                ))
+                .with_code("E0411")
+                .primary(span, "a function value cannot be made here")
+                .note(
+                    "a `const` initializer is evaluated again at each use rather than stored once, \
+                     so a `const` cannot hold a function value",
+                )
+                .help(format!(
+                    "bind it in the function that uses it (`let f = {nm};`), or write a function \
+                     that returns it"
+                )),
+            );
+        }
+        true
     }
 
     /// A top-level function `name` used as a run-time function value at `span`: a generic one has

@@ -1525,6 +1525,21 @@ mod tests {
         );
         assert!(codes(&ok).is_empty(), "{:?}", codes(&ok));
     }
+    /// A function value is made in a function body: a `const`, lowered again at each use, cannot
+    /// hold one (`E0411`), alone or inside an aggregate.
+    #[test]
+    fn a_const_cannot_hold_a_function_value() {
+        for bad in [
+            format!("{APPLY} const F: fn(f32) -> f32 = square; fn main() -> i32 {{ return 0; }}"),
+            format!(
+                "{APPLY} const FS: [fn(f32) -> f32; 1] = [square]; \
+                 fn main() -> i32 {{ return 0; }}"
+            ),
+        ] {
+            assert_eq!(codes(&bad), vec!["E0411"], "{bad}");
+        }
+    }
+
     #[test]
     fn a_function_parameter_is_neither_mut_nor_a_builtin_name() {
         let m = "fn apply(mut f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }";

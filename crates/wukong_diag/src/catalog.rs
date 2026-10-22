@@ -627,8 +627,10 @@ fn main() -> i32 {
          binds; copy it to a `let mut` local to reassign it). A function-typed parameter or local \
          cannot be named after a builtin (`gelu`, `print`, ...): kernel recognizers and the \
          vectorizer read a call `gelu(x)` as the builtin unless a top-level function shadows it. \
-         And a closure literal is an expression of a function body: a `const` initializer, a \
-         `where` predicate or a `static_assert` cannot hold one."
+         And a closure literal, like a function used as a value, is an expression of a function \
+         body: a `const` initializer, a `where` predicate or a `static_assert` cannot hold one (a \
+         `const` is evaluated again at each use, so it cannot hold a function value; bind the \
+         function with `let` in the function that uses it)."
     ),
     entry!(
         "E0415",

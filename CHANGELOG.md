@@ -40,8 +40,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   from lowering, for a function-typed parameter bound to one and used as a value); `E0428` two
   function values compared; `E0429` a generic, `extern` or run-time-extent function used as a value.
   `E0411` now covers only an `extern` signature with a function type, a `mut` or builtin-named
-  function-typed parameter or local, and a closure outside a function body; `E0421`/`E0422` apply to
-  closures that capture (a capture-free one is a value, and `let mut` of it a function variable).
+  function-typed parameter or local, and a closure or a function value outside a function body (a
+  `const` cannot hold one); `E0421`/`E0422` apply to closures that capture (a capture-free one is a
+  value, and `let mut` of it a function variable).
   `tests/fail/{closure_value_captures,closure_param_value_captures,fn_value_compare,fn_value_generic,fn_type_in_extern}.wk`;
   `tests/fail/{closure_outside_argument,fn_value_binding,lower_function_value}.wk` are gone (each is
   a legal program now).
@@ -62,6 +63,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   struct fields, `if`/`match`/`break` merges and call arguments — and an aggregate of functions
   against one of anything else (`ops = [1, 2]` for an array of functions).
   `tests/fail/fn_value_array_signatures.wk`.
+- **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
+  lowered again at each use, so a function named there escaped the whole-program analyses (a
+  recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the
+  address of a higher-order function had no compiled instance) and resolved its name in the scope
+  of each use. `tests/fail/fn_value_const.wk`.
 - **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
   value; a closure that captures still has no run-time value (no heap environment).
 

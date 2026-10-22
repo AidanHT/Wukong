@@ -125,8 +125,9 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   instance that takes the pointer (`apply$fn1$f32$to$f32`); the address of a function with
   function-typed parameters is that instance. `E0427` for a capturing closure as a value, `E0428`
   for comparing two, `E0429` for a generic or `extern` one; `E0411` is now only an `extern`
-  signature, a `mut` or builtin-named function-typed parameter or local, and a closure outside a
-  function body. Function types inside aggregates are compared (`[inc, add]` is `E0401`).
+  signature, a `mut` or builtin-named function-typed parameter or local, and a closure or function
+  value outside a function body (a `const` cannot hold one). Function types inside aggregates are
+  compared (`[inc, add]` is `E0401`).
   Every optimizer pass asks one exhaustive effect classification
   (`wukong_mir::Effects`) instead of its own opcode list, and a call whose callee is a visible
   `func_addr` is devirtualized (`-O1`, then inlined at `-O2`) — a program step between pipeline
@@ -1775,7 +1776,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   loss that calls through one is refused by `--emit=grad`/`--train`, since the callee has no VJP
   rule. Comparing two values is `E0428`, by design. A call through a value is opaque to the
   kernel recognizers and the vectorizer (a loop around one stays scalar) unless the optimizer
-  devirtualizes it.
+  devirtualizes it. A `const` cannot hold a function value (`E0411`): a `const` initializer is
+  lowered again at every use, in the scope of that use, so supporting one needs a hygienic const
+  lowering first (a local named like something the initializer names captures it today, for
+  every `const`).
 
 - **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
   only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an
