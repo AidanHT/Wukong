@@ -26,9 +26,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `file:line:col`, where the scan started, the input line most like the pattern ("possible
   intended match"), the variables it used, and the whole input, numbered. A misspelled directive
   (`CHECK-NXT:`, `CHECK-NEXT` without its colon) and a comment directive for a prefix no `RUN:`
-  line checks are errors, not silently ignored lines. 43 unit tests pin the matcher and the
-  harness, including a wrong `CHECK` that must fail with its location and a stand-in compiler
-  that panics and exits 1, which `not` must reject under every redirection.
+  line checks are errors, not silently ignored lines; a hyphenated prefix another `RUN:` line
+  checks (`--check-prefixes=CHECK,CHECK-O2` beside `CHECK,CHECK-O0`, LLVM's shared-plus-specific
+  layout) is that line's, not a misspelling. 45 unit tests pin the matcher and the harness,
+  including a wrong `CHECK` that must fail with its location and a stand-in compiler that panics
+  and exits 1, which `not` must reject under every redirection.
 - **Seeded with 37 files.** 24 under `opt/`, each a pass's essential property (most with a
   hand-written `.mir` input run through that one pass, so the lowering cannot drift under it):
   constant folding, GVN and load forwarding through joins, alias-based forwarding, LICM (an

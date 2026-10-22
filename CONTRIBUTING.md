@@ -320,7 +320,11 @@ search started, the input line most like the pattern, and the whole input number
 - **Directives** are LLVM FileCheck's: `CHECK:`, `-NEXT:`, `-SAME:`, `-NOT:`, `-DAG:`, `-LABEL:`,
   `-EMPTY:`, `-COUNT-<n>:`; `{{regex}}`, `[[NAME:regex]]` / `[[NAME]]`, `[[@LINE+k]]`. A run of
   blanks matches any run of blanks, and a pattern never spans lines. Give each function its own
-  `CHECK-LABEL: fn name(` so a match cannot wander into the next one.
+  `CHECK-LABEL: fn name(` so a match cannot wander into the next one. Two `RUN:` lines may share
+  a prefix and add their own (`--check-prefixes=CHECK,CHECK-V2` and `CHECK,CHECK-V3`): each
+  ignores the other's directives. A misspelled directive (`CHECK-NXT:`, `CHECK-NEXT` without its
+  colon, `CHECK_NEXT:`) is an error; a directive of a prefix some `RUN:` line checks never counts
+  as one, however close its name is to a suffix.
 - **`REQUIRES: vec-kernels`** (or `windows`, `unix`, `x86_64`) skips a file on hosts without the
   feature; the suite names every skipped file. Anything printed below `--target-cpu=x86-64-v3` is
   the same on every host, so pin that level unless the test is about the 256-bit kernels.

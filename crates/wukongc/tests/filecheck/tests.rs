@@ -442,6 +442,43 @@ fn prefixes_select_directives() {
 }
 
 #[test]
+fn another_runs_hyphenated_prefix_is_no_typo() {
+    // The shared-plus-specific layout: `CHECK-O2:` and `CHECK-V3-NEXT:` belong to prefixes other
+    // RUN lines check. LLVM ignores a directive of a prefix it was not given, and so does this.
+    ok(
+        "CHECK: a\n// CHECK-O2: x\n// CHECK-V3-NEXT: y\n; CHECK-AVX2-NOT: z\n// CHECK_O2: w\n\
+         // CHECK-NO-VEC: v",
+        "a\n",
+    );
+    // Still typos: one edit from a suffix, a suffix whose colon is missing or misplaced, a bad
+    // count, a `-NOT` combination, an underscore for the hyphen, an empty suffix.
+    for (line, word) in [
+        ("// CHECK-NXT: b", "CHECK-NXT"),
+        ("// CHECK-LABLE: b", "CHECK-LABLE"),
+        ("// CHECK-EMTPY:", "CHECK-EMTPY"),
+        ("// CHECK-next: b", "CHECK-next"),
+        ("// CHECK-NEXT b", "CHECK-NEXT"),
+        ("// CHECK-NEXT : b", "CHECK-NEXT"),
+        ("// CHECK-COUNT: b", "CHECK-COUNT"),
+        ("// CHECK-COUNT-x: b", "CHECK-COUNT-x"),
+        ("// CHECK-NEXT-NOT: b", "CHECK-NEXT-NOT"),
+        ("// CHECK_NEXT: b", "CHECK_NEXT"),
+        ("// CHECK-: b", "CHECK-"),
+    ] {
+        let r = fail(&format!("CHECK: a\n{line}"), "a\n");
+        assert_has(&r, &format!("`{word}` looks like a `CHECK` directive"));
+    }
+    // A prefix another RUN line checks is that prefix's, even one edit from a suffix.
+    let r = fail("CHECK: a\n// CHECK-NET: x", "a\n");
+    assert_has(&r, "`CHECK-NET` looks like a `CHECK` directive");
+    let o = Options {
+        other_prefixes: vec!["CHECK-NET".into()],
+        ..opts()
+    };
+    ok_with("CHECK: a\n// CHECK-NET: x\n// CHECK-NET-NEXT: y", "a\n", &o);
+}
+
+#[test]
 fn implicit_check_not_applies_everywhere() {
     let o = Options {
         implicit_check_not: vec!["call".into()],

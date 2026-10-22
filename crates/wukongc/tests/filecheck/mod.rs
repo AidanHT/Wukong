@@ -29,8 +29,13 @@
 //!
 //! A directive is a prefix (`CHECK`, or each of `Options::prefixes`) followed by `:` or one of the
 //! suffixes above, anywhere in a line, not preceded by a word character or `-`; a line holds at
-//! most one. A comment whose first word starts with a prefix but is no directive (`CHECK-NXT:`,
-//! `CHECK-NEXT` without its colon, `CHECK :`) is an error rather than a silently ignored line.
+//! most one. A comment whose first word is a misspelled directive (`CHECK-NXT:`, `CHECK-NEXT`
+//! without its colon, `CHECK :`, `CHECK_NEXT:`, `CHECK-NEXT-NOT:`) is an error rather than a
+//! silently ignored line. A word after `CHECK-` that is neither a suffix nor one edit from one
+//! makes a prefix of its own (`CHECK-O2:`), as in LLVM's shared-plus-specific layout
+//! (`--check-prefixes=CHECK,CHECK-O2` on one `RUN:` line, `CHECK,CHECK-O0` on another): a run
+//! that was not given it ignores its directives, as LLVM does. So does a run whose
+//! `Options::other_prefixes` names it, however close it is to a suffix ([`misspelled_directive`]).
 //!
 //! A failed match reports the directive's `file:line:col` and the line it is on, where the scan
 //! started in the input, the input line most like the pattern ("possible intended match"), and
@@ -50,6 +55,10 @@ use regex::{Node, RegexError};
 pub struct Options {
     /// The directive prefixes; `["CHECK"]` by default.
     pub prefixes: Vec<String>,
+    /// Prefixes the check file's other `RUN:` lines check: a comment directive of one of these is
+    /// that prefix's, never a misspelled directive of one of `prefixes` (`CHECK-NET:` beside
+    /// `CHECK`, one edit from `CHECK-NEXT:`).
+    pub other_prefixes: Vec<String>,
     /// Patterns that must not occur anywhere a positive directive did not match (FileCheck's
     /// `--implicit-check-not`): a `CHECK-NOT` before every directive and at the end.
     pub implicit_check_not: Vec<String>,
@@ -63,6 +72,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             prefixes: vec!["CHECK".to_string()],
+            other_prefixes: Vec::new(),
             implicit_check_not: Vec::new(),
             allow_empty: false,
             strict_whitespace: false,
@@ -281,6 +291,73 @@ fn find_directive(line: &str, prefixes: &[String]) -> Option<(usize, Kind, usize
     None
 }
 
+/// The suffixes a directive word may carry, without their `-` and `:`.
+const SUFFIXES: [&str; 7] = ["NEXT", "SAME", "NOT", "DAG", "LABEL", "EMPTY", "COUNT"];
+
+/// Is `body`, a comment that holds no directive, a misspelled directive of prefix `p`?
+///
+/// `CHECK :` is, and so is `CHECK-` or `CHECK_` followed by a word that is a suffix with its colon
+/// missing or misplaced (`CHECK-NEXT x`), one edit from a suffix (`CHECK-NXT:`, `CHECK-LABLE:`),
+/// a malformed count (`CHECK-COUNT:`) or a suffix combined with another (`CHECK-NEXT-NOT:`). Any
+/// other word makes `CHECK-<word>` a prefix of its own (`CHECK-O2:`, `CHECK-V3-NEXT:`), which
+/// another `RUN:` line may check: LLVM FileCheck ignores a directive of a prefix it was not
+/// given, and so does this. A directive of one of `other_prefixes` is never a typo, however
+/// close its name is to a suffix.
+fn misspelled_directive(body: &str, p: &str, other_prefixes: &[String]) -> bool {
+    let Some(rest) = body.strip_prefix(p) else {
+        return false;
+    };
+    if rest.trim_start().starts_with(':') {
+        return true;
+    }
+    let Some(tail) = rest.strip_prefix(['-', '_']) else {
+        return false;
+    };
+    let others = other_prefixes.iter().filter(|o| o.as_str() != p);
+    if others
+        .filter_map(|o| body.strip_prefix(o.as_str()))
+        .any(|after| Kind::parse_suffix(after).is_some())
+    {
+        return false;
+    }
+    let word: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    word.is_empty()
+        || word.starts_with("COUNT-")
+        || SUFFIXES.iter().any(|s| {
+            word.strip_prefix(s)
+                .is_some_and(|after| after.starts_with(['-', '_']))
+                || osa_distance(&word, s) <= 1
+        })
+}
+
+/// The optimal-string-alignment distance between `a` and `b`: insertions, deletions,
+/// substitutions and transpositions of adjacent characters each cost 1.
+fn osa_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    d[0] = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
+}
+
 /// Every directive of `text` with one of `opts.prefixes`, in order, parsed.
 fn read_directives(name: &str, text: &str, opts: &Options) -> Result<Vec<Pattern>, String> {
     let mut patterns = Vec::new();
@@ -291,10 +368,7 @@ fn read_directives(name: &str, text: &str, opts: &Options) -> Result<Vec<Pattern
             // A comment that starts like a directive but is none is a typo, not prose.
             if let Some(body) = comment_body(line) {
                 for p in &opts.prefixes {
-                    let Some(rest) = body.strip_prefix(p.as_str()) else {
-                        continue;
-                    };
-                    if rest.starts_with('-') || rest.trim_start().starts_with(':') {
+                    if misspelled_directive(body, p, &opts.other_prefixes) {
                         let word: String = body
                             .chars()
                             .take_while(|c| !c.is_whitespace() && *c != ':')

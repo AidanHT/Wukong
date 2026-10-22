@@ -480,6 +480,9 @@ struct Ctx<'a> {
     scratch: &'a Path,
     counter: AtomicUsize,
     compiler: &'a Compiler,
+    /// Every prefix the file's `RUN:` lines check: those one `filecheck` was not given are
+    /// another line's, so their directives are no misspellings of its own.
+    prefixes: &'a [String],
 }
 
 impl Ctx<'_> {
@@ -617,6 +620,12 @@ impl Ctx<'_> {
         if !prefixes.is_empty() {
             opts.prefixes = prefixes;
         }
+        opts.other_prefixes = self
+            .prefixes
+            .iter()
+            .filter(|p| !opts.prefixes.contains(p))
+            .cloned()
+            .collect();
         let Some(check_file) = check_file else {
             return fail("no check file (usually `filecheck %s`)".into());
         };
@@ -943,6 +952,7 @@ fn run_file_with(path: &Path, scratch_root: &Path, compiler: &Compiler) -> Outco
         scratch: &scratch,
         counter: AtomicUsize::new(0),
         compiler,
+        prefixes: &prefixes,
     };
     for run in &header.runs {
         if let Err(report) = ctx.run_line(run) {
@@ -1289,6 +1299,23 @@ fn the_harness_fails_a_failing_compile_and_a_passing_not() {
         panic!("`not` on a success must fail the test");
     };
     assert!(report.contains("`not` needs a failure"), "{report}");
+}
+
+#[test]
+fn run_lines_may_share_a_prefix_and_add_their_own() {
+    // LLVM's shared-plus-specific layout: each RUN line's own prefix is the other's directive,
+    // never a misspelled CHECK one — not even `CHECK-NET`, one edit from `CHECK-NEXT`.
+    let body = format!(
+        "// RUN: wukongc --emit=mir -O0 %s | filecheck %s --check-prefixes=CHECK,CHECK-O0\n\
+         // RUN: wukongc --emit=mir -O2 %s | filecheck %s --check-prefixes=CHECK,CHECK-NET\n\
+         // CHECK-LABEL: fn main() -> i32 {{\n\
+         // CHECK-O0: ret\n\
+         // CHECK-NET: ret\n{TINY}"
+    );
+    match run_scratch_test("shared", &body) {
+        Outcome::Pass => {}
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
