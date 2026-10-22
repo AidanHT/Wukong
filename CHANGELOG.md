@@ -33,9 +33,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   they computed) run lane by lane — lane 0's, then lane 1's, every step of a lane before the next
   lane's — so they happen in exactly the scalar loop's order, repeated indices included, while the
   arithmetic around them stays 4-wide (`tests/run/vec7_lane_serial.wk`). `loop_info::dependence`
-  lists such pairs (`DepSummary::serial`) instead of failing when the vectorizer asks.
-  `WUKONG_NO_LANE_SERIAL` restores the decline. A body whose every access would have to run lane
-  by lane (an unpromised scatter, a bare histogram) is still declined by the replication rule.
+  lists such pairs (`DepSummary::serial`) instead of failing when the vectorizer asks, and then
+  also takes a scatter of a typed element beside a slice's in-loop data-pointer read as
+  independent (no type punning). `WUKONG_NO_LANE_SERIAL` makes the vectorizer ask for the plain
+  verdict, which restores both declines. A body whose every access would have to run lane by lane
+  (an unpromised scatter, a bare histogram) is still declined by the replication rule.
 - **Outer-loop vectorization (N41).** A two-deep nest whose inner loop carries a row's own state
   the inner path cannot widen in parallel — a float sum (a matrix-vector product), a float
   min/max, a recurrence (per-row Horner) — is widened **across its rows**: lane `k` runs the inner

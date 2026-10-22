@@ -883,7 +883,10 @@ pub(crate) struct DepFacts<'a> {
     /// `None` keeps every call an opaque effect.
     pub(crate) calls: Option<&'a crate::effects::CallEffects>,
     /// Report a gather or scatter that may meet another access in [`DepSummary::serial`] instead of
-    /// failing the verdict.
+    /// failing the verdict, and take a scatter of a typed element beside a slice's data-pointer
+    /// read as independent (the no-punning rule, [`header_read`]). Both serve the one consumer that
+    /// orders the rest lane by lane — the vectorizer, which passes `false` under
+    /// `WUKONG_NO_LANE_SERIAL` so the switch reverts both.
     pub(crate) serial: bool,
 }
 
@@ -3950,6 +3953,56 @@ mod tests {
             !l.is_vectorizable_shape(),
             "a listed pair is not a plain widening licence"
         );
+    }
+
+    /// A scatter into a `[]f32` slice beside the loop's own read of that slice's data pointer (the
+    /// fat pointer re-read every iteration: no licm at `-O1`). Its index and value come from local
+    /// tables, which the alias analysis keeps apart from the parameter, so the header read is the
+    /// scatter's only possible conflict. The no-punning exemption that settles it belongs to the
+    /// lane-serial consumer alone ([`DepFacts::serial`]): every other consumer — and the vectorizer
+    /// under `WUKONG_NO_LANE_SERIAL`, which then asks for the plain analysis — still sees the pair
+    /// as carried, the verdict before the exemption existed.
+    #[test]
+    fn a_scatter_beside_its_slice_header_read_is_exempt_only_for_the_serial_consumer() {
+        let src = "@unchecked fn k(@noalias mut o: []f32, n: i64, z: i64) { \
+                   if z > 0 { k2(o, n, z - 1); return; } \
+                   let mut q: [i32; 16] = [0; 16]; let mut x: [f32; 16] = [0.0; 16]; \
+                   let mut j: i64 = 0; \
+                   while j < 16 { q[j] = ((j * j) % 7) as i32; x[j] = (j as f32) * 0.25; j = j + 1; } \
+                   let mut i: i64 = 0; \
+                   while i < n { o[q[i] as i64] = x[i] * 2.0 + 1.0; i = i + 1; } } \
+                   fn k2(mut o: []f32, n: i64, z: i64) { k(o, n, z); } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = serial_loop(src, "k");
+        let scatter = l
+            .accesses
+            .iter()
+            .find(|a| a.kind == AccessKind::Store && matches!(a.addr, AddrForm::Unknown))
+            .expect("the scatter loop");
+        assert!(
+            l.accesses.iter().any(header_read),
+            "no data-pointer read left in the loop: {:?}",
+            l.accesses
+        );
+        assert!(scatter.gather_base.is_some());
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+        assert!(
+            l.dep.serial.is_empty(),
+            "a plain scatter is no lane-serial region: {:?}",
+            l.dep.serial
+        );
+        // The same loop under the plain analysis every other consumer runs.
+        let forest = analyze_function(&opt_mir_of(src, "k", 1));
+        let plain = forest
+            .loops
+            .iter()
+            .find(|l| {
+                l.accesses
+                    .iter()
+                    .any(|a| a.kind == AccessKind::Store && matches!(a.addr, AddrForm::Unknown))
+            })
+            .expect("the scatter loop");
+        assert_eq!(plain.dep.memory, MemDep::Carried, "{}", plain.dep.reason);
     }
 
     /// A call is an opaque effect to every consumer without the summaries. With them, a call to a

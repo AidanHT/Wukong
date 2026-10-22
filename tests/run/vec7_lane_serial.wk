@@ -75,6 +75,13 @@
 // EXPECT-OUT: 735952
 // EXPECT-OUT: 994984
 // EXPECT-OUT: 0
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 13
+// EXPECT-OUT: -2
+// EXPECT-OUT: 14
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
 module tests.run.vec7_lane_serial
 
 // Lane-serial regions (-O2). A read-modify-write scatter `h[q[i]] += v`, two scatters into one
@@ -110,6 +117,15 @@ module tests.run.vec7_lane_serial
 //             reaches each lane's call as that lane's `bool`; folding the 23 updates bin by bin
 //             in j order gives h = 8287/64, 366845/2048, 0, 45997/256, 124373/512, 0 (bins 2
 //             and 5 are never hit); printed h[b] * 4096.
+//   scat_hdr: no lane-serial region at all - a plain scatter o[q[j]] = 2x + 1 whose loop re-reads
+//             o's data pointer every iteration (scat_hdr and scat_hdr2 call each other, and licm
+//             leaves that read in place). Index and value come from local tables, so the scatter's
+//             one possible conflict is that header read, and a typed f32 element never lands on a
+//             slice header (no punning): widened, and kept scalar under WUKONG_NO_LANE_SERIAL,
+//             which reverts that exemption with the regions. o[0..7] = -1, q[j] = j^2 mod 7 =
+//             0 1 4 2 | 2 4 1 0 | 1 4 2 2 | 4 1 0 1 (bins hit twice inside a group), x[j] = j/4,
+//             for j < 16: the last writer of each bin wins, o = 8, 17/2, 13/2, -1, 7, -1, -1;
+//             printed o[k] * 2.
 
 @unchecked
 fn hist(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, z: i64) {
@@ -211,6 +227,31 @@ fn hist_sel(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, z: i64)
         h[j] = sel(pos, g + e, 1);
         i = i + 1;
     }
+}
+
+@unchecked
+fn scat_hdr(@noalias mut o: []f32, n: i64, z: i64) {
+    if z > 0 {
+        scat_hdr2(o, n, z - 1);
+        return;
+    }
+    let mut q: [i32; 16] = [0; 16];
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut j: i64 = 0;
+    while j < 16 {
+        q[j] = ((j * j) % 7) as i32;
+        x[j] = (j as f32) * 0.25;
+        j = j + 1;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[q[i] as i64] = x[i] * 2.0 + 1.0;
+        i = i + 1;
+    }
+}
+
+fn scat_hdr2(mut o: []f32, n: i64, z: i64) {
+    scat_hdr(o, n, z);
 }
 
 fn again(z: i64) {
@@ -328,6 +369,19 @@ fn main() -> i32 {
     j = 0;
     while j < 6 {
         print((hs[j] * 4096.0) as i64);
+        j = j + 1;
+    }
+
+    let mut ho: []f32 = alloc_f32(7);
+    j = 0;
+    while j < 7 {
+        ho[j] = -1.0;
+        j = j + 1;
+    }
+    scat_hdr(ho, 16, 0);
+    j = 0;
+    while j < 7 {
+        print((ho[j] * 2.0) as i64);
         j = j + 1;
     }
     return 0;

@@ -968,6 +968,7 @@ fn pick(
     // every fixpoint iteration of the pass manager, so a DECLINE repeats once per iteration while a
     // WIDEN appears once — see the module docs before quoting the stream anywhere.
     let trace = std::env::var_os("WUKONG_VEC_TRACE").is_some();
+    let lane_serial = lane_serial_enabled();
     let decline = |header: u32, why: &str| {
         if trace {
             eprintln!("vectorize: declined loop at bb{header}: {why}");
@@ -1031,10 +1032,12 @@ fn pick(
         // Stage 3+4: accesses, carried values and dependence. Still not the derived-IV list, which
         // nothing here reads. A call the effect summaries prove side-effect free is no memory
         // access ([`plan_body`] replicates it per lane), and a gather or scatter that may meet
-        // another access is listed rather than failing the verdict ([`SerialRegion`]).
+        // another access is listed rather than failing the verdict ([`SerialRegion`]) — unless
+        // `WUKONG_NO_LANE_SERIAL` asks for the plain verdict, list and header-read exemption
+        // both off ([`lane_serial_enabled`]).
         let facts = loop_info::DepFacts {
             calls: effects,
-            serial: true,
+            serial: lane_serial,
         };
         loop_info::analyze_one_with(f, forest, idx, loop_info::Stages::Memory, facts);
         let l = forest.get(id);
@@ -1614,16 +1617,23 @@ fn plan_loop(
     })
 }
 
+/// Does the dependence analysis run for the lane-serial consumer ([`loop_info::DepFacts::serial`])?
+/// Everything but `WUKONG_NO_LANE_SERIAL` says yes. The switch is a strict revert, for a same-run
+/// A/B: the analysis then lists nothing (a gather or scatter that may meet another access is
+/// `Carried` again, so no region forms) and takes no header-read exemption (a scatter beside a
+/// slice's in-loop data-pointer read is `Carried` again), which is the verdict every loop had
+/// before either existed.
+fn lane_serial_enabled() -> bool {
+    std::env::var_os("WUKONG_NO_LANE_SERIAL").is_none()
+}
+
 /// The lane-serial region the dependence verdict asks for, if any: the span of the flattened body
 /// from the first to the last listed access ([`SerialRegion`]). Every listed access must be a step
 /// of its own — one inside an if-converted arm is predicated or merged, and has no single place in
-/// iteration order. `WUKONG_NO_LANE_SERIAL` turns the region off, restoring the decline.
+/// iteration order. Nothing is listed under `WUKONG_NO_LANE_SERIAL` ([`lane_serial_enabled`]).
 fn serial_region(l: &NaturalLoop, lin: &[LinInst]) -> Result<Option<SerialRegion>, &'static str> {
     if l.dep.serial.is_empty() {
         return Ok(None);
-    }
-    if std::env::var_os("WUKONG_NO_LANE_SERIAL").is_some() {
-        return Err("loop-carried dependence");
     }
     let mut span: Option<SerialRegion> = None;
     for &k in &l.dep.serial {

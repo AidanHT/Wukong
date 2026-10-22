@@ -1068,7 +1068,9 @@ listed accesses happen in the scalar loop's order, iteration by iteration, and a
 the earlier lane's write. The region's pure steps that read nothing it computed keep their plans and
 run first. Every pair with at most one listed access is still checked as before. A typed element
 store never lands on a slice header (no type punning), so a slice's data-pointer reads stay out of
-the region. `WUKONG_NO_LANE_SERIAL` restores the decline.
+the region — and a plain scatter beside its slice's in-loop data-pointer read needs no region at
+all. Under `WUKONG_NO_LANE_SERIAL` the vectorizer asks for the plain dependence verdict
+(`DepFacts::serial` off), which restores both declines, the header-read exemption's included.
 
 **Outer-loop vectorization** (`outer_vec.rs`, a child module): a two-deep nest — outer header, one
 straight block before the inner loop, a one-block inner loop, the outer latch after it — is widened

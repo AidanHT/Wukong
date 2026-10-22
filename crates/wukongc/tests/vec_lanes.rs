@@ -113,7 +113,11 @@ fn a_checked_gather_is_tested_per_group() {
 #[test]
 fn lane_serial_regions_widen_around_the_serial_accesses() {
     let m = mir("vec7_lane_serial.wk", &[]);
-    for k in ["hist", "two_scat", "beside", "alias", "checked", "hist_sel"] {
+    // `scat_hdr` is a plain scatter beside its slice's in-loop data-pointer read, which only the
+    // lane-serial consumer's no-punning exemption lets widen.
+    for k in [
+        "hist", "two_scat", "beside", "alias", "checked", "hist_sel", "scat_hdr",
+    ] {
         assert!(
             function(&m, k).contains("<4 x"),
             "{k} was not widened around its lane-serial region"
@@ -122,9 +126,12 @@ fn lane_serial_regions_widen_around_the_serial_accesses() {
     // The histogram's update is four scalar load/store pairs in the vector body.
     let hist = function(&m, "hist");
     assert!(hist.matches("store ").count() >= 5, "{hist}");
-    // The kill switch restores the decline, region by region.
+    // The kill switch restores the decline, region by region, and the header-read exemption with
+    // them.
     let off = mir("vec7_lane_serial.wk", &[("WUKONG_NO_LANE_SERIAL", "1")]);
-    for k in ["hist", "two_scat", "beside", "alias", "checked", "hist_sel"] {
+    for k in [
+        "hist", "two_scat", "beside", "alias", "checked", "hist_sel", "scat_hdr",
+    ] {
         assert!(
             !function(&off, k).contains("<4 x"),
             "{k} widened with WUKONG_NO_LANE_SERIAL set"
