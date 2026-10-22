@@ -278,9 +278,12 @@ pub struct Function {
 /// - No pass renumbers a `ValueId` (`value_types` only ever grows, and a new value is appended
 ///   at its end), so an entry can be lost but never transferred to another value.
 ///
-/// `wukong_mir_build` fills it for every value it creates. Of the optimizer's passes only
-/// inlining (a callee's values keep the callee's spans) and loop unrolling (each copy keeps its
-/// original's span) carry locations onto values they create; every other new value stays unknown.
+/// `wukong_mir_build` fills it for every value it creates. The optimizer's passes that copy
+/// located code carry each original's span onto its copy: inlining (a callee's values keep the
+/// callee's spans), loop unrolling and unroll-and-jam, bounds-check versioning and unswitching
+/// (each copy of a loop) and jump threading (each copy of a block). The vectorizer attributes each
+/// widened step to its scalar step's span and the guard, trip and exit it adds to the loop's. Every
+/// other new value stays unknown.
 /// The Cranelift backend tags each instruction with the `ValueId` it lowers (its `SourceLoc`), so
 /// a machine-code range maps back to a span through [`Function::value_loc`], and a backend
 /// failure points at the value it was lowering. The interpreter and the MIR printer ignore it, so

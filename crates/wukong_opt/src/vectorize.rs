@@ -163,6 +163,7 @@ use crate::loop_info::{
     NaturalLoop, RedKind, TripCount,
 };
 use crate::{each_op_use, CfgAnalyses, Pass};
+use wukong_span::Span;
 
 /// # Termination
 ///
@@ -4540,14 +4541,27 @@ fn op_of(f: &Function, v: ValueId) -> Option<&Op> {
 // ---------------------------------------------------------------------------------------------
 
 /// A tiny append-only instruction builder over a `Function`.
+///
+/// Like `wukong_mir::Builder` it carries a **current location**: every value it creates is
+/// attributed to `loc` (`wukong_mir::SourceLocs`; a dummy span records nothing). A widened loop is
+/// still its source loop, so [`apply`] starts at the loop's span ([`loop_loc`]) for the guard, the
+/// trip and the exit, and [`emit_body`] moves it to each scalar step's own span ([`step_loc`])
+/// while that step is widened — the vector `fadd` of `y[i] = a * x[i] + y[i]` is on the line the
+/// scalar `fadd` was.
 struct Emit<'a> {
     f: &'a mut Function,
+    loc: Span,
 }
 
 impl<'a> Emit<'a> {
+    fn new(f: &'a mut Function, loc: Span) -> Emit<'a> {
+        Emit { f, loc }
+    }
+
     fn value(&mut self, ty: MirType) -> ValueId {
         let id = ValueId(self.f.value_types.len() as u32);
         self.f.value_types.push(ty);
+        self.f.set_value_loc(id, self.loc);
         id
     }
 
@@ -4582,6 +4596,76 @@ impl<'a> Emit<'a> {
     }
 }
 
+/// The span of the source loop `p` widens: its header's exit test, else its induction variable,
+/// else the first located value of its body. Dummy when none of them is located (a loop the
+/// optimizer itself built), so its new values stay unknown rather than borrow another line.
+fn loop_loc(f: &Function, p: &VecPlan) -> Span {
+    let header = &f.blocks[p.header.0 as usize];
+    let exit_test = match &header.term {
+        Terminator::CondBr { cond, .. } => f.value_loc(*cond),
+        _ => None,
+    };
+    exit_test
+        .or_else(|| f.value_loc(header.params[p.iv_index]))
+        .or_else(|| {
+            f.blocks[p.body.0 as usize]
+                .insts
+                .iter()
+                .find_map(|i| i.result.and_then(|r| f.value_loc(r)))
+        })
+        .unwrap_or_else(Span::dummy)
+}
+
+/// The span of the scalar step a body step widens: its result's, or for a store (which has no
+/// result) its address's, else its stored value's. `None` when the step is not located.
+fn step_loc(f: &Function, step: &LinInst) -> Option<Span> {
+    let inst_loc = |(block, idx): (BlockId, usize)| match &f.blocks[block.0 as usize].insts[idx] {
+        Inst {
+            result: Some(r), ..
+        } => f.value_loc(*r),
+        Inst {
+            op: Op::Store { ptr, value },
+            ..
+        } => f.value_loc(*ptr).or_else(|| f.value_loc(*value)),
+        _ => None,
+    };
+    match step {
+        LinInst::Real { block, idx } | LinInst::PredLoad { block, idx, .. } => {
+            inst_loc((*block, *idx))
+        }
+        LinInst::MaskedStore { at, .. }
+        | LinInst::TreeStore { at, .. }
+        | LinInst::PredStore { at, .. } => inst_loc(*at),
+        LinInst::Merge { param, .. } => f.value_loc(*param),
+    }
+}
+
+/// The span of reduction `r`'s scalar update (its back-edge argument), else of its accumulator,
+/// else `fallback`: the combines and folds of its partials are that update, regrouped.
+fn red_loc(f: &Function, p: &VecPlan, r: &RedPlan, fallback: Span) -> Span {
+    let update = match &f.blocks[p.body.0 as usize].term {
+        Terminator::Br { args, .. } => args.get(r.param_index).copied(),
+        Terminator::CondBr {
+            then_blk,
+            then_args,
+            else_args,
+            ..
+        } => {
+            let args = if *then_blk == p.header {
+                then_args
+            } else {
+                else_args
+            };
+            args.get(r.param_index).copied()
+        }
+        _ => None,
+    };
+    update
+        .and_then(|v| f.value_loc(v))
+        .or_else(|| f.value_loc(f.blocks[p.header.0 as usize].params[r.param_index]))
+        .unwrap_or(fallback)
+}
+
 fn apply(f: &mut Function, p: &VecPlan) {
     let header_params: Vec<ValueId> = f.blocks[p.header.0 as usize].params.clone();
     let header_tys: Vec<MirType> = header_params
@@ -4589,7 +4673,8 @@ fn apply(f: &mut Function, p: &VecPlan) {
         .map(|v| f.value_type(*v).clone())
         .collect();
 
-    let mut e = Emit { f };
+    let loop_at = loop_loc(f, p);
+    let mut e = Emit::new(f, loop_at);
 
     // Reassociable reductions carry an extra, vector-typed accumulator through the vector loop —
     // `W` independent partials that are folded into the scalar accumulator once, on the way out.
@@ -4714,6 +4799,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let mut exit_args = vh_params[..header_tys.len()].to_vec();
     let mut next_param = header_tys.len();
     for r in &vacc {
+        e.loc = red_loc(e.f, p, r, loop_at);
         let n = parts_of(&r.ty, p.w);
         let parts = vh_params[next_param..next_param + n].to_vec();
         next_param += n;
@@ -4744,6 +4830,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
         }
         exit_args[r.param_index] = acc;
     }
+    e.loc = loop_at;
     e.f.blocks[vx.0 as usize].term = Terminator::Br {
         target: p.header,
         args: exit_args,
@@ -4761,6 +4848,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
         &header_params,
         &vh_params,
     );
+    e.loc = loop_at;
     reads.finish(&mut e);
     e.f.blocks[last.0 as usize].term = Terminator::Br {
         target: vh,
@@ -5211,6 +5299,13 @@ fn emit_body(
     vh_params: &[ValueId],
 ) -> (Vec<ValueId>, BlockId) {
     let latch_term = e.f.blocks[p.body.0 as usize].term.clone();
+    // The loop's own span ([`loop_loc`]), for what no single step owns: the lane ramp, the step of
+    // the counter and the back edge. Each step and each reduction moves the cursor to its own.
+    let loop_at = e.loc;
+    let exit_at = p
+        .early
+        .and_then(|x| e.f.value_loc(x.cond))
+        .unwrap_or(loop_at);
 
     // scalar value -> its counterpart in the vector body.
     let mut map: FxHashMap<u32, Wide> = FxHashMap::default();
@@ -5261,8 +5356,10 @@ fn emit_body(
 
     for (i, step) in p.lin.iter().enumerate() {
         if p.early.is_some_and(|x| x.split == i) {
+            e.loc = exit_at;
             vb = emit_exit_test(e, p, vb, vx, &map);
         }
+        e.loc = step_loc(e.f, step).unwrap_or(loop_at);
         // Give the induction variable its lane-varying face for exactly the steps that read it as a
         // value, and its scalar one everywhere else, so the address arithmetic around them stays
         // scalar. Set at the top of every iteration rather than restored at the bottom: the body
@@ -5612,6 +5709,7 @@ fn emit_body(
 
     // A search loop whose latch computes nothing but the step tests after every body step.
     if p.early.is_some_and(|x| x.split == p.lin.len()) {
+        e.loc = exit_at;
         vb = emit_exit_test(e, p, vb, vx, &map);
     }
 
@@ -5634,6 +5732,7 @@ fn emit_body(
     let mut vacc_next: Vec<ValueId> = Vec::new();
     let header_len = header_params.len();
     for r in &p.reductions {
+        e.loc = red_loc(e.f, p, r, loop_at);
         if let Some((_, ity)) = &r.arg {
             // An argmax: per part, the loop's own compare with the partial maximum in the
             // accumulator's position, a select of the value, and a select of the counter's lane
@@ -5740,6 +5839,8 @@ fn emit_body(
         let out = emit_reduction_fold(e, vb, &map, r, init, p.w);
         acc_of.insert(r.param_index, out);
     }
+
+    e.loc = loop_at;
 
     // Back-edge arguments, one per header parameter.
     let latch_args = match &latch_term {

@@ -47,8 +47,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
 and a failure inside one function points at the source construct being lowered (the oversized
 `let`), else at that function's declaration; a module-level failure (an unresolved `extern "C"`
 symbol, an unsupported target CPU) has no span. Every MIR value is located straight out of lowering,
-inlining and unrolling carry locations onto the values they copy, and values other passes create
-stay unknown (about 75% of the corpus's instructions are still located at `-O2`); Cranelift's
+the passes that copy code (inlining, unrolling, bounds-check versioning, unswitching, jump threading)
+carry locations onto the values they copy, the vectorizer gives each widened value its scalar step's,
+and the guards other passes synthesize stay unknown (about 96% of the corpus's instructions are still
+located at `-O2`); Cranelift's
 per-instruction source locations follow the table and drop, never borrow, an unknown one. `-g`
 turns them into DWARF in `--emit=obj|exe` (COFF and ELF): a line table (`file:line:column` per
 machine-code range; an unlocated range continues the row before it), one subprogram per function,

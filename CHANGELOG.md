@@ -142,6 +142,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `f8_negated_literal.wk`;
   `tests/fail/f8_literal_out_of_range.wk` (E0438), `f8_format_mix.wk` (E0440),
   `f8_vector_lane.wk` (E0302), `extern_f8.wk` (C0001).
+### Source locations through the vectorizer and the loop-copying passes
+
+- **Fix: vectorized and copied code keeps its source line at `-O2`.** The MIR vectorizer created
+  every widened value with no source location, and bounds-check versioning, unswitching, jump
+  threading and unroll-and-jam copied loops and blocks without their originals' locations (a later
+  unroll of such a copy then copied nothing). With the vectorizer now widening more loops (256-bit
+  kernels, bf16 lanes) the `-O2` census in `crates/wukong_opt/tests/source_locations.rs` fell to
+  73.05%, below its 74% floor. The vectorizer's builder now has a current location: a widened
+  step's values take the span of the scalar step they widen, a reduction's folds its update's, and
+  the guard, trip and exit the loop's; each copying pass copies its originals' spans. `-O2` now
+  keeps 96.48% of the corpus's result-bearing instructions located, pinned at 96%; what stays
+  unknown is what the optimizer synthesizes (the unroller's limits, the bounds-check and unswitch
+  guards, SLP packs). Code is unchanged; only the `-g` line table and native diagnostics see it.
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

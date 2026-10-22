@@ -846,10 +846,15 @@ statement window a recognizer replaces with one kernel call is attributed to its
 Each source function starts at its name (`Builder::set_decl`; a generic instance at its template's,
 a lifted closure at its literal) and an outlined `@parallel` region at its loop, so straight out of
 lowering every value of a source function is located (`crates/wukong_opt/tests/source_locations.rs`
-pins 100% over `tests/run`). Of the optimizer's passes only inlining (the callee's values keep the
-callee's spans) and loop unrolling (each copy keeps its original's) carry locations onto the values
-they create; every other new value stays unknown, and the same census pins the share that survives
-`-O2` from below. The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
+pins 100% over `tests/run`). The optimizer's passes that copy located code carry each original's
+span onto its copy (`Function::copy_value_loc`): inlining (the callee's values keep the callee's
+spans), loop unrolling and unroll-and-jam, bounds-check versioning and unswitching (each copy of a
+loop) and jump threading (each copy of a block). The vectorizer's builder has a current location,
+like `mir_build`'s: a widened step's vector values take the span of the scalar step they widen (a
+store's, its address's), a reduction's folds the span of its update, and the guard, trip and exit
+the span of the loop's exit test. Every other new value stays unknown — the unroller's wrap-safe
+limits, the bounds-check and unswitch guards, SLP packs — and the same census pins the share that
+survives `-O2` from below (96.48% over the corpus). The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
 `ValueId` (`FnTranslator::translate`): an instruction with a result carries that value when it is
 located; a store or void call, which has no table entry of its own, carries the value it reads when
 that value was lowered just before it; a terminator carries its condition, scrutinee or return

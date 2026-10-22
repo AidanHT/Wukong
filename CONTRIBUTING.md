@@ -271,8 +271,8 @@ build it with `-g` and use a debugger: `wukongc --emit=exe -g -O2 bug.wk -o bug.
 `gdb bug.exe` breaks by function or `bug.wk:<line>`, steps by line and backtraces through every
 Wukong frame (`docs/internals.md`, "Debug info and the JIT perf map"); `-g` changes no machine code.
 A value a pass creates is attributed to a line only if the pass copies a location onto it
-(`Function::copy_value_loc`, as inlining and unrolling do); otherwise its code continues the line
-before it.
+(`Function::copy_value_loc`, as inlining, unrolling and the loop-copying passes do; the vectorizer
+sets its builder's current location instead); otherwise its code continues the line before it.
 
 ## Adding a language feature
 
