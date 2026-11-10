@@ -2,10 +2,11 @@
 // EXPECT-COUNT: 1
 module tests.fail.closure_let_escape
 
-// `scale` is bound to a closure. Every call through it is resolved at compile time to a direct
-// call of the closure's code, and passing it to a function-typed parameter specializes the callee
-// for it; there is no run-time function value. Copying it into another local would need one.
-// tests/run/closure_let.wk is the positive control.
+// `scale` is bound to a closure that captures `k`. Every call through it is resolved at compile
+// time to a direct call of the closure's code, and passing it to a function-typed parameter
+// specializes the callee for it. Copying it into another local would need a run-time function
+// value, which is only a code address with no room for `k` (a closure that captures nothing can
+// be copied). tests/run/closure_let.wk is the positive control.
 
 fn main() -> i32 {
     let k = 3.0;

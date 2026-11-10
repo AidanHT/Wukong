@@ -715,7 +715,8 @@ fn legal(
         }
         let mut passed = moved.iter().filter(|m| m.idx < j);
         match &inst.op {
-            Op::Call { .. } | Op::VecKernelCall { .. } => {
+            // A call of any kind (`Op::effects`).
+            op if op.is_call() => {
                 if passed.any(|m| !alias.is_call_proof(m.ptr)) {
                     return Err("a call between the members may touch a moved access");
                 }

@@ -1746,13 +1746,11 @@ fn linearize_region(
                 Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, ..) => {
                     return Err("an arm divides, which may fault on a lane that would not run it")
                 }
-                Op::Call { .. }
-                | Op::VecKernelCall { .. }
-                | Op::AtomicAdd { .. }
-                | Op::Alloca {
-                    space: wukong_mir::AddrSpace::Local,
-                    ..
-                } => return Err("an arm has an effect that cannot be predicated"),
+                // A frame slot, or any write but a plain store (`Op::effects`): a call of any
+                // kind, an atomic.
+                op if unpredicable(op) => {
+                    return Err("an arm has an effect that cannot be predicated")
+                }
                 _ => {}
             }
         }
@@ -2023,13 +2021,7 @@ impl TreeWalk<'_> {
                 {
                     return Err("an arm divides, which may fault on a lane that would not run it")
                 }
-                Op::Call { .. }
-                | Op::VecKernelCall { .. }
-                | Op::AtomicAdd { .. }
-                | Op::Alloca {
-                    space: wukong_mir::AddrSpace::Local,
-                    ..
-                } if !pred.is_empty() => {
+                op if unpredicable(op) && !pred.is_empty() => {
                     return Err("an arm has an effect that cannot be predicated")
                 }
                 op => {
@@ -2852,19 +2844,17 @@ fn header_is_test_only(f: &Function, l: &NaturalLoop) -> bool {
         .iter()
         .filter_map(|i| i.result.map(|r| r.0))
         .collect();
+    // No memory access, no write of any kind (`Op::effects`) and no frame slot.
     if header.insts.iter().any(|i| {
-        matches!(
-            i.op,
-            Op::Store { .. }
-                | Op::Load(..)
-                | Op::Call { .. }
-                | Op::VecKernelCall { .. }
-                | Op::AtomicAdd { .. }
-                | Op::Alloca {
+        i.op.may_read_memory()
+            || i.op.may_write_memory()
+            || matches!(
+                i.op,
+                Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..
                 }
-        )
+            )
     }) {
         return false;
     }
@@ -3097,6 +3087,19 @@ enum Role {
     Value,
     /// Neither, so the loop cannot be widened.
     Reject,
+}
+
+/// May this op not run under a lane mask? A frame slot, or a write other than a plain store
+/// (`Op::effects`: a call of any kind, an atomic) — something a lane that would not have run it
+/// cannot be kept from doing.
+fn unpredicable(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Alloca {
+            space: wukong_mir::AddrSpace::Local,
+            ..
+        }
+    ) || (op.may_write_memory() && !matches!(op, Op::Store { .. }))
 }
 
 /// May this operation read the induction variable as one lane-varying vector operand?

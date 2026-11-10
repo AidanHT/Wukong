@@ -17,8 +17,8 @@ use wukong_span::{Interner, SourceId, Span};
 use wukong_types::{Scalar, Ty};
 
 use crate::{
-    lower_program, mir_ty, ret_mir_ty, HELP_ANNOTATE, HELP_BIND_TYPE_PARAM, HELP_FN_VALUE,
-    HELP_UNBOUND_NAME, HELP_UNREACHABLE_TYPE,
+    lower_program, mir_ty, ret_mir_ty, HELP_ANNOTATE, HELP_BIND_TYPE_PARAM, HELP_UNBOUND_NAME,
+    HELP_UNREACHABLE_TYPE,
 };
 
 /// Parse and check `src`, which must check clean.
@@ -159,12 +159,13 @@ fn the_free_mir_ty_answers_only_from_structure() {
     assert_eq!(mir_ty(&Ty::Tuple(vec![f32_.clone(), Ty::Named(p)])), None);
     // An extent the MIR's `u32` cannot hold is no answer, not a truncated one.
     assert_eq!(mir_ty(&arr(f32_.clone(), u64::from(u32::MAX) + 2)), None);
-    // No machine representation at all.
+    // A function value is one code address.
     let fn_ty = Ty::Fn {
         params: vec![f32_.clone()],
         ret: Box::new(f32_),
     };
-    assert_eq!(mir_ty(&fn_ty), None);
+    assert_eq!(mir_ty(&fn_ty), Some(MirType::Ptr));
+    // No machine representation at all.
     assert_eq!(mir_ty(&Ty::Unknown), None);
     assert_eq!(mir_ty(&Ty::Error), None);
 }
@@ -276,13 +277,9 @@ fn an_annotation_sema_rejects_is_refused_if_it_reaches_lowering() {
     let src = "struct P { x: f32 }\n\
                fn locals() -> i32 { let a: f32; return 0; }\n\
                fn main() -> i32 { return locals(); }\n";
-    let cases: [(&str, fn(&mut Interner, Span) -> TypeKind); 3] = [
+    let cases: [(&str, fn(&mut Interner, Span) -> TypeKind); 2] = [
         ("dimension `512` written as a type", |i, _| {
             TypeKind::Int(i.intern("512"))
-        }),
-        ("a value of function type", |_, _| TypeKind::Fn {
-            params: vec![],
-            ret: None,
         }),
         ("unexpanded generic type `P<..>`", |i, span| {
             TypeKind::Generic {
@@ -328,22 +325,12 @@ fn a_value_type_with_no_representation_is_refused() {
     let src = "fn other() -> i32 { return 1; }\n\
                fn locals() -> i32 { let v = 1.5; return 0; }\n\
                fn main() -> i32 { return locals() + other(); }\n";
-    let cases: [(&str, &str, fn(&mut Interner) -> Ty); 4] = [
+    let cases: [(&str, &str, fn(&mut Interner) -> Ty); 3] = [
         // Reachable: sema leaves a value it does not model `Unknown`.
         (
             "a value whose type was never determined (`_`)",
             HELP_ANNOTATE,
             |_| Ty::Unknown,
-        ),
-        // Reachable: a function name in an array or tuple literal, or alone as a statement, is
-        // typed as a function value (`[square, square]` is `[fn(f32) -> f32; 2]`).
-        (
-            "a function value of type `fn(f32) -> f32`",
-            HELP_FN_VALUE,
-            |_| Ty::Fn {
-                params: vec![Ty::Scalar(Scalar::F32)],
-                ret: Box::new(Ty::Scalar(Scalar::F32)),
-            },
         ),
         // Reachable: a name declared as something other than a type, shadowed by a type
         // parameter that is not the enclosing function's (a generic struct's own `T`).
@@ -408,31 +395,23 @@ fn a_type_parameter_that_shadows_an_item_is_refused_not_sized_as_the_item() {
     }
 }
 
-/// A function named as a value outside a call is refused as `C0001` where it is lowered, with no
-/// detour through the compiler-bug refusal: in an array literal (sema types it
-/// `[fn(f32) -> f32; 2]`) and alone as a statement. Both were the debug-build panic.
+/// A function named as a value outside a call is its address (`func_addr`): in an array literal
+/// (sema types it `[fn(f32) -> f32; 2]`) and alone as a statement. Both were a `C0001` refusal
+/// (and before that the debug-build panic) when a function type had no representation.
 #[test]
-fn a_function_value_outside_a_call_is_a_codegen_limit() {
+fn a_function_named_as_a_value_is_its_address() {
     for body in ["let _fs = [square, square];", "square;"] {
         let src = format!(
             "fn square(x: f32) -> f32 {{ return x * x; }}\n\
              fn main() -> i32 {{ {body} return 0; }}\n"
         );
         let (module, sema, mut interner) = checked(&src);
-        let (_, diags) = lower_program(&module, &sema, &mut interner);
-        let errs = errors(&diags);
-        assert!(!errs.is_empty(), "{body}: lowered clean");
-        for (code, message) in &errs {
-            assert_eq!(*code, Some("C0001"), "{body}: {errs:?}");
-            assert!(!message.contains("<error>"), "{body}: {message}");
-        }
-        assert!(
-            diags.iter().all(|d| d
-                .notes
-                .iter()
-                .all(|(_, text)| text != HELP_UNREACHABLE_TYPE)),
-            "{body}: the compiler-bug refusal: {diags:?}"
-        );
+        let (program, diags) = lower_program(&module, &sema, &mut interner);
+        assert!(errors(&diags).is_empty(), "{body}: {diags:?}");
+        assert!(wukong_mir::verify::verify_program(&program).is_empty());
+        let main = program.function(interner.intern("main")).unwrap();
+        let text = wukong_mir::print::print_function(main, &interner);
+        assert!(text.contains("func_addr square"), "{body}: {text}");
     }
 }
 

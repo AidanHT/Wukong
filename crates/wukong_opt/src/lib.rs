@@ -69,6 +69,7 @@ mod cfg;
 pub mod coalesce;
 mod cse;
 mod dce;
+mod devirt;
 mod dom;
 mod dse;
 mod effects;
@@ -110,6 +111,7 @@ pub use coalesce::{
 };
 pub use cse::Cse;
 pub use dce::Dce;
+pub use devirt::devirtualize_program;
 pub use dse::Dse;
 pub use inline::inline_program;
 pub use jump_thread::JumpThread;
@@ -827,6 +829,17 @@ pub fn optimize_preserving_with(
     PassManager::standard_with(opt_level, options)
         .run_program(program, None, debug, par)
         .unwrap_or_else(|failure| panic!("{failure}"));
+    // A call through a function value whose callee the pipeline made visible becomes a direct
+    // call, and the program is optimized again around the new call edges (`devirt`: outside the
+    // fixpoint, so the call-effect table never depends on the schedule).
+    if opt_level >= 1 && !devirt::devirtualize_program(program).is_empty() {
+        if opt_level >= 2 {
+            inline::inline_program_preserving(program, roots);
+        }
+        PassManager::standard_with(opt_level, options)
+            .run_program(program, None, debug, par)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
     // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
     // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
@@ -884,6 +897,15 @@ pub fn optimize_verified_preserving_with(
     verify_program_stage(program, "pipeline input")?;
     pm.run_program(program, None, true, par)?;
     verify_program_stage(program, "pipeline output")?;
+    if opt_level >= 1 && !devirt::devirtualize_program(program).is_empty() {
+        verify_program_stage(program, "devirt")?;
+        if opt_level >= 2 {
+            inline::inline_program_preserving(program, roots);
+            verify_program_stage(program, "inline")?;
+        }
+        pm.run_program(program, None, true, par)?;
+        verify_program_stage(program, "pipeline output")?;
+    }
     if opt_level >= 2 {
         let changed = unroll::unroll_program_with(program, par);
         verify_program_stage(program, "unroll")?;
@@ -929,6 +951,16 @@ pub fn optimize_timed_with(
     PassManager::standard_with(opt_level, options)
         .run_program(program, Some(&mut t), debug, par)
         .unwrap_or_else(|failure| panic!("{failure}"));
+    if opt_level >= 1 && !devirt::devirtualize_program(program).is_empty() {
+        if opt_level >= 2 {
+            let i0 = Instant::now();
+            inline_program(program);
+            t.inline += i0.elapsed();
+        }
+        PassManager::standard_with(opt_level, options)
+            .run_program(program, Some(&mut t), debug, par)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
     if opt_level >= 2 {
         // The unroll bucket is the pass *and* its cleanup sweep: that sum is the cost unrolling
         // actually adds, which is the number worth reporting. Keeping the cleanup out of the
@@ -996,6 +1028,12 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
             *index = f(*index);
         }
         Op::Call { args, .. } => {
+            for a in args {
+                *a = f(*a);
+            }
+        }
+        Op::CallIndirect { callee, args, .. } => {
+            *callee = f(*callee);
             for a in args {
                 *a = f(*a);
             }
@@ -1097,6 +1135,12 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
                 f(*a);
             }
         }
+        Op::CallIndirect { callee, args, .. } => {
+            f(*callee);
+            for a in args {
+                f(*a);
+            }
+        }
         Op::VecKernelCall {
             ptrs, scalars, n, ..
         } => {
@@ -1143,20 +1187,11 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
     }
 }
 
-/// Does this op have a side effect that prevents removing it even if its result is unused?
-pub(crate) fn has_side_effects(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Store { .. }
-            | Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::Barrier
-            | Op::AtomicAdd { .. }
-    )
-}
-
 #[cfg(test)]
 mod atomic_tests;
+
+#[cfg(test)]
+mod indirect_tests;
 
 #[cfg(test)]
 mod parallel_tests;

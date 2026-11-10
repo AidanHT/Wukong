@@ -1,0 +1,103 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 512
+// EXPECT-OUT: 16
+// EXPECT-OUT: 27
+// EXPECT-OUT: 528
+// EXPECT-OUT: 532
+// EXPECT-OUT: 10
+module tests.run.fn_values_shadowing
+
+// A `let` (or a `for` binding) that shadows a function-typed parameter holds a run-time function
+// value of its own, in every instance of the function, including the one specialized for a
+// function the parameter is bound to at compile time. Passing the shadowing local on to another
+// function-typed parameter used to ask the instance's binding first, so `outer(sq, 2)` called
+// `apply_twice` specialized for `sq` and printed 16; the shadowing local is never the parameter.
+// Expectations by hand:
+//   outer(sq, 2): `f` shadowed by cube, apply_twice(f, 2) = cube(cube(2)) = cube(8)  = 512
+//   plain(sq, 2): no shadow, apply_twice(f, 2) = sq(sq(2)) = sq(4)                    = 16
+//   called(sq, 3): the shadowing local called directly, cube(3)                       = 27
+//   scoped(sq, 2): shadowed in an inner block only: cube(cube(2)) inside it, then the
+//     parameter again after it, sq(sq(2)): 512 + 16                                   = 528
+//   each(sq, 2): the parameter, then a `for` binding of the same name over [cube, inc]:
+//     sq(sq(2)) + cube(cube(2)) + inc(inc(2)) = 16 + 512 + 4                          = 532
+//   forward(direct, 3): `h` shadowed by runner, which takes a function-typed parameter
+//     itself (so its address is the instance taking that parameter at run time):
+//     runner(apply, 3) = apply(sq, 3) + 1 = 9 + 1                                     = 10
+
+fn sq(x: i32) -> i32 {
+    return x * x;
+}
+
+fn cube(x: i32) -> i32 {
+    return x * x * x;
+}
+
+fn inc(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn apply_twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(f(x));
+}
+
+@allow(unused_variables)
+fn outer(f: fn(i32) -> i32, x: i32) -> i32 {
+    let f: fn(i32) -> i32 = cube;
+    return apply_twice(f, x);
+}
+
+fn plain(f: fn(i32) -> i32, x: i32) -> i32 {
+    return apply_twice(f, x);
+}
+
+@allow(unused_variables)
+fn called(f: fn(i32) -> i32, x: i32) -> i32 {
+    let f: fn(i32) -> i32 = cube;
+    return f(x);
+}
+
+fn scoped(f: fn(i32) -> i32, x: i32) -> i32 {
+    let a = {
+        let f: fn(i32) -> i32 = cube;
+        apply_twice(f, x)
+    };
+    return a + apply_twice(f, x);
+}
+
+fn each(g: fn(i32) -> i32, x: i32) -> i32 {
+    let fs: [fn(i32) -> i32; 2] = [cube, inc];
+    let mut total = apply_twice(g, x);
+    for g in fs {
+        total = total + apply_twice(g, x);
+    }
+    return total;
+}
+
+fn runner(g: fn(fn(i32) -> i32, i32) -> i32, x: i32) -> i32 {
+    return g(sq, x) + 1;
+}
+
+fn direct(g: fn(fn(i32) -> i32, i32) -> i32, x: i32) -> i32 {
+    return g(sq, x);
+}
+
+@allow(unused_variables)
+fn forward(h: fn(fn(fn(i32) -> i32, i32) -> i32, i32) -> i32, x: i32) -> i32 {
+    let h: fn(fn(fn(i32) -> i32, i32) -> i32, i32) -> i32 = runner;
+    return h(apply, x);
+}
+
+fn main() -> i32 {
+    print(outer(sq, 2));
+    print(plain(sq, 2));
+    print(called(sq, 3));
+    print(scoped(sq, 2));
+    print(each(sq, 2));
+    print(forward(direct, 3));
+    return 0;
+}

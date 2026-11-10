@@ -1,0 +1,23 @@
+// EXPECT-CODE: E0427
+// EXPECT-COUNT: 2
+module tests.fail.closure_indirect_call_captures
+
+// `g` holds a run-time function value, so `g(..)` is a call through a pointer: nothing is
+// specialized for the closure it is given, which must therefore be a code address alone. A
+// closure that captures `k` (written at the call, or bound by `let` and passed by name) has
+// nowhere to keep `k`. Passed to `apply` by name instead, the same closures work: `apply` is then
+// specialized for each and receives `k` as a hidden argument.
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let g: fn(fn(i32) -> i32, i32) -> i32 = apply;
+    let k = 5;
+    print(g(|x| x + k, 3)); //~ E0427
+    let c = |x: i32| x * k;
+    print(g(c, 3)); //~ E0427
+    print(apply(c, 3));
+    return 0;
+}

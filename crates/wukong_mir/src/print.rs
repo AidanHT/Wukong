@@ -124,6 +124,15 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
             let a: Vec<String> = args.iter().map(|v| val(*v)).collect();
             format!("call {}({})", interner.resolve(*func), a.join(", "))
         }
+        Op::CallIndirect { callee, args, ret } => {
+            let a: Vec<String> = args.iter().map(|v| val(*v)).collect();
+            format!(
+                "call_indirect {}({}) -> {}",
+                val(*callee),
+                a.join(", "),
+                ret.display()
+            )
+        }
         Op::FuncAddr(func) => format!("func_addr {}", interner.resolve(*func)),
         Op::GlobalAddr(data) => format!("global_addr {}", interner.resolve(*data)),
         Op::Splat(v) => format!("splat {}", val(*v)),

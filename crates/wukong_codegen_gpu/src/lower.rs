@@ -1451,6 +1451,15 @@ impl<'a> FnEmit<'a> {
                 return Ok(());
             }
             Op::Call { func, args } => return self.lower_call(*func, args, inst.result),
+            // A call through a function value: PTX has no portable function pointers (an
+            // `Op::FuncAddr` is only ever a `wukong_parallel_for` target here, never materialized),
+            // so decline — the coverage gate skips the function rather than miscompiling it.
+            Op::CallIndirect { .. } => {
+                return Err(format!(
+                    "{UNSUPPORTED} `CallIndirect` (a call through a function value) not lowered \
+                     to PTX"
+                ))
+            }
             // A raw-AVX2 CPU microkernel call (the general 256-bit loop vectorizer's `VecKernelCall`)
             // has no PTX analog; report it UNSUPPORTED so the coverage gate skips this function.
             Op::VecKernelCall { .. } => {
@@ -1653,6 +1662,7 @@ impl<'a> FnEmit<'a> {
             }
             Op::Store { .. }
             | Op::Call { .. }
+            | Op::CallIndirect { .. }
             | Op::VecKernelCall { .. }
             | Op::Barrier
             | Op::AtomicAdd { .. } => {

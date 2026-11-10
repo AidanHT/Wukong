@@ -87,7 +87,9 @@ cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:
 char_match.wk:
 char_type.wk:
+closure_capture_indirect_write.wk:
 closure_capture_out_params.wk: wukong_argsort_f32 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_fmt_lit wukong_rt_fmt_str wukong_rt_free wukong_rt_free*2 wukong_vmath_f32 wukong_vmath_f32*4
+closure_capture_views.wk: wukong_rt_alloc wukong_rt_fmt_lit wukong_rt_fmt_str wukong_rt_free
 closure_captures.wk:
 closure_hidden_reads.wk:
 closure_i8_accumulator.wk: wukong_i8gemm_nt wukong_i8gemm_nt*2
@@ -192,6 +194,11 @@ float_literal_suffix.wk:
 float_underscore.wk:
 fmax_int.wk:
 fn_params.wk:
+fn_values.wk:
+fn_values_captured.wk:
+fn_values_devirt.wk:
+fn_values_dispatch.wk:
+fn_values_shadowing.wk:
 for_array.wk:
 for_continue.wk:
 for_destructure.wk:

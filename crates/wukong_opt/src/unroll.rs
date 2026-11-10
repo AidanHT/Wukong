@@ -343,18 +343,17 @@ struct Candidate {
 /// they must be repeatable without observable effect. Loads are excluded conservatively: the header
 /// of the shape we accept holds the compare and nothing else.
 fn pure_header_op(op: &Op) -> bool {
-    !matches!(
-        op,
-        Op::Load(..)
-            | Op::Store { .. }
-            | Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::AtomicAdd { .. }
-            | Op::Alloca {
+    // No memory access, no write of any kind (`Op::effects`: a call of any kind, an atomic), and
+    // no frame slot.
+    !op.may_read_memory()
+        && !op.may_write_memory()
+        && !matches!(
+            op,
+            Op::Alloca {
                 space: wukong_mir::AddrSpace::Local,
                 ..
             }
-    )
+        )
 }
 
 /// May this operation appear in a *body* we are about to duplicate? Loads and stores are fine — the
@@ -362,16 +361,16 @@ fn pure_header_op(op: &Op) -> bool {
 /// is a code-size loss on a body that is already dominated by the call's own cost, and an alloca
 /// would multiply the frame. A vector-kernel call already processes many elements per invocation.
 fn unrollable_body_op(op: &Op) -> bool {
-    !matches!(
-        op,
-        Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::AtomicAdd { .. }
-            | Op::Alloca {
+    // Loads and stores only: no other write (`Op::effects`: a call of any kind, an atomic), and no
+    // frame slot.
+    (matches!(op, Op::Store { .. }) || !op.may_write_memory())
+        && !matches!(
+            op,
+            Op::Alloca {
                 space: wukong_mir::AddrSpace::Local,
                 ..
             }
-    )
+        )
 }
 
 /// The largest value the type can hold when read as a *signed* integer. Used to reject an unroll

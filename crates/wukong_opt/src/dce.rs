@@ -11,7 +11,7 @@
 
 use wukong_mir::{Function, Op, ValueId};
 
-use crate::{each_op_use, each_term_use, has_side_effects, CfgAnalyses, Pass};
+use crate::{each_op_use, each_term_use, CfgAnalyses, Pass};
 
 pub struct Dce;
 
@@ -28,7 +28,7 @@ impl Pass for Dce {
         };
         // Must this instruction stay even if nothing reads its result?
         let rooted = |op: &Op, has_result: bool| {
-            !removable_call(op) && (!has_result || has_side_effects(op))
+            !removable_call(op) && (!has_result || op.has_side_effects())
         };
         let mut definitions = vec![None; f.value_types.len()];
         let mut live = vec![false; f.value_types.len()];

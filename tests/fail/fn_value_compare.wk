@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0428
+// EXPECT-COUNT: 1
+module tests.fail.fn_value_compare
+
+// Two function values are code addresses, and which functions share one is the compiler's choice:
+// the optimizer may merge, clone or inline a function, and the interpreter numbers what native code
+// addresses. So `==` on function values would not mean the same on every backend; keep a tag
+// beside the function and compare that.
+
+fn one() -> i32 {
+    return 1;
+}
+
+fn two() -> i32 {
+    return 2;
+}
+
+fn main() -> i32 {
+    let f: fn() -> i32 = one;
+    let g: fn() -> i32 = two;
+    if f == g { //~ E0428
+        return 1;
+    }
+    return 0;
+}

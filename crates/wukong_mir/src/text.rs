@@ -679,6 +679,17 @@ impl FnParser {
                     args: self.values(args)?,
                 }
             }
+            "call_indirect" => {
+                let (call, ret) = rest
+                    .rsplit_once(" -> ")
+                    .ok_or("`call_indirect` needs `<callee>(<args>) -> <type>`")?;
+                let (callee, args) = split_call(call)?;
+                Op::CallIndirect {
+                    callee: self.value(callee)?,
+                    args: self.values(args)?,
+                    ret: parse_type(ret)?,
+                }
+            }
             "func_addr" if !rest.is_empty() => Op::FuncAddr(interner.intern(rest)),
             "global_addr" if !rest.is_empty() => Op::GlobalAddr(interner.intern(rest)),
             "splat" => Op::Splat(self.operands::<1>(rest)?[0]),
@@ -1091,12 +1102,13 @@ mod tests {
             Op::Sqrt(_) => 25,
             Op::Round(..) => 26,
             Op::IntUnary(..) => 27,
+            Op::CallIndirect { .. } => 28,
             // No textual form: `veckernel_is_a_parse_error` covers it.
             Op::VecKernelCall { .. } => VECKERNEL_SLOT,
         }
     }
-    const VECKERNEL_SLOT: usize = 28;
-    const OP_SLOTS: usize = 29;
+    const VECKERNEL_SLOT: usize = 29;
+    const OP_SLOTS: usize = 30;
 
     fn term_slot(t: &Terminator) -> usize {
         match t {
@@ -1424,7 +1436,27 @@ mod tests {
             func: c_void,
             args: vec![],
         });
-        b.build(Ptr, Op::FuncAddr(generic));
+        let generic_addr = b.build(Ptr, Op::FuncAddr(generic));
+        b.build(
+            F32,
+            Op::CallIndirect {
+                callee: generic_addr,
+                args: vec![fv],
+                ret: F32,
+            },
+        );
+        let sink_addr = b.build(Ptr, Op::FuncAddr(sink));
+        b.build_void(Op::CallIndirect {
+            callee: sink_addr,
+            args: vec![x],
+            ret: Void,
+        });
+        // A value-returning signature whose result is discarded keeps its return type.
+        b.build_void(Op::CallIndirect {
+            callee: generic_addr,
+            args: vec![fv],
+            ret: F32,
+        });
         b.build(Ptr, Op::GlobalAddr(rodata));
 
         b.build(F32, Op::ExtractLane(vf, 3));

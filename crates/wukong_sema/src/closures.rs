@@ -2,10 +2,14 @@
 //!
 //! A closure literal is legal as an argument of a function-typed parameter of a call — to a user
 //! function, a method (`v.map(|a| a * k)`), a function-typed parameter or a closure-bound local —
-//! and as the initializer of a `let` (`let f = |x: f32| x * k;`). The name such a `let` binds can
-//! only be called or passed to a function-typed parameter (`E0421`: it has no run-time value), and
-//! the binding must be one immutable name (`E0422` for `let mut`, a pattern or a reassignment).
-//! Anywhere else a closure is `E0411`. `wukong_mir_build` then lifts each literal to a top-level
+//! and as the initializer of a `let` (`let f = |x: f32| x * k;`). When it captures, the name such a
+//! `let` binds can only be called or passed to a function-typed parameter (`E0421`: it has no
+//! run-time value), and the binding must be one immutable name (`E0422` for `let mut`, a pattern or
+//! a reassignment). Anywhere else in a function body — a `let mut`, a `return`, an assignment, a
+//! field, an element — a closure is a **run-time function value**, legal only when it captures
+//! nothing (`E0427`), as is a closure-bound local that captures nothing used as a value
+//! ([`Sema::type_closure_value`]). Outside a function body a closure is `E0411`.
+//! `wukong_mir_build` then lifts each literal to a top-level
 //! function whose leading parameters are its captures, and specializes the callee per closure
 //! exactly as it does per named function (`apply$main$closure$0`), so a call through `f` stays a
 //! direct call with no function pointer at run time. Everything that lift needs is decided here and
@@ -22,17 +26,19 @@
 //!   generic binding — the existing `E0401` of `check_fn_value_args`.
 //! * **Captures.** Every enclosing local the body reads is captured. One it only reads is COPIED
 //!   where the closure is created (when the call evaluates the argument, or at the `let`): a
-//!   scalar, an enum, a raw pointer or reference, a fixed-size array, a tuple or a struct. One it
+//!   scalar, an enum, a raw pointer or reference, a fixed-size array, a tuple, a struct, a slice or
+//!   `str` (its fat pointer) or a function value. One it
 //!   writes — assigns, takes `&mut` of, or passes as an aggregate to a `mut` parameter or as a
 //!   builtin's output operand — is captured BY REFERENCE ([`ClosureInfo::by_ref`],
 //!   [`Sema::note_capture_write`]): the closure and the enclosing function share it, and its own
 //!   mutability rules apply (`E0304` for an immutable binding, as outside the closure). Either way
 //!   a capture has the type its variable is stored at: a `for` range counter's is its wider bound's
-//!   ([`Sema::enter_range_counter`]). A slice, `str`, tensor or vector, the enclosing function's
-//!   function-typed parameter, a value whose type names an enclosing generic and a range counter
-//!   whose width one decides are `E0418`, as is any use of an enclosing generic parameter (the
-//!   lifted function is not generic). A closure-bound local is captured through its closure
-//!   ([`ClosureInfo::bound`]).
+//!   ([`Sema::enter_range_counter`]). A local holding a run-time function value is copied like a
+//!   pointer, and a slice or `str` as its fat pointer (another view of the same elements). A tensor
+//!   or vector, the enclosing function's function-typed parameter, a value whose type names an
+//!   enclosing generic and a range counter whose width one decides are `E0418`, as is any use of
+//!   an enclosing generic parameter (the lifted function is not generic).
+//!   A closure-bound local is captured through its closure ([`ClosureInfo::bound`]).
 //! * **Control.** `return` leaves the closure; `break`/`continue` cannot cross it (`E0303`, the
 //!   enclosing loops are hidden while its body is checked). Nested closures are allowed: a name an
 //!   inner closure captures is captured by every closure it crosses.
@@ -115,6 +121,11 @@ impl Sema<'_> {
         let target = if self.args_need_params(args) {
             match &callee.kind {
                 ExprKind::Path(p) if p.is_single() => match self.lookup_local(p.first().sym) {
+                    // A call through a run-time function value: nothing is specialized for a
+                    // closure given to it, so the closure is a run-time value too.
+                    Some(Ty::Fn { params, .. }) if self.holds_run_time_fn(p.first().sym) => {
+                        return self.type_args_of_value_call(args, &params);
+                    }
                     Some(Ty::Fn { params, .. }) => Some((params, Vec::new())),
                     Some(_) => None,
                     None => match self.defs.lookup(p.first().sym).map(|d| &d.kind) {
@@ -131,6 +142,58 @@ impl Sema<'_> {
             Some((params, generics)) => self.type_args_against(args, &params, &generics),
             None => args.iter().map(|a| self.type_expr(a)).collect(),
         }
+    }
+
+    /// Whether the local `name` of function type always holds a run-time function value: a `let`,
+    /// pattern or `for` binding that is not bound to a closure. A call through one is an
+    /// `Op::CallIndirect` in every instance. A parameter (of the function or of a closure) may be
+    /// bound at compile time instead, and a call through a closure-bound local is a direct call of
+    /// the lifted closure.
+    pub(crate) fn holds_run_time_fn(&self, name: Symbol) -> bool {
+        !self.is_param_binding(name) && self.closure_bound(name).is_none()
+    }
+
+    /// Type the arguments `args` of a call through a run-time function value whose parameter types
+    /// are `params`. A closure argument of a function-typed parameter becomes the value the callee
+    /// receives — the lifted function's address — so it is typed by
+    /// [`Self::type_closure_value`] (one that captures is `E0427`), and a closure-bound local
+    /// passed there must capture nothing either.
+    pub(crate) fn type_args_of_value_call(&mut self, args: &[Expr], params: &[Ty]) -> Vec<Ty> {
+        let mut tys = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let want = params.get(i).filter(|t| matches!(t, Ty::Fn { .. }));
+            let t = match (want, &a.kind) {
+                (Some(want), ExprKind::Closure { .. }) => {
+                    let t = self.type_closure_value(a, Some(want));
+                    self.types.insert(a.id, t.clone());
+                    t
+                }
+                (Some(_), ExprKind::Path(p)) if p.is_single() => {
+                    let captures: Vec<Symbol> = self
+                        .closure_bound(p.first().sym)
+                        .and_then(|lit| self.closures.get(&lit))
+                        .map(|info| info.captures.iter().map(|(n, _)| *n).collect())
+                        .unwrap_or_default();
+                    // Typed as an argument of a function-typed parameter, so the use is recorded
+                    // without `E0421`'s "only called or passed" (it is passed).
+                    let outer = self.fn_value_arg.replace(a.id);
+                    let t = self.type_expr(a);
+                    self.fn_value_arg = outer;
+                    if captures.is_empty() || !matches!(t, Ty::Fn { .. }) {
+                        t
+                    } else {
+                        if self.inst_subst.is_empty() {
+                            self.report_capturing_value(a.span, &captures);
+                        }
+                        self.types.insert(a.id, Ty::Error);
+                        Ty::Error
+                    }
+                }
+                _ => self.type_expr(a),
+            };
+            tys.push(t);
+        }
+        tys
     }
 
     /// Whether typing `args` needs the callee's parameter types: an argument is a closure literal,
@@ -242,6 +305,8 @@ impl Sema<'_> {
         let report = self.inst_subst.is_empty();
         let name = match &pat.kind {
             PatKind::Ident(n) if !mutable => *n,
+            // `let mut f = |..| ..;` — a function variable, when the closure captures nothing.
+            PatKind::Ident(n) => return self.type_closure_mut_let(s, pat, *n, ann, e),
             _ => {
                 if report {
                     let msg = if mutable {
@@ -265,13 +330,7 @@ impl Sema<'_> {
                 return;
             }
         };
-        // The one place a `let` may spell a function type: the closure it initializes.
-        let expected = ann.map(|t| {
-            self.methods.fn_type_ok = true;
-            let ty = self.lower_type(t);
-            self.methods.fn_type_ok = false;
-            ty
-        });
+        let expected = ann.map(|t| self.lower_type(t));
         let t = match &expected {
             Some(want @ Ty::Fn { .. }) => {
                 let t = self.type_closure(e, Some(want), &[]);
@@ -371,14 +430,20 @@ impl Sema<'_> {
         self.closure_binds.get(i)?.get(&name).copied()
     }
 
-    /// A closure-bound local `name` used as the value expression `e`. Legal only as a single-name
+    /// A closure-bound local `name` used as the value expression `e`. Legal as a single-name
     /// argument of a function-typed parameter ([`Sema::fn_value_arg`]) — a call `f(..)` never
-    /// reaches here (`type_fn_param_call`). Anywhere else the closure would escape: `E0421`.
+    /// reaches here (`type_fn_param_call`) — and, when the closure captures nothing, anywhere a
+    /// function value is: it is the lifted function's address. Anywhere else a closure that
+    /// captures would escape: `E0421`.
     pub(crate) fn closure_value_use(&mut self, e: &Expr, name: Symbol, span: Span, t: Ty) -> Ty {
         let Some(lit) = self.closure_bound(name) else {
             return t;
         };
-        if self.fn_value_arg == Some(e.id) {
+        let captures_nothing = self
+            .closures
+            .get(&lit)
+            .is_some_and(|info| info.captures.is_empty());
+        if self.fn_value_arg == Some(e.id) || captures_nothing {
             self.closure_refs.insert(e.id, lit);
             self.note_value_use(name, span);
             return t;
@@ -670,21 +735,308 @@ impl Sema<'_> {
         }
     }
 
-    /// `E0411`: a closure anywhere but an argument of a function-typed parameter or a `let`.
+    /// `E0411`: a closure outside a function body (a `const` initializer, a `where` predicate, a
+    /// `static_assert`).
     pub(crate) fn misplaced_closure(&mut self, e: &Expr) -> Ty {
         self.diags.push(
-            Diagnostic::error(
-                "a closure can only be passed to a function-typed parameter or bound by `let`",
-            )
-            .with_code("E0411")
-            .primary(e.span, "a closure cannot be used here")
-            .help(
-                "pass it as an argument of a call whose parameter has a function type \
-                 (`fn apply(f: fn(f32) -> f32, x: f32)`), bind it with `let f = |..| ..;` and \
-                 call `f`, or declare a named function",
-            ),
+            Diagnostic::error("a closure can only be written inside a function body")
+                .with_code("E0411")
+                .primary(e.span, "a closure cannot be used here")
+                .help(
+                    "declare a named function, or write the closure in the function that uses it",
+                ),
         );
         Ty::Error
+    }
+
+    /// `e` typed where a value of type `want` is expected: a closure literal is checked against
+    /// `want` when that is a function type ([`Self::type_closure_value`]); anything else is typed
+    /// as usual.
+    pub(crate) fn type_expr_expecting(&mut self, e: &Expr, want: &Ty) -> Ty {
+        match (&e.kind, want) {
+            (ExprKind::Closure { .. }, Ty::Fn { .. }) => {
+                let t = self.type_closure_value(e, Some(want));
+                self.types.insert(e.id, t.clone());
+                t
+            }
+            _ => self.type_expr(e),
+        }
+    }
+
+    /// A closure literal used as a **run-time function value** — the initializer of a `let mut`,
+    /// a `return`ed value, an assigned value, a field or an element — rather than an argument of
+    /// a function-typed parameter or a `let`-bound closure. Its value is the lifted function's
+    /// address, so it may capture nothing: a closure that captures is `E0427` (there is nowhere
+    /// for the captured values to live). `expected`, when known, types its parameters.
+    pub(crate) fn type_closure_value(&mut self, e: &Expr, expected: Option<&Ty>) -> Ty {
+        if !self.in_fn_body {
+            return self.misplaced_closure(e);
+        }
+        let t = self.type_closure(e, expected, &[]);
+        let captures: Vec<Symbol> = self
+            .closures
+            .get(&e.id)
+            .map(|info| info.captures.iter().map(|(n, _)| *n).collect())
+            .unwrap_or_default();
+        if captures.is_empty() || !matches!(t, Ty::Fn { .. }) {
+            return t;
+        }
+        if self.inst_subst.is_empty() {
+            self.report_capturing_value(e.span, &captures);
+        }
+        Ty::Error
+    }
+
+    /// `E0427`: a closure that captures `captures`, used as a run-time function value at `span`.
+    fn report_capturing_value(&mut self, span: Span, captures: &[Symbol]) {
+        let names: Vec<String> = captures
+            .iter()
+            .map(|n| format!("`{}`", self.sym_str(*n)))
+            .collect();
+        let (what, list) = if names.len() == 1 {
+            ("variable", names[0].clone())
+        } else {
+            ("variables", names.join(", "))
+        };
+        self.diags.push(
+            Diagnostic::error(
+                "a closure that captures variables cannot be a run-time function value",
+            )
+            .with_code("E0427")
+            .primary(span, format!("this closure captures the {what} {list}"))
+            .note(
+                "a function value is only the address of code; the values a closure captures \
+                 have nowhere to live in it",
+            )
+            .help(
+                "pass the captured values as ordinary parameters, or pass the closure directly to \
+                 a function-typed parameter of the function that calls it",
+            ),
+        );
+    }
+
+    /// `let mut f = |..| ..;`: a function variable initialized with the closure's address, which
+    /// a later `f = ..` may replace. The closure must capture nothing (`E0422` names the `mut`,
+    /// as for a capturing closure bound by `let mut` before function values existed).
+    fn type_closure_mut_let(
+        &mut self,
+        s: &Stmt,
+        pat: &Pattern,
+        name: Symbol,
+        ann: Option<&TypeExpr>,
+        e: &Expr,
+    ) {
+        let report = self.inst_subst.is_empty();
+        let expected = ann.map(|t| self.lower_type(t));
+        let want = expected.as_ref().filter(|t| matches!(t, Ty::Fn { .. }));
+        let mut t = self.type_closure(e, want, &[]);
+        let captures = self
+            .closures
+            .get(&e.id)
+            .is_some_and(|info| !info.captures.is_empty());
+        if captures && matches!(t, Ty::Fn { .. }) {
+            if report {
+                self.diags.push(
+                    Diagnostic::error("a closure that captures cannot be bound by a `mut` binding")
+                        .with_code("E0422")
+                        .primary(pat.span, "the closure is bound here")
+                        .note(
+                            "a `mut` binding holds a run-time function value, which is only the \
+                             address of code; the values this closure captures have nowhere to \
+                             live in it",
+                        )
+                        .help("bind it with a plain `let name = |..| ..;`"),
+                );
+            }
+            t = Ty::Error;
+        }
+        match (&expected, &t) {
+            (Some(want @ Ty::Fn { .. }), Ty::Fn { .. }) if *want != t && report => {
+                let (w, f) = (want.display(self.interner), t.display(self.interner));
+                self.error(
+                    s.span,
+                    "E0401",
+                    format!("type mismatch: `let` is annotated `{w}` but the closure is `{f}`"),
+                );
+            }
+            (Some(other), Ty::Fn { .. }) if !matches!(other, Ty::Fn { .. }) && report => {
+                let o = other.display(self.interner);
+                self.error(
+                    s.span,
+                    "E0401",
+                    format!("type mismatch: `let` is annotated `{o}` but the value is a closure"),
+                );
+                t = Ty::Error;
+            }
+            _ => {}
+        }
+        self.types.insert(e.id, t.clone());
+        self.check_fn_binding_name(name, pat.span, &t);
+        self.bind(name, t);
+    }
+
+    /// A use of the name `name` (of type `t`) as the value `e`, at `span`. A local holding a
+    /// function value is recorded for `wukong_mir_build` ([`Self::note_fn_local_read`]); a
+    /// top-level function is checked to have one address ([`Self::reject_fn_item_value`]).
+    /// Returns the use's type.
+    pub(crate) fn fn_value_use(&mut self, e: &Expr, name: Symbol, span: Span, t: Ty) -> Ty {
+        if !matches!(t, Ty::Fn { .. }) {
+            return t;
+        }
+        if self.lookup_local(name).is_some() {
+            self.note_fn_local_read(e, name);
+            return t;
+        }
+        if !self.in_fn_body && self.reject_fn_value_outside_body(name, span) {
+            return Ty::Error;
+        }
+        if self.reject_fn_item_value(name, span) {
+            return Ty::Error;
+        }
+        t
+    }
+
+    /// `E0411`: the top-level function `name` used as a value outside a function body — in a
+    /// `const` initializer, which is not one value but an expression lowered again at every use.
+    /// A function value made there would escape the whole-program analyses that must see every
+    /// function used as a value (which buffers a call through a pointer may alias, which instance
+    /// of a function with function-typed parameters has an address) and would resolve its name in
+    /// the scope of each use. Returns whether it was refused.
+    fn reject_fn_value_outside_body(&mut self, name: Symbol, span: Span) -> bool {
+        if !matches!(
+            self.defs.lookup(name).map(|d| &d.kind),
+            Some(DefKind::Fn(_))
+        ) {
+            return false;
+        }
+        if self.inst_subst.is_empty() {
+            let nm = self.sym_str(name).to_string();
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "the function `{nm}` cannot be used as a value outside a function body"
+                ))
+                .with_code("E0411")
+                .primary(span, "a function value cannot be made here")
+                .note(
+                    "a `const` initializer is evaluated again at each use rather than stored once, \
+                     so a `const` cannot hold a function value",
+                )
+                .help(format!(
+                    "bind it in the function that uses it (`let f = {nm};`), or write a function \
+                     that returns it"
+                )),
+            );
+        }
+        true
+    }
+
+    /// The single-name path `e` reads the local `name` of function type, as a value or as a
+    /// callee: recorded in [`crate::SemaResult::fn_value_locals`], and in
+    /// [`crate::SemaResult::fn_value_lets`] too unless the local is a parameter.
+    pub(crate) fn note_fn_local_read(&mut self, e: &Expr, name: Symbol) {
+        self.fn_value_locals.insert(e.id);
+        if !self.is_param_binding(name) {
+            self.fn_value_lets.insert(e.id);
+        }
+    }
+
+    /// Whether the local `name` resolves (innermost scope first) to a parameter: of the function
+    /// being checked (bound in the outermost scope, `check_fn_pass`) or of a closure being checked
+    /// (bound in the scope at its context's `base`, [`Self::type_closure`]). Every other local —
+    /// a `let`, a pattern or a `for` binding — lives in a scope a block or an arm pushed.
+    pub(crate) fn is_param_binding(&self, name: Symbol) -> bool {
+        match self.lookup_local_depth(name) {
+            Some((depth, _)) => depth == 0 || self.closure_ctx.iter().any(|c| c.base == depth),
+            None => false,
+        }
+    }
+
+    /// A top-level function `name` used as a run-time function value at `span`: a generic one has
+    /// no single address, and one without a body (`extern`) is not Wukong code (`E0429`).
+    /// Returns whether it was refused.
+    pub(crate) fn reject_fn_item_value(&mut self, name: Symbol, span: Span) -> bool {
+        let (generic, extents) = match self.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Fn(sig)) => (
+                !sig.generics.is_empty(),
+                sig.params.iter().any(has_runtime_extent),
+            ),
+            _ => return false,
+        };
+        let bodyless = self.bodyless_fns.contains(&name);
+        if !generic && !extents && !bodyless {
+            return false;
+        }
+        if self.inst_subst.is_empty() {
+            let nm = self.sym_str(name).to_string();
+            let (label, note) = if generic {
+                (
+                    format!("`{nm}` is generic"),
+                    "a generic function is compiled once per instantiation, chosen at each call \
+                     from its arguments, so it has no single address",
+                )
+            } else if extents {
+                (
+                    format!("`{nm}` takes a tensor with a run-time extent (`?`)"),
+                    "each run-time extent is passed as a hidden argument read off the tensor at a \
+                     direct call, which a call through a function value cannot pass",
+                )
+            } else {
+                (
+                    format!("`{nm}` is declared without a body"),
+                    "an `extern` function is C code, which a run-time function value cannot \
+                     reach on every backend",
+                )
+            };
+            self.diags.push(
+                Diagnostic::error(format!("`{nm}` cannot be a run-time function value"))
+                    .with_code("E0429")
+                    .primary(span, label)
+                    .note(note)
+                    .help(format!(
+                        "wrap it in a non-generic function of the concrete type and use that \
+                         (`fn {nm}_i32(x: i32) -> i32 {{ return {nm}(x); }}`)"
+                    )),
+            );
+        }
+        true
+    }
+
+    /// `E0428`: a comparison whose operand is a function value. Returns whether it was refused.
+    pub(crate) fn reject_fn_value_comparison(
+        &mut self,
+        op: wukong_ast::BinOp,
+        l: &Ty,
+        r: &Ty,
+        span: Span,
+    ) -> bool {
+        use wukong_ast::BinOp::*;
+        if !matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
+            || ![l, r].into_iter().any(|t| matches!(t, Ty::Fn { .. }))
+        {
+            return false;
+        }
+        let shown = [l, r]
+            .into_iter()
+            .find(|t| matches!(t, Ty::Fn { .. }))
+            .map(|t| t.display(self.interner))
+            .unwrap_or_default();
+        self.diags.push(
+            Diagnostic::error(format!(
+                "function values cannot be compared with `{}`",
+                op.glyph()
+            ))
+            .with_code("E0428")
+            .primary(
+                span,
+                format!("an operand is a function value of type `{shown}`"),
+            )
+            .note(
+                "which functions share an address is the compiler's choice: the optimizer may \
+                 merge or clone them, and the interpreter numbers what native code addresses",
+            )
+            .help("keep a tag (an enum or an integer) beside the function and compare that"),
+        );
+        true
     }
 
     /// The closure being checked has an error of its own: its type is `Error` (and so is every
@@ -759,6 +1111,24 @@ impl Sema<'_> {
             Some(CounterWidth::Generic) => (ty, Some(NoCopy::CounterWidth)),
             None => (ty, None),
         };
+        // A local holding a run-time function value is a code address, copied like a pointer.
+        // Only the enclosing function's own function-typed parameter (bound at compile time, at
+        // the function's outermost scope) has no value to copy.
+        let why = match why {
+            None if matches!(ty, Ty::Fn { .. })
+                && !(depth == 0 && self.param_tys.contains_key(&name))
+                && !self.mentions_enclosing_generic(&ty) =>
+            {
+                for i in crossed {
+                    let c = &mut self.closure_ctx[i];
+                    if !c.captures.iter().any(|(n, _)| *n == name) {
+                        c.captures.push((name, ty.clone()));
+                    }
+                }
+                return;
+            }
+            why => why,
+        };
         let why = match why.map_or_else(|| self.capture_kind(&ty), Err) {
             Ok(()) => {
                 for i in crossed {
@@ -791,8 +1161,8 @@ impl Sema<'_> {
             .primary(span, "captured here")
             .note(
                 "a closure copies what it captures: a scalar, an enum, a pointer or reference, a \
-                 fixed-size array, a tuple or a struct; a slice, `str`, tensor or SIMD vector \
-                 views or holds storage a copy cannot carry",
+                 fixed-size array, a tuple, a struct, a slice or a `str` (its view); a tensor or \
+                 SIMD vector holds a shape or lanes a copy cannot carry",
             )
             .help(format!(
                 "capture a pointer instead (`let p{nm} = &{nm};` before the call, then \
@@ -923,6 +1293,29 @@ impl Sema<'_> {
         }
     }
 
+    /// The arguments `args` of a call through a function value — a function-typed parameter or
+    /// `let`, a field, an element, a call's result. A function type does not say which parameters
+    /// are `mut`, and an aggregate is passed by reference, so the function the value holds may
+    /// write any aggregate argument in place: a closure passing a variable it captures there
+    /// shares it, as it would at a direct call of a function whose parameter is `mut`
+    /// ([`Self::note_mut_arg_writes`]). Conservative: a callee that only reads sees the variable
+    /// itself rather than a copy, the same value unless the enclosing code writes it between
+    /// creating a `let`-bound closure and calling it.
+    pub(crate) fn note_value_call_writes(&mut self, args: &[Expr]) {
+        if self.closure_ctx.is_empty() {
+            return;
+        }
+        for a in args {
+            let by_reference = self
+                .types
+                .get(&a.id)
+                .is_some_and(|t| self.is_aggregate_ty(t) && !matches!(t, Ty::Slice(_) | Ty::Str));
+            if by_reference {
+                self.note_capture_write(a);
+            }
+        }
+    }
+
     /// The variable whose own storage a write to `e` changes, if `e` is a name or a field / element
     /// projection of one that does not pass through a pointer or reference, or a tensor view of
     /// one (`out as Tensor[f32, 2, 3]`, a zero-copy reshape of its storage).
@@ -1018,6 +1411,9 @@ impl Sema<'_> {
             },
             Ty::Fn { .. } => Err(NoCopy::FnParam),
             _ if self.mentions_enclosing_generic(ty) => Err(NoCopy::Generic),
+            // A slice or `str` is its 16-byte fat pointer `(data, len)`: a copy is another view of
+            // the same elements, exactly what passing it to a parameter makes.
+            Ty::Slice(_) | Ty::Str => Ok(()),
             // A fixed-size array or a tuple is copied whole, into a buffer the lifted function
             // receives by pointer. A `shared` (GPU block-shared) array is not a value to copy, and
             // an element whose extent is only known at run time cannot be laid out.
@@ -1244,11 +1640,20 @@ mod tests {
 
     #[test]
     fn uncopyable_captures_are_e0418() {
-        // A slice views storage a copy cannot carry.
+        // A slice or `str` is copied as its fat pointer: another view of the same elements.
         assert_eq!(
             error_codes(&format!(
-                "{APPLY} fn main() -> i32 {{ let s = alloc_f32(2); \
-                 let r = apply(|x| x + s[0], 1.0) as i32; free(s); return r; }}"
+                "{APPLY} fn main() -> i32 {{ let s = alloc_f32(2); let t: str = \"ab\"; \
+                 let r = apply(|x| x + s[0] + (t.len() as f32), 1.0) as i32; free(s); \
+                 return r; }}"
+            )),
+            Vec::<&str>::new()
+        );
+        // A tensor view holds a shape a copy cannot carry.
+        assert_eq!(
+            error_codes(&format!(
+                "{APPLY} fn g(t: Tensor[f32, 2]) -> f32 {{ return apply(|x| x * t[1], 2.0); }} \
+                 fn main() -> i32 {{ let a: [f32; 2] = [1.0, 2.0]; return g(a) as i32; }}"
             )),
             vec!["E0418"]
         );
@@ -1505,17 +1910,46 @@ mod tests {
     }
 
     #[test]
-    fn a_closure_outside_a_call_argument_is_e0411() {
+    fn a_closure_value_captures_nothing_and_lives_in_a_body() {
+        // Anywhere else in a body a closure is a function value: one that captures nothing is
+        // legal, one that captures is `E0427`.
         for body in [
-            "return |x: i32| x;",
-            "let a = [|x: i32| x]; return 0;",
+            "let a = [|x: i32| x]; return a[0](1);",
             "let t = (1, |x: i32| x); return t.0;",
+            "let mut f = |x: i32| x; f = |x| x + 1; return f(1);",
         ] {
-            assert!(
-                error_codes(&format!("fn main() -> i32 {{ {body} }}")).contains(&"E0411"),
+            assert_eq!(
+                error_codes(&format!("fn main() -> i32 {{ {body} }}")),
+                Vec::<&str>::new(),
                 "{body}"
             );
         }
+        for body in [
+            "let k = 1; let a = [|x: i32| x + k]; return 0;",
+            "let k = 1; let mut f = |x: i32| x; f = |x| x + k; return f(1);",
+        ] {
+            assert_eq!(
+                error_codes(&format!("fn main() -> i32 {{ {body} }}")),
+                vec!["E0427"],
+                "{body}"
+            );
+        }
+        assert_eq!(
+            error_codes(
+                "fn mk() -> fn(i32) -> i32 { return |x| x + 1; } \
+                 fn main() -> i32 { return mk()(1); }"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            error_codes(
+                "fn mk(k: i32) -> fn(i32) -> i32 { return |x| x + k; } \
+                 fn main() -> i32 { return mk(1)(1); }"
+            ),
+            vec!["E0427"]
+        );
+        // Returned where the function's type is no function type: a mismatch.
+        assert!(error_codes("fn main() -> i32 { return |x: i32| x; }").contains(&"E0401"));
         // A const initializer.
         assert!(error_codes(&format!(
             "{APPLY} const C: f32 = apply(|x| x, 1.0); fn main() -> i32 {{ return C as i32; }}"
@@ -1591,7 +2025,7 @@ mod tests {
         ] {
             assert_eq!(
                 error_codes(&format!(
-                    "fn main() -> i32 {{ let f = |x: f32| x * 2.0; {body} }}"
+                    "fn main() -> i32 {{ let k = 2.0; let f = |x: f32| x * k; {body} }}"
                 )),
                 vec!["E0421"],
                 "{body}"
@@ -1601,13 +2035,28 @@ mod tests {
         assert_eq!(
             error_codes(
                 "fn takes(x: f32) -> f32 { return x; } \
-                 fn main() -> i32 { let f = |x: f32| x; return takes(f) as i32; }"
+                 fn main() -> i32 { let k = 2.0; let f = |x: f32| x * k; \
+                 return takes(f) as i32; }"
             ),
             vec!["E0421"]
         );
+        // A closure that captures nothing is a function value: copying it is fine.
+        assert_eq!(
+            error_codes(
+                "fn main() -> i32 { let f = |x: f32| x; let g = f; return g(1.0) as i32; }"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            error_codes(
+                "fn main() -> i32 { let k = 1.0; let mut f = |x: f32| x + k; \
+                 return f(1.0) as i32; }"
+            ),
+            vec!["E0422"]
+        );
         assert_eq!(
             error_codes("fn main() -> i32 { let mut f = |x: f32| x; return f(1.0) as i32; }"),
-            vec!["E0422"]
+            Vec::<&str>::new()
         );
         assert_eq!(
             error_codes(
@@ -1752,6 +2201,57 @@ mod tests {
             by_ref("print(sum(out as Tensor[f32, 4]));"),
             Vec::<String>::new()
         );
+    }
+
+    /// A function type does not say which parameters are `mut`, so a call through a function value
+    /// — a captured `let`, a field, an element, a call's result, the closure's own function-typed
+    /// parameter — may write an aggregate argument in place: a closure passing a variable it
+    /// captures there captures it by reference, as for `fill(out, ..)` above. A scalar is a copy
+    /// whatever the callee, and a closure-bound local's closure cannot write its arguments (a
+    /// closure parameter is never `mut`).
+    #[test]
+    fn an_aggregate_a_call_through_a_function_value_gets_is_captured_by_reference() {
+        let by_ref = |body: &str| -> Vec<String> {
+            let src = format!(
+                "fn each(f: fn(i32), n: i32) {{ for i in 0..n {{ f(i); }} }} \
+                 fn each2(f: fn(fn([f32; 4]), i32), n: i32) {{ f(fill, n); }} \
+                 fn fill(mut o: [f32; 4]) {{ for i in 0..4 {{ o[i] = 1.0; }} }} \
+                 fn pick() -> fn([f32; 4]) {{ return fill; }} \
+                 fn inc(k: i32) -> i32 {{ return k + 1; }} \
+                 struct S {{ op: fn([f32; 4]) }} \
+                 fn main() -> i32 {{ let mut out: [f32; 4] = [0.0; 4]; let n = 2; \
+                 let f: fn([f32; 4]) = fill; let g: fn(i32) -> i32 = inc; \
+                 let s = S {{ op: fill }}; let ops: [fn([f32; 4]); 1] = [fill]; \
+                 let peek = |o: [f32; 4]| o[0]; \
+                 each(|i| {{ {body} print(i); }}, 1); \
+                 each2(|h: fn([f32; 4]), i: i32| {{ h(out); print(i); }}, 1); \
+                 f(out); s.op(out); ops[0](out); pick()(out); \
+                 return out[0] as i32 + n + g(1) + peek(out) as i32; }}"
+            );
+            let (_m, res, diags, interner) = check(&src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{body}: {diags:?}");
+            // The `each` closure: one parameter and no result (`peek` returns an `f32`, and the
+            // `each2` closure takes two).
+            let info = res
+                .closures
+                .values()
+                .find(|c| c.params.len() == 1 && c.ret == Ty::Unit)
+                .expect("the `each` closure");
+            let mut names: Vec<String> = info
+                .by_ref
+                .iter()
+                .map(|s| interner.resolve(*s).to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(by_ref("f(out);"), vec!["out"]);
+        assert_eq!(by_ref("pick()(out);"), vec!["out"]);
+        assert_eq!(by_ref("s.op(out);"), vec!["out"]);
+        assert_eq!(by_ref("ops[0](out);"), vec!["out"]);
+        // A scalar is copied into any callee; a closure-bound local's closure only reads.
+        assert_eq!(by_ref("print(g(n));"), Vec::<String>::new());
+        assert_eq!(by_ref("print(peek(out));"), Vec::<String>::new());
     }
 
     /// A `for` counter is stored at the wider of its bounds' integer types, and a closure captures

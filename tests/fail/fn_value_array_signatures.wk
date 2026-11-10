@@ -1,0 +1,23 @@
+// EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
+module tests.fail.fn_value_array_signatures
+
+// Every element of an array holds one function type, and function types meet only at the same
+// signature. `[inc, add]` mixes `fn(i32) -> i32` with `fn(i32, i32) -> i32`; it used to take the
+// first element's type, and `ops[1](5)` then called `add` with one argument: a register the
+// caller never wrote on native, a stale value on the interpreter, and a verifier ICE at -O2 once
+// the optimizer saw which function the element held.
+
+fn inc(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn main() -> i32 {
+    let ops = [inc, add]; //~ E0401
+    print(ops[1](5));
+    return 0;
+}

@@ -571,6 +571,17 @@ fn inline_call_site(caller: &mut Function, callee: &Function, bi: usize, ii: usi
         vmap.insert(vid as u32, nv);
     }
     let mapv = |v: ValueId| -> ValueId { vmap[&v.0] };
+    // A call may discard a value-returning callee's result (legal MIR, and what devirtualizing a
+    // result-less indirect call produces), but every `ret v` of the copy still branches to the
+    // continuation with `v`: give the continuation a parameter that takes it and goes unused.
+    let result = match result {
+        None if callee.ret != wukong_mir::MirType::Void => {
+            let dropped = ValueId(caller.value_types.len() as u32);
+            caller.value_types.push(callee.ret.clone());
+            Some(dropped)
+        }
+        r => r,
+    };
 
     // Callee block b -> caller block (base + b); the continuation block follows them.
     let base = caller.blocks.len() as u32;

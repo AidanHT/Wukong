@@ -103,9 +103,11 @@ OPTIONS:
                        runs none. Consecutive function passes run together to a fixpoint:
                        sroa, mem2reg, simplify, jump-thread, simplify-cfg, simplify-phis, dce,
                        tre, cse, dse, loop-canon, loop-delete, fuse, licm, bce, unswitch,
-                       promote, vectorize. Program steps run once where named: inline, unroll,
-                       slp, form-switches. -O2 is the list `inline,sroa,...,vectorize,unroll,
-                       slp,form-switches` (docs/internals.md). Not with --emit=tokens, ast,
+                       promote, vectorize. Program steps run once where named: inline, devirt
+                       (indirect calls of a known function become direct; when one did, the
+                       earlier inline and fixpoint run again), unroll, slp, form-switches. -O2
+                       is the list `inline,sroa,...,vectorize,devirt,unroll,slp,form-switches`
+                       (docs/internals.md). Not with --emit=tokens, ast,
                        check, mir-high or grad, --train or --grad-of
     --print-after=<p>  Print the MIR to stderr after each run of pass <p> on a function (a run
                        that changed nothing prints a one-line note), or after program step <p>;

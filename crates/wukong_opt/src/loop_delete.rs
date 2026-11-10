@@ -31,7 +31,7 @@ use wukong_mir::{BlockId, CmpOp, Function, MirType, Op, Terminator, ValueId};
 
 use crate::fxhash::FxHashSet;
 use crate::loop_info::{self, NaturalLoop, Stages, TripCount};
-use crate::{cfg, each_op_use, each_term_use, has_side_effects, CfgAnalyses, Pass};
+use crate::{cfg, each_op_use, each_term_use, CfgAnalyses, Pass};
 
 pub struct LoopDelete;
 
@@ -121,7 +121,7 @@ fn shape_ok(f: &Function, l: &NaturalLoop) -> bool {
             !f.blocks[b.0 as usize]
                 .insts
                 .iter()
-                .any(|i| has_side_effects(&i.op))
+                .any(|i| i.op.has_side_effects())
         })
 }
 

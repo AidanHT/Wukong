@@ -330,6 +330,113 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and reproducer laws, `.mir` parse errors, six verifier rejections of invalid `.mir` input, a
   `--verify-each -O2` run that must equal plain `-O2`, `--print-after` and the pass-list errors.
 
+### First-class function values and indirect calls (`gap7/fn-values`, N27)
+
+- **Added: function values.** A function type `fn(A, B) -> R` is an ordinary value type: a local
+  (`let`, `let mut`, reassigned), a struct field, an array or tuple element, a return value, a
+  closure's capture. A named non-generic function or a closure that captures nothing makes one; a
+  call through any of them (`f(x)`, `ops[i](a, b)`, `pick(1)(x)`, `s.op(x)` for a field that is no
+  method) calls the function it holds. A function-typed parameter given a run-time value gets one
+  more instance that takes the pointer (`apply$fn1$f32$to$f32`), so higher-order functions accept a
+  run-time choice; given a named function or a closure it is still specialized with no pointer.
+  The address of a function with function-typed parameters is that pointer-taking instance.
+  `tests/run/{fn_values,fn_values_dispatch,fn_values_devirt}.wk`, interp == native at `-O0`/`-O2`.
+- **Added: `Op::CallIndirect`**, `call_indirect vF(vA, ..) -> T`: the verifier (a pointer callee;
+  under `verify_program`, a visible `func_addr g` must have exactly `g`'s signature), the printer
+  and the typed MIR text, the interpreter (the `FUNC_TAG` index; anything else is an error), Cranelift
+  `call_indirect` for the JIT and objects (a caller polls the failure status after it, since the
+  callee may fail an assertion), the LLVM text (`call T %f(..)`); `gpu-native` declines it
+  (`UNSUPPORTED`), autodiff refuses a loss that makes one.
+- **Added: devirtualization.** An indirect call whose callee is a visible `func_addr` of a function
+  with its signature becomes a direct call after the per-function pipeline (`-O1`), and the program
+  is optimized again around it (inlined at `-O2`). It is a program step, not a pass: the call-effect
+  table a function's passes see is schedule-dependent for symbols other than its direct callees, so
+  a call created mid-fixpoint could make the MIR depend on the thread count. `--passes` has the new
+  program step `devirt`, in both `-O` lists.
+- **Changed: one effect classification for the optimizer.** `wukong_mir::Effects` (`Op::effects`,
+  exhaustive) says what each op may do — read, write, call out, trap, synchronize, allocate — and
+  every `wukong_opt` pass that kept its own opcode list beside a permissive `_` arm asks it instead
+  (alias, bce, cse, dce, dse, the call summaries, fuse, jump_thread, licm, loop_delete, loop_info,
+  slp, unroll, unroll_jam, unswitch, vec256, vectorize). No behaviour change: the corpus MIR is
+  byte-identical. `wukong_opt::indirect_tests` pins, per pass, what may not happen to an indirect
+  call (two identical calls kept and ordered, a store before one not dropped, none hoisted, a caller
+  of one not summarized pure, no loop around one deleted or vectorized).
+- **New diagnostics:** `E0427` a closure that captures used as a run-time function value (also
+  from lowering, for a function-typed parameter bound to one and used as a value); `E0428` two
+  function values compared; `E0429` a generic, `extern` or run-time-extent function used as a value.
+  `E0411` now covers only an `extern` signature with a function type, a `mut` or builtin-named
+  function-typed parameter or local, and a closure or a function value outside a function body (a
+  `const` cannot hold one); `E0421`/`E0422` apply to closures that capture (a capture-free one is a
+  value, and `let mut` of it a function variable).
+  `tests/fail/{closure_value_captures,closure_param_value_captures,fn_value_compare,fn_value_generic,fn_type_in_extern}.wk`;
+  `tests/fail/{closure_outside_argument,fn_value_binding,lower_function_value}.wk` are gone (each is
+  a legal program now).
+- **Added: a closure captures a slice or a `str`** as its 16-byte fat pointer — another view of
+  the same elements, as passing it to a parameter makes (an element the closure writes is written
+  in the shared storage; reassigning the variable later leaves the closure on the old view). It was
+  `E0418`, which now covers a tensor or vector (`tests/run/closure_capture_views.wk`;
+  `tests/fail/closure_capture_slice.wk` became `closure_capture_tensor.wk`).
+- **Fixed: inlining a call that discards a value-returning callee's result** branched every `ret v`
+  of the copy to a continuation with no parameter (legal MIR the inliner mishandled; a devirtualized
+  result-less indirect call produced it). The continuation now takes the value and drops it.
+- **Fixed: function signatures inside aggregates were never compared.** The layout checks
+  treat a function type as an open leaf, so `[inc, add]` (`fn(i32) -> i32` beside
+  `fn(i32, i32) -> i32`) took the first element's type and `ops[1](5)` called `add` with one
+  argument: native read a register the caller never wrote, the interpreter a stale value, and
+  `-O2` failed the verifier once it saw the callee. `E0401` now compares function types at every
+  position of an array, slice, tuple or pointer — array-literal elements, assignment, `return`,
+  struct fields, `if`/`match`/`break` merges and call arguments — and an aggregate of functions
+  against one of anything else (`ops = [1, 2]` for an array of functions).
+  `tests/fail/fn_value_array_signatures.wk`.
+- **Fixed: a `let` shadowing a function-typed parameter was taken for the parameter.**
+  Passed on to another function-typed parameter in the instance specialized for the parameter's
+  function, `let f = cube;` in `fn outer(f: fn(i32) -> i32)` called `apply_twice` specialized for
+  the *parameter's* function: `outer(sq, 2)` printed 16, not `cube(cube(2))` = 512, on both
+  backends. Sema now publishes which reads of a function-typed local are not parameters
+  (`SemaResult::fn_value_lets`: `let`, pattern and `for` bindings, and captures of them), and
+  lowering and the instance collector never resolve one through the instance's binding. A shadowed
+  callee also no longer registers an instance of the parameter's function, or keeps an argument
+  from being noted as a value (`forward` in `tests/run/fn_values_shadowing.wk` called a function
+  that was never compiled).
+- **Fixed: a closure capturing a function value, passed to a higher-order function, was never
+  compiled.** A function-typed capture makes the lifted closure a function compiled per binding,
+  and a call through the parameter it is bound to passes the captures ahead of its own arguments.
+  The instance collector lined the call's arguments up against the closure's parameters without
+  them, so `apply(|x| k + g(x), 3)` (captures `k`, then `g`) registered no instance and `apply`
+  called a function that was never compiled ("call to unknown function" on the interpreter,
+  `C0001` natively), and a capturing closure with a function-typed parameter of its own
+  (`with(|a, y| a(|x| x + k, y), 5)`) got the instance taking `a` at run time instead of the one
+  specialized for `apply`. The collector now skips the environment, binding a captured function
+  value as the run-time value it always is. `tests/run/fn_values_captured.wk`.
+- **Fixed: a closure that captures, given to a call through a function value, compiled into a
+  jump through stack memory.** Its argument was typed like one of a call to a named function
+  (captures allowed), but an indirect call specializes nothing, and the closure value
+  `(L, captures..)` was lowered as an uninitialized 8-byte buffer whose address was passed as the
+  function: `let g = apply; g(|x| x + k, 3)` crashed natively and failed on the interpreter
+  ("indirect call through a pointer that is not a function address"), and so did the instance of
+  `fn run(g: fn(fn(i32) -> i32, i32) -> i32, k: i32) { g(|x| x + k, 3) }` that receives `g` at run
+  time. Both are `E0427` now — from sema when the callee is a `let`-bound local (a closure-bound
+  local that captures included), from lowering in such an instance; a closure that captures
+  nothing still works. `tests/fail/{closure_indirect_call_captures,closure_dynamic_call_captures}.wk`.
+- **Fixed: a closure lost a write through a call through a function value.** An aggregate a
+  closure captures and passes to a `mut` parameter is captured by reference, but a call through a
+  function value never applied the rule (a function type does not carry `mut`), so
+  `apply(|x| { pick()(arr); x }, 7)` with `pick` returning `fill1(mut a: [i32; 4])` wrote the
+  closure's private copy and `arr` stayed 0, while `fill1(arr)` in the closure, or `pick()(arr)`
+  outside it, wrote `arr` — on both backends. Inside a closure, an aggregate given to any call
+  through a function value (a captured `let`, a field, an element, a call's result, the closure's
+  own function-typed parameter) is now captured by reference, conservatively.
+  `tests/run/closure_capture_indirect_write.wk`.
+- **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
+  lowered again at each use, so a function named there escaped the whole-program analyses (a
+  recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the
+  address of a higher-order function had no compiled instance) and resolved its name in the scope
+  of each use. `tests/fail/fn_value_const.wk`.
+- The `E0429` explanation (`--explain`) now covers a function with a run-time-extent (`?`) tensor
+  parameter, which it already refused.
+- **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
+  value; a closure that captures still has no run-time value (no heap environment).
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

@@ -940,7 +940,8 @@ impl Numbering<'_> {
                         self.number(res, res_ty, Key::PureCall(func.0, list), added);
                     }
                 }
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
+                // Any other writer: a call of any kind or an atomic add (`Op::effects`).
+                op if op.may_write_memory() => {
                     // A call (or vector kernel) may store through any pointer it was given, or any
                     // pointer reachable from one — but never into a stack slot of *this* function
                     // whose address never escaped. What a read-only callee would read may change.
@@ -1041,6 +1042,7 @@ impl Numbering<'_> {
             Op::Load(..)
             | Op::Store { .. }
             | Op::Call { .. }
+            | Op::CallIndirect { .. }
             | Op::VecKernelCall { .. }
             | Op::AtomicAdd { .. }
             | Op::Alloca { .. }

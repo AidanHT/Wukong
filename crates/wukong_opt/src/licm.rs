@@ -64,7 +64,7 @@ use crate::effects::CallEffects;
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::loop_info::{self, NaturalLoop};
 
-use wukong_mir::{AddrSpace, BinOp, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId};
+use wukong_mir::{AddrSpace, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId};
 
 use crate::{cfg, each_op_use, CfgAnalyses, Pass};
 
@@ -193,11 +193,9 @@ impl LoopMem {
                         .stores
                         .push((*ptr, type_bytes(f.value_type(*value)).unwrap_or(u32::MAX))),
                     Op::Call { func, .. } if mem.writes_nothing(*func) => {}
-                    // An atomic add writes its (escaped) location and may race other threads'
-                    // adds: opaque, like a call.
-                    Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
-                        mem.has_call = true
-                    }
+                    // Any other writer (`Op::effects`): a call of any kind, or an atomic add, which
+                    // writes its (escaped) location and may race other threads' adds — opaque.
+                    op if op.may_write_memory() => mem.has_call = true,
                     Op::Barrier => mem.has_barrier = true,
                     _ => {}
                 }
@@ -469,38 +467,13 @@ pub(crate) fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
 /// `call`.
 fn safe_to_hoist(op: &Op, mem: &LoopMem) -> bool {
     match op {
-        Op::ConstInt(..)
-        | Op::ConstFloat(..)
-        | Op::Cmp(..)
-        | Op::Neg(..)
-        | Op::Not(..)
-        | Op::Cast(..)
-        | Op::Select(..)
-        | Op::Gep { .. }
-        | Op::FuncAddr(..)
-        | Op::GlobalAddr(..)
-        | Op::Splat(..)
-        | Op::ExtractLane(..)
-        | Op::Iota(..)
-        | Op::Widen { .. }
-        | Op::Narrow { .. }
-        | Op::Shuffle { .. }
-        | Op::InsertLane(..)
-        | Op::Fma(..)
-        | Op::Sqrt(..)
-        | Op::Round(..)
-        | Op::IntUnary(..) => true,
-        // Integer division/remainder can trap on a zero divisor, so they are not speculatable.
-        Op::Bin(b, ..) => !matches!(b, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem),
         // A speculatable callee always returns, reads nothing and cannot trap: with invariant
         // arguments its result is invariant and computing it early is unobservable.
         Op::Call { func, .. } => mem.effects.as_ref().is_some_and(|e| e.hoistable(*func)),
-        Op::Load(..)
-        | Op::Store { .. }
-        | Op::VecKernelCall { .. }
-        | Op::AtomicAdd { .. }
-        | Op::Alloca { .. }
-        | Op::Barrier => false,
+        // Everything else only when it has no effect at all (`Op::effects`): not a memory access,
+        // an allocation, a barrier, any other call, nor an integer division or remainder, which
+        // traps on a zero divisor.
+        op => op.is_pure(),
     }
 }
 
@@ -630,7 +603,7 @@ fn hoist_from_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wukong_mir::{Builder, CmpOp, MirType};
+    use wukong_mir::{BinOp, Builder, CmpOp, MirType};
     use wukong_span::Interner;
 
     /// Build `bb0 -> bb1(header, guard) -> bb2(body) -> bb1`, running `body` inside bb2. The

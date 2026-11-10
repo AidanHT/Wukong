@@ -226,14 +226,9 @@ fn escaping_values(f: &Function, defs: &Defs) -> Vec<Vec<ValueId>> {
 
 /// What one instruction may not be copied for.
 fn copyable(op: &Op) -> bool {
-    !matches!(
-        op,
-        Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::Alloca { .. }
-            | Op::Barrier
-            | Op::AtomicAdd { .. }
-    )
+    // An allocation, or any effect but a plain store (`Op::effects`): a call of any kind, a
+    // barrier, an atomic.
+    !matches!(op, Op::Alloca { .. }) && (matches!(op, Op::Store { .. }) || !op.has_side_effects())
 }
 
 fn find_thread(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Option<Thread> {

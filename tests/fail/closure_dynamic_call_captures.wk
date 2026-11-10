@@ -1,0 +1,24 @@
+// EXPECT-CODE: E0427
+// EXPECT-COUNT: 1
+module tests.fail.closure_dynamic_call_captures
+
+// `run` calls its function-typed parameter `g` with a closure that captures `k`. Called with the
+// named function `apply`, `run` is specialized for it and the closure is passed on like a literal
+// written at a call of `apply`. But `run` is also called with a run-time value (`a`), and in the
+// instance that receives `g` as a pointer, `g(..)` is a call through that pointer: the closure
+// would have to be a code address alone, with nowhere to keep `k`.
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn run(g: fn(fn(i32) -> i32, i32) -> i32, k: i32) -> i32 {
+    return g(|x| x + k, 3); //~ E0427
+}
+
+fn main() -> i32 {
+    print(run(apply, 5));
+    let a: fn(fn(i32) -> i32, i32) -> i32 = apply;
+    print(run(a, 5));
+    return 0;
+}

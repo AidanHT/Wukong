@@ -798,44 +798,21 @@ impl AliasInfo {
     /// anything the caller can name — *except* a stack slot of this function whose address never
     /// escaped, or `@noalias` storage nothing derived from escaped, neither of which any callee can
     /// have an address for ([`AliasInfo::is_call_proof`]).
-    /// The match below is **deliberately exhaustive — never add a `_` arm.** An op that writes
-    /// memory and is not classified as a writer here silently answers "cannot clobber", which is an
-    /// unsound no-alias answer, i.e. a miscompile. Listing every non-writing variant makes a newly
-    /// added `Op` a compile error at this site instead of a silent wrong answer, so the requirement
-    /// is enforced by the compiler rather than by `CONTRIBUTING.md`.
+    ///
+    /// Which ops write memory at all is [`Op::effects`]'s classification, never a list here: an op
+    /// that writes and is not seen as a writer would silently answer "cannot clobber", an unsound
+    /// no-alias answer, i.e. a miscompile. That classification is exhaustive, so a new `Op` is a
+    /// compile error there rather than a silent wrong answer here; this function only refines the
+    /// writers whose destination it can name.
     pub fn may_clobber(&self, ptr: ValueId, bytes: u32, op: &Op) -> bool {
         match op {
             Op::Store { ptr: q, value: _ } => self.may_alias_sized(ptr, bytes, *q, u32::MAX),
             // An atomic RMW writes exactly its own location, like a store. (Its pointer is also
             // marked escaped by the escape scan's fallback, which keeps its slot non-private.)
             Op::AtomicAdd { ptr: q, value: _ } => self.may_alias_sized(ptr, bytes, *q, u32::MAX),
-            Op::Call { .. } | Op::VecKernelCall { .. } => !self.is_call_proof(ptr),
-            // Everything below provably writes no memory.
-            Op::ConstInt(..)
-            | Op::ConstFloat(..)
-            | Op::Bin(..)
-            | Op::Cmp(..)
-            | Op::Neg(..)
-            | Op::Not(..)
-            | Op::Cast(..)
-            | Op::Select(..)
-            | Op::Alloca { .. }
-            | Op::Load(..)
-            | Op::Gep { .. }
-            | Op::FuncAddr(..)
-            | Op::GlobalAddr(..)
-            | Op::Splat(..)
-            | Op::ExtractLane(..)
-            | Op::Iota(..)
-            | Op::Widen { .. }
-            | Op::Narrow { .. }
-            | Op::Shuffle { .. }
-            | Op::InsertLane(..)
-            | Op::Fma(..)
-            | Op::Sqrt(..)
-            | Op::Round(..)
-            | Op::IntUnary(..)
-            | Op::Barrier => false,
+            op if op.is_call() => !self.is_call_proof(ptr),
+            // Anything else writes nothing (or, for a writer this function cannot place, anything).
+            op => op.may_write_memory(),
         }
     }
 

@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0427
+// EXPECT-COUNT: 1
+module tests.fail.closure_value_captures
+
+// An array element of function type is a run-time function value: the address of code and
+// nothing else. A closure that captures nothing is one; this one captures `k`, and the value has
+// no room for it (no environment to allocate, keep alive or free). Pass `k` as an ordinary
+// parameter, or capture nothing. tests/run/fn_values.wk is the positive control.
+
+fn main() -> i32 {
+    let k = 2.0;
+    let fs: [fn(f32) -> f32; 1] = [|x: f32| x * k]; //~ E0427
+    print(fs[0](3.0));
+    return 0;
+}

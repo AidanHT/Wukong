@@ -124,6 +124,7 @@ fn scalarize(f: &mut Function) -> Result<(), String> {
                     inst.op,
                     Op::Store { .. }
                         | Op::Call { .. }
+                        | Op::CallIndirect { .. }
                         | Op::VecKernelCall { .. }
                         | Op::Barrier
                         | Op::AtomicAdd { .. }
@@ -344,7 +345,7 @@ fn scalarize(f: &mut Function) -> Result<(), String> {
                             "casts between scalar and vector values require repacking".into()
                         );
                     }
-                    Op::Call { args, .. }
+                    Op::Call { args, .. } | Op::CallIndirect { args, .. }
                         if args
                             .iter()
                             .any(|v| original_types[v.0 as usize].is_vector()) =>

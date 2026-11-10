@@ -81,6 +81,7 @@ fn verify(f: &Function, sigs: Option<&FnSigs>) -> Vec<String> {
         live: HashSet::new(),
         dom_check: false,
         slots: None,
+        func_addrs: None,
     };
     v.run();
     v.errors
@@ -99,6 +100,9 @@ struct Verifier<'a> {
     dom_check: bool,
     /// `alloca` result -> its slot type, built the first time a `veckernel` call needs it.
     slots: Option<HashMap<u32, &'a MirType>>,
+    /// `func_addr` result -> the function it names, built the first time a `call_indirect` is
+    /// checked against a whole program.
+    func_addrs: Option<HashMap<u32, Symbol>>,
 }
 
 /// Sentinel for "no immediate dominator yet" in the Cooper–Harvey–Kennedy fixpoint below.
@@ -472,6 +476,22 @@ impl<'a> Verifier<'a> {
         result.and_then(|r| self.ty(r).cloned())
     }
 
+    /// The function `v` is the address of, when this function defines it as `func_addr g`.
+    fn func_addr_target(&mut self, v: ValueId) -> Option<Symbol> {
+        let f = self.f;
+        let map = self.func_addrs.get_or_insert_with(|| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|inst| match (&inst.op, inst.result) {
+                    (Op::FuncAddr(g), Some(r)) => Some((r.0, *g)),
+                    _ => None,
+                })
+                .collect()
+        });
+        map.get(&v.0).copied()
+    }
+
     fn check_op(&mut self, op: &Op, result: Option<ValueId>) {
         // `Store` never produces a result; `Call` may be void (e.g. the `print` intrinsic) or
         // value-producing; `VecKernelCall` is void when elementwise and f32 when a reduction (checked
@@ -480,6 +500,7 @@ impl<'a> Verifier<'a> {
             op,
             Op::Store { .. }
                 | Op::Call { .. }
+                | Op::CallIndirect { .. }
                 | Op::VecKernelCall { .. }
                 | Op::Barrier
                 | Op::AtomicAdd { .. }
@@ -778,6 +799,69 @@ impl<'a> Verifier<'a> {
                     if let Some(t) = self.ty(*n) {
                         if !t.is_int() {
                             self.err(format!("veckernel n has non-int type {}", t.display()));
+                        }
+                    }
+                }
+            }
+            Op::CallIndirect { callee, args, ret } => {
+                if self.use_val(*callee) {
+                    self.expect_ty(*callee, &MirType::Ptr, "call_indirect callee");
+                }
+                // The signature is the argument types and `ret`, and a backend builds its
+                // call from exactly those, so each must be a type a value can have.
+                for (i, a) in args.iter().enumerate() {
+                    if self.use_val(*a) {
+                        if let Some(t) = self.ty(*a) {
+                            if matches!(t, MirType::Void | MirType::Array(..)) {
+                                let t = t.display();
+                                self.err(format!(
+                                    "call_indirect argument {i} {a:?} has type {t}, which no \
+                                     parameter can have"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if matches!(ret, MirType::Array(..)) {
+                    self.err(format!(
+                        "call_indirect returns {}, which no function can return",
+                        ret.display()
+                    ));
+                }
+                // Discarding a returned value is legal, but taking one from a `void` signature is
+                // not, and a taken result has the signature's return type.
+                if *ret == MirType::Void {
+                    if result.is_some() {
+                        self.err("call_indirect takes a result but returns void".to_string());
+                    }
+                } else {
+                    self.check_result_is(result, ret);
+                }
+                // With the whole program in hand, a callee that is visibly `func_addr g` is checked
+                // against `g`'s declared signature: calling a function through a pointer of another
+                // signature is an ABI desync (Cranelift's `call_indirect` trusts the signature it
+                // is given, the interpreter zips parameters with arguments).
+                let target = if self.sigs.is_some() {
+                    self.func_addr_target(*callee)
+                } else {
+                    None
+                };
+                if let Some(g) = target {
+                    let sig = self.sigs.and_then(|s| s.get(&g)).cloned();
+                    if let Some((params, want_ret)) = sig {
+                        let have: Vec<MirType> =
+                            args.iter().filter_map(|a| self.ty(*a).cloned()).collect();
+                        if have != params || want_ret != *ret {
+                            let show = |ps: &[MirType], r: &MirType| {
+                                let p: Vec<String> = ps.iter().map(MirType::display).collect();
+                                format!("({}) -> {}", p.join(", "), r.display())
+                            };
+                            self.err(format!(
+                                "call_indirect through func_addr {g:?} uses the signature {} but \
+                                 the function has {}",
+                                show(&have, ret),
+                                show(&params, &want_ret)
+                            ));
                         }
                     }
                 }
@@ -2238,5 +2322,111 @@ mod tests {
         };
         assert_eq!(f.decl_span(), None);
         assert!(verify_function(&f).is_empty());
+    }
+
+    /// `g(x: i64) -> i64` and a `main` that calls it through `func_addr g` with `args`, taking a
+    /// result of `ret` (or none for `Void`), and returning 0.
+    fn indirect_program(i: &mut Interner, args: &[MirType], ret: MirType) -> Program {
+        let g_name = i.intern("g");
+        let mut g = Builder::new(g_name, MirType::I64);
+        let x = g.add_param(MirType::I64);
+        g.ret(Some(x));
+        let mut m = Builder::new(i.intern("main"), MirType::I64);
+        let addr = m.build(MirType::Ptr, Op::FuncAddr(g_name));
+        let argv: Vec<ValueId> = args
+            .iter()
+            .map(|t| match t {
+                MirType::F64 => m.build(MirType::F64, Op::ConstFloat(1.0, MirType::F64)),
+                t => m.build(t.clone(), Op::ConstInt(1, t.clone())),
+            })
+            .collect();
+        if ret == MirType::Void {
+            m.build_void(Op::CallIndirect {
+                callee: addr,
+                args: argv,
+                ret,
+            });
+        } else {
+            m.build(
+                ret.clone(),
+                Op::CallIndirect {
+                    callee: addr,
+                    args: argv,
+                    ret,
+                },
+            );
+        }
+        let zero = m.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        m.ret(Some(zero));
+        let mut p = Program::new();
+        p.funcs = vec![g.finish(), m.finish()];
+        p
+    }
+
+    /// A call through `func_addr g` with `g`'s own signature verifies, the result taken or not.
+    #[test]
+    fn a_matching_indirect_call_still_verifies() {
+        let mut i = Interner::new();
+        let p = indirect_program(&mut i, &[MirType::I64], MirType::I64);
+        assert_eq!(verify_program(&p), Vec::<String>::new());
+        let mut p = p;
+        p.funcs[1].blocks[0].insts[2].result = None;
+        assert_eq!(verify_program(&p), Vec::<String>::new());
+    }
+
+    /// Calling `func_addr g` with another signature is an ABI desync: Cranelift's `call_indirect`
+    /// trusts the signature it is given and the interpreter zips parameters with arguments.
+    #[test]
+    fn detects_an_indirect_call_signature_that_is_not_the_targets() {
+        let mut i = Interner::new();
+        for (args, ret) in [
+            (vec![MirType::I32], MirType::I64),
+            (vec![MirType::I64, MirType::I64], MirType::I64),
+            (vec![MirType::I64], MirType::F64),
+        ] {
+            let p = indirect_program(&mut i, &args, ret);
+            let errs = verify_program(&p);
+            assert!(errs.iter().any(|e| e.contains("signature")), "{errs:?}");
+            // Without the program the target's signature is unknown; the call alone is fine.
+            assert!(verify_function(&p.funcs[1]).is_empty());
+        }
+    }
+
+    /// The callee must be a pointer, and a `void` signature yields no result.
+    #[test]
+    fn detects_a_malformed_indirect_call() {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let not_ptr = b.add_param(MirType::I64);
+        let fp = b.add_param(MirType::Ptr);
+        b.build_void(Op::CallIndirect {
+            callee: not_ptr,
+            args: vec![],
+            ret: MirType::Void,
+        });
+        b.build(
+            MirType::I64,
+            Op::CallIndirect {
+                callee: fp,
+                args: vec![],
+                ret: MirType::Void,
+            },
+        );
+        b.build(
+            MirType::I32,
+            Op::CallIndirect {
+                callee: fp,
+                args: vec![],
+                ret: MirType::I64,
+            },
+        );
+        b.ret(None);
+        let errs = verify_function(&b.finish());
+        assert!(errs.iter().any(|e| e.contains("callee")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("returns void")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("operation yields i64")),
+            "{errs:?}"
+        );
     }
 }
