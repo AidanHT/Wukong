@@ -149,7 +149,9 @@ fn strict_parallel_keeps_the_source_order() {
 }
 
 /// With recognition off (`WUKONG_NO_RECOGNIZE`, `@generic`) the kernel shape takes the fallback —
-/// the same tree, so recognition cannot change a `@parallel` reduction's bits.
+/// the same tree, so recognition cannot change the bits of a `@parallel` reduction loop on its own.
+/// (A reduction inside a nest a multi-loop kernel takes is the documented exception:
+/// `a_reduction_inside_a_multi_loop_kernel_nest_moves_with_recognition`.)
 #[test]
 fn recognition_off_still_takes_the_tree() {
     let src = par_fn("@parallel", "for i in 0..n { s += x[i] * y[i]; }");
@@ -335,6 +337,43 @@ fn a_reduction_inside_a_whole_function_chunk_keeps_the_tree() {
         .map(|f| calls(f, &it, "wukong_sreduce_f32"))
         .sum();
     assert_eq!(total, 2);
+}
+
+/// The documented edge of the contract (language guide's table under Attributes, roadmap's sharp
+/// edge): a reduction that is the inner loop of a nest a multi-loop kernel takes whole is NOT one
+/// order on every path. With recognition on, the `@parallel` column sum is
+/// `wukong_colsum_f32_parallel` — its row-ascending fold — and no tree lowering runs at all; with
+/// recognition off (or `@generic`) the inner loop is a reduction on its own and takes the tree.
+/// The two differ in the low bits on generic data, so whether the kernel fired moves them. If a
+/// change ever gives such a nest one order, this test fails and the docs must move with it.
+#[test]
+fn a_reduction_inside_a_multi_loop_kernel_nest_moves_with_recognition() {
+    let nest = "fn colsum(x: [f32; 4096], mut out: [f32; 16]) {\n    for j in 0..16 {\n        let mut s: f32 = 0.0;\n        for i in 0..256 { s += x[i * 16 + j]; }\n        out[j] = s;\n    }\n}\n";
+    let total = |prog: &Program, it: &Interner, callee: &str| -> usize {
+        prog.funcs.iter().map(|f| calls(f, it, callee)).sum()
+    };
+
+    let (prog, it, trace) = lower(&format!("@parallel\n{nest}"));
+    assert!(trace.is_empty(), "the kernel took the nest: {trace:?}");
+    assert_eq!(total(&prog, &it, "wukong_colsum_f32_parallel"), 1);
+    assert_eq!(total(&prog, &it, "wukong_sreduce_f32"), 0);
+
+    let off = LowerOptions {
+        recognize: false,
+        ..LowerOptions::default()
+    };
+    for (src, opts) in [
+        (format!("@parallel\n{nest}"), off),
+        (
+            format!("@parallel\n@generic\n{nest}"),
+            LowerOptions::default(),
+        ),
+    ] {
+        let (prog, it, trace) = lower_opts(&src, opts);
+        assert_eq!(trace, [TreePath::Fallback], "{src}");
+        assert_eq!(total(&prog, &it, "wukong_colsum_f32_parallel"), 0, "{src}");
+        assert_eq!(total(&prog, &it, "wukong_sreduce_f32"), 2, "{src}");
+    }
 }
 
 /// A half reduction keeps the `_parallel` tree inside a region body.
