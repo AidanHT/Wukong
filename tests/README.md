@@ -18,6 +18,7 @@ harnesses that consume them live in `crates/wukongc/tests/` and reach this direc
 | `fail/lib/` | 2 (`badlib.wk`, `dup.wk`) | Support for import fixtures. **Not fixtures.** |
 | `warn/` | 12 top-level `*.wk` | Must **compile** and produce exactly the warnings (lints) their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list, in order. |
 | `imports/` | 6 | Flat import-graph fixtures consumed **only** by `crates/wukong_driver/src/loader.rs` unit tests. E2e harnesses ignore this directory. |
+| `filetests/` | 37 `*.mir` / `*.wk`, **recursive** (`opt/`, `mir-text/`, `verify/`, `cli/`) | FileCheck-style tests of what the compiler *emits* — chiefly what each optimizer pass does to the MIR. Each file carries its own `RUN:` and `CHECK:` lines. The only directory scanned recursively; an `Inputs/` subdirectory holds files a `RUN:` line reads, not tests. |
 
 See each subdirectory's `README.md` for format details and landmines.
 
@@ -74,6 +75,29 @@ module tests.warn.deny_warnings_flag
 - `// FLAGS: <args>` — extra arguments, appended to `--error-format=json --emit=mir`.
 - Exit status must be 1 when an `EXPECT-ERROR` is listed, 0 otherwise.
 
+## Fixture format — `filetests/`
+
+```text
+; RUN: wukongc --emit=mir --passes=licm %s | filecheck %s
+; CHECK-LABEL: fn invariant_product(
+; CHECK:       bb0(
+; CHECK:         [[AB:v[0-9]+]] = fmul v2, v3
+; CHECK:       bb2:
+; CHECK-NOT:     fmul v2, v3
+fn invariant_product(v0 ptr, v1 ptr, v2 f32, v3 f32, v4 i64) -> void { ... }
+```
+
+- `RUN:` — a pipeline run in order with `pipefail`: `wukongc <args>`, `filecheck <file>
+  [--check-prefix=P] [--input-file=f] [--implicit-check-not=pat]`, `diff <a> <b>`, `not <cmd>`
+  (a clean failure, never a crash); `>`, `<`, `2>`, `2>&1`; `%s` the file, `%S` its directory,
+  `%t` a scratch path. A trailing `\` continues onto the next `RUN:` line. Every file needs a
+  `RUN:` line that checks something (`filecheck` or `diff`).
+- `CHECK:` / `-NEXT:` / `-SAME:` / `-NOT:` / `-DAG:` / `-LABEL:` / `-EMPTY:` / `-COUNT-<n>:` —
+  LLVM FileCheck's semantics, with `{{regex}}`, `[[VAR:regex]]`, `[[VAR]]` and `[[@LINE+k]]`.
+- `REQUIRES: vec-kernels` (or `windows`, `unix`, `x86_64`) skips the file elsewhere, by name.
+- Expectations come from the pass's semantics, then are confirmed — never pasted from output.
+  `CONTRIBUTING.md` ("Writing a filetest") has the rules.
+
 ## Gates over this corpus
 
 `crates/wukongc/tests/run.rs` — `run_suite`, `optimization_is_observationally_invariant`,
@@ -94,6 +118,10 @@ automatic, `4`), and an `-O1` arm compares 1 against 4 threads over the corpus.
 `crates/wukongc/tests/exe.rs` — AOT linked exe matches `--run` on four curated fixtures.
 
 `crates/wukongc/tests/emit.rs` — frontend and lowering stages succeed over `examples/` + `run/`.
+
+`crates/wukongc/tests/filetests.rs` — every file under `filetests/`, through the real binary and
+the in-tree FileCheck (`crates/wukongc/tests/filecheck/`); also the matcher's and the harness's
+own unit tests. `WUKONG_FILETESTS=<substring>` runs a subset.
 
 `crates/wukongc/tests/recognize.rs` — the **only** gate that can see a recognizer at all: one witness
 fixture per cascade head loses its kernel under `WUKONG_NO_RECOGNIZE`, the `lang_generic_*` pairs keep
@@ -116,6 +144,7 @@ both backends, and autodiff refuses to run under the instrument.
 cargo test -p wukongc                      # every gate over this corpus
 cargo test -p wukongc --test run           # opt-invariance / native-agreement
 cargo test -p wukongc --test fail          # compile-fail + catalogue coverage
+cargo test -p wukongc --test filetests     # what each optimizer pass emits (FileCheck)
 cargo run -q -p wukongc -- --run -O2 tests/run/foo.wk
 ```
 

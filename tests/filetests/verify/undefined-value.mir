@@ -1,0 +1,13 @@
+; RUN: not wukongc --emit=mir --verify-each %s 2>&1 | filecheck %s
+; RUN: not wukongc --emit=mir %s 2>&1 | filecheck %s
+;
+; A `.mir` input is verified before any pass runs, with or without --verify-each: an invalid
+; program is an internal-compiler-error report naming the broken rule, exit 1, and nothing on
+; stdout. (These inputs parse; the parser's own errors are in mir-text/parse-errors.mir.)
+
+; CHECK: internal compiler error (MIR verify): use of undefined value v7
+; CHECK-NOT: fn f(
+fn f(v0 i32) -> i32 {
+  bb0(v0 i32):
+    ret v7
+}

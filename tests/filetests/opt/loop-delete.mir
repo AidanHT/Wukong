@@ -1,0 +1,45 @@
+; RUN: wukongc --emit=mir --passes=loop-delete %s | filecheck %s
+;
+; `loop-delete` bypasses a loop that has no side effect, provably terminates (here a constant trip
+; count) and computes nothing used after it. A loop whose counter is read after the exit is kept.
+
+; CHECK-LABEL: fn dead_loop(
+; CHECK-NOT:     cond_br
+; CHECK-NOT:     add
+; CHECK:         ret v0
+fn dead_loop(v0 i32) -> i32 {
+  bb0(v0 i32):
+    v1: i64 = const.i64 0
+    br bb1(v1)
+  bb1(v2 i64):
+    v3: i64 = const.i64 100
+    v4: i1 = cmp.slt v2, v3
+    cond_br v4, bb2, bb3
+  bb2:
+    v5: i64 = const.i64 1
+    v6: i64 = add v2, v5
+    br bb1(v6)
+  bb3:
+    ret v0
+}
+
+; CHECK-LABEL: fn live_out(
+; CHECK:       bb1([[I:v[0-9]+]] i64):
+; CHECK:         cond_br
+; CHECK:         add [[I]],
+; CHECK:         ret [[I]]
+fn live_out(v0 i32) -> i64 {
+  bb0(v0 i32):
+    v1: i64 = const.i64 0
+    br bb1(v1)
+  bb1(v2 i64):
+    v3: i64 = const.i64 100
+    v4: i1 = cmp.slt v2, v3
+    cond_br v4, bb2, bb3
+  bb2:
+    v5: i64 = const.i64 1
+    v6: i64 = add v2, v5
+    br bb1(v6)
+  bb3:
+    ret v2
+}

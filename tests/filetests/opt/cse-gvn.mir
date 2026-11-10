@@ -1,0 +1,96 @@
+; RUN: wukongc --emit=mir --passes=cse,dce %s | filecheck %s
+;
+; `cse` is global value numbering over the dominator tree: a pure computation is reused by every
+; block it dominates, an expression every arm of a join computed becomes a block parameter of the
+; join, and a load is forwarded from the store that wrote its location, through a join too.
+; `dce` removes what was replaced. (The pair runs together as in the standard pipeline: on its
+; own, `cse` keeps forwarding the dead load at a join and gives the join one more parameter on
+; every fixpoint sweep.)
+
+; The add in bb0 dominates both arms, so neither arm keeps its own.
+; CHECK-LABEL: fn dominated(
+; CHECK:         [[S:v[0-9]+]] = add v0, v1
+; CHECK-NEXT:    cond_br
+; CHECK:       bb1:
+; CHECK-NOT:     add
+; CHECK:         mul [[S]], [[S]]
+; CHECK:       bb2:
+; CHECK-NEXT:    ret [[S]]
+fn dominated(v0 i32, v1 i32, v2 i1) -> i32 {
+  bb0(v0 i32, v1 i32, v2 i1):
+    v3: i32 = add v0, v1
+    cond_br v2, bb1, bb2
+  bb1:
+    v4: i32 = add v0, v1
+    v5: i32 = mul v4, v4
+    ret v5
+  bb2:
+    v6: i32 = add v0, v1
+    ret v6
+}
+
+; Each arm computes `v0 - v1`, so the join's recomputation is replaced by a new block parameter
+; that each edge feeds with its own arm's value.
+; CHECK-LABEL: fn join_redundant(
+; CHECK:       bb1:
+; CHECK-NEXT:    [[A:v[0-9]+]] = sub v0, v1
+; CHECK:         br bb3({{v[0-9]+}}, [[A]])
+; CHECK:       bb2:
+; CHECK-NEXT:    [[B:v[0-9]+]] = sub v0, v1
+; CHECK-NEXT:    br bb3([[B]], [[B]])
+; CHECK:       bb3({{v[0-9]+}} i32, [[P:v[0-9]+]] i32):
+; CHECK-NOT:     sub
+; CHECK:         add {{v[0-9]+}}, [[P]]
+fn join_redundant(v0 i32, v1 i32, v2 i1) -> i32 {
+  bb0(v0 i32, v1 i32, v2 i1):
+    cond_br v2, bb1, bb2
+  bb1:
+    v3: i32 = sub v0, v1
+    v4: i32 = mul v3, v3
+    br bb3(v4)
+  bb2:
+    v5: i32 = sub v0, v1
+    br bb3(v5)
+  bb3(v6 i32):
+    v7: i32 = sub v0, v1
+    v8: i32 = add v6, v7
+    ret v8
+}
+
+; A load right after a store to the same address reads the stored value.
+; CHECK-LABEL: fn forward(
+; CHECK:         store v1, v0
+; CHECK-NOT:     load
+; CHECK:         ret v1
+fn forward(v0 ptr, v1 f32) -> f32 {
+  bb0(v0 ptr, v1 f32):
+    store v1, v0
+    v2: f32 = load f32 v0
+    ret v2
+}
+
+; Each arm stores a different value to *v0: the load at the join becomes a block parameter
+; carrying the value each edge stored.
+; CHECK-LABEL: fn forward_through_join(
+; CHECK:       bb1:
+; CHECK-NEXT:    store v2, v0
+; CHECK-NEXT:    br bb3(v2)
+; CHECK:       bb2:
+; CHECK-NEXT:    store v3, v0
+; CHECK-NEXT:    br bb3(v3)
+; CHECK:       bb3([[M:v[0-9]+]] f32):
+; CHECK-NOT:     load
+; CHECK:         ret [[M]]
+fn forward_through_join(v0 ptr, v1 i1, v2 f32, v3 f32) -> f32 {
+  bb0(v0 ptr, v1 i1, v2 f32, v3 f32):
+    cond_br v1, bb1, bb2
+  bb1:
+    store v2, v0
+    br bb3
+  bb2:
+    store v3, v0
+    br bb3
+  bb3:
+    v4: f32 = load f32 v0
+    ret v4
+}

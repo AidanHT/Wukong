@@ -1,0 +1,55 @@
+// RUN: wukongc --emit=mir --passes=inline %s | filecheck %s
+// RUN: wukongc --emit=mir -O2 %s | filecheck %s --check-prefix=O2
+// RUN: wukongc --emit=mir --passes= %s | filecheck %s --check-prefix=BEFORE
+//
+// The `inline` step splices non-recursive callees into their callers bottom-up over the call
+// graph, then drops every function left uncalled. A recursive function is never inlined into its
+// caller. Once inlined, the rest of -O2 folds the constant arguments straight through.
+
+// BEFORE-LABEL: fn square(
+// BEFORE-LABEL: fn sum_of_squares(
+// BEFORE-COUNT-2: call square(
+// BEFORE-LABEL: fn main(
+// BEFORE:         call sum_of_squares(
+fn square(x: i32) -> i32 {
+    return x * x;
+}
+
+fn sum_of_squares(a: i32, b: i32) -> i32 {
+    return square(a) + square(b);
+}
+
+// CHECK-NOT:   fn square(
+// CHECK-NOT:   fn sum_of_squares(
+// CHECK-LABEL: fn fib(
+// CHECK-COUNT-2: call fib(
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// main keeps no call to either helper: both squares are its own multiplies now.
+// CHECK-LABEL: fn main(
+// CHECK-NOT:     call s
+// CHECK:         [[A:v[0-9]+]] = mul
+// CHECK:         br {{bb[0-9]+}}([[A]])
+// CHECK:         [[B:v[0-9]+]] = mul
+// CHECK:         br [[JOIN_B:bb[0-9]+]]([[B]])
+// CHECK:       [[JOIN_B]]([[RB:v[0-9]+]] i32):
+// CHECK-NEXT:    add {{v[0-9]+}}, [[RB]]
+// CHECK:         call print(
+// CHECK:         call fib(
+//
+// At -O2, 3*3 + 4*4 is folded to the constant 25.
+// O2-LABEL: fn main(
+// O2-NOT:     mul
+// O2:         [[C:v[0-9]+]] = const.i32 25
+// O2-NEXT:    call print([[C]])
+// O2:         call fib(
+fn main() -> i32 {
+    print(sum_of_squares(3, 4));
+    print(fib(10));
+    return 0;
+}

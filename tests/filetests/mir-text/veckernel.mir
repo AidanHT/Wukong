@@ -1,0 +1,39 @@
+; REQUIRES: vec-kernels
+; RUN: wukongc --emit=mir-text --target-cpu=x86-64-v3 --passes=vectorize %s > %t.v3.mir
+; RUN: filecheck %s --input-file=%t.v3.mir --check-prefix=DUMP
+; RUN: not wukongc --emit=mir %t.v3.mir 2>&1 | filecheck %s --check-prefix=REREAD
+; RUN: wukongc --emit=mir-text --target-cpu=x86-64-v2 --passes=vectorize %s > %t.v2.mir
+; RUN: wukongc --emit=mir --passes= %t.v2.mir | filecheck %s --check-prefix=V2
+;
+; A synthesized 256-bit vector-kernel recipe has no textual form. The typed dump says so in a
+; comment line and still shows the call, but reading the dump back stops at that line with the
+; remedy: dump at x86-64-v2, which builds no recipe, and the dump reads back.
+
+; DUMP:      ; wukong mir text v1
+; DUMP-NEXT: ; 1 vector-kernel recipe(s) are not representable
+; DUMP:      veckernel #0(
+; REREAD:      invalid MIR: vector-kernel recipes have no textual form;
+; REREAD-SAME: dump with --target-cpu=x86-64-v2
+; V2-NOT:    veckernel
+; V2:        load <4 x f32>
+fn axpy(v0 ptr noalias, v1 ptr noalias, v2 f32, v3 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 i64):
+    v4: i64 = const.i64 0
+    br bb1(v4)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v3
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fmul v8, v2
+    v10: ptr = gep v1, v5 : f32
+    v11: f32 = load f32 v10
+    v12: f32 = fadd v9, v11
+    store v12, v10
+    v13: i64 = const.i64 1
+    v14: i64 = add v5, v13
+    br bb1(v14)
+  bb3:
+    ret
+}

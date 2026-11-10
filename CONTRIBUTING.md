@@ -221,7 +221,11 @@ the verifier will not catch it. Under `debug_assertions` the pass manager verifi
 after every pass that ran and panics naming the culprit, so run the tests in a debug build.
 
 Add a test asserting both an effect (e.g. instruction-count reduction) and that results are
-unchanged. The opt-level differential test (`crates/wukongc/tests/run.rs`) will also exercise it.
+unchanged. The opt-level differential test (`crates/wukongc/tests/run.rs`) will also exercise it,
+but it only proves the pass changes no output — not that it fires. Pin what it does with a
+filetest (`tests/filetests/opt/<pass>.mir`, see "Writing a filetest" below): a small `.mir` input
+run through `--passes=<your pass>`, with `CHECK:` lines for the transformation's essential property
+and a negative case it must leave alone.
 
 Then name the pass in `crates/wukong_driver/src/passes.rs`: `FUNCTION_PASSES`, `make_pass`, and
 `standard_spec` for each level that runs it. That module is the `--passes` replica of the standard
@@ -267,9 +271,11 @@ A dump is a faithful reproducer: `-O2` of a parsed `-O0` dump, and the `-O2` lis
 through a dump, both equal `-O2` byte for byte over the whole run corpus
 (`crates/wukongc/tests/mir_text.rs`). To cut the program down, delete functions and blocks from the
 `.mir` file itself and re-run step 2 (`wukongc --emit=mir bug.mir` first, to make sure it still
-verifies). The reduced `.mir` and its list are the regression test: a Rust test can read it with
-`wukong_mir::text::parse_program`, run `wukong_driver::passes::run_steps`, and compare the result
-through `wukong_interp`, with no `Builder` code. Any future post-pipeline stage in
+verifies). The reduced `.mir` and its list are the regression test: check it in as a filetest
+(below) whose `RUN:` line is step 2 and whose `CHECK:` lines state what the fixed pass must (or
+must not) produce. A Rust test can also read it with `wukong_mir::text::parse_program`, run
+`wukong_driver::passes::run_steps`, and compare the result through `wukong_interp`, with no
+`Builder` code, when the property is a value rather than a shape. Any future post-pipeline stage in
 `optimize_preserving` must become a `passes::Step` (see "Adding an optimizer pass"), or step 2 stops
 reproducing `-O2`.
 
@@ -280,6 +286,68 @@ Wukong frame (`docs/internals.md`, "Debug info and the JIT perf map"); `-g` chan
 A value a pass creates is attributed to a line only if the pass copies a location onto it
 (`Function::copy_value_loc`, as inlining, unrolling and the loop-copying passes do; the vectorizer
 sets its builder's current location instead); otherwise its code continues the line before it.
+
+## Writing a filetest
+
+`tests/filetests/` holds FileCheck-style tests of what the compiler *emits*, chiefly what each
+optimizer pass does to the MIR: `opt/` (one file per pass), `mir-text/` (the typed dump and its
+reader), `verify/` (the MIR verifier) and `cli/` (`--passes`, `--print-after`). A file is a
+`.mir` or `.wk` program carrying its own commands and expectations in comments:
+
+```text
+; RUN: wukongc --emit=mir --passes=licm %s | filecheck %s
+;
+; What the pass must do here, and why (the reasoning the CHECK lines encode).
+
+; CHECK-LABEL: fn invariant_product(
+; CHECK:       bb0(
+; CHECK:         [[AB:v[0-9]+]] = fmul v2, v3
+; CHECK:       bb2:
+; CHECK-NOT:     fmul v2, v3
+; CHECK:         fmul {{v[0-9]+}}, [[AB]]
+fn invariant_product(v0 ptr, v1 ptr, v2 f32, v3 f32, v4 i64) -> void {
+  ...
+}
+```
+
+Run them with `cargo test -p wukongc --test filetests` (`WUKONG_FILETESTS=licm` runs the files
+whose path contains `licm`). A failure prints the directive with its `file:line:col`, where the
+search started, the input line most like the pattern, and the whole input numbered.
+
+- **`RUN:`** lines run in order and must all succeed; a trailing `\` continues onto the next
+  `RUN:` line. Commands: `wukongc <args>` (the real binary, run in a scratch directory with the
+  emit-changing `WUKONG_*` switches cleared), `filecheck <checkfile> [--check-prefix=P]
+  [--check-prefixes=P,Q] [--implicit-check-not=pat] [--input-file=f] [--allow-empty]
+  [--strict-whitespace]`, `diff <a> <b>` and `not <command>` (a clean non-zero exit; a crash or a
+  panic fails it — `wukongc` exits 1 after a panic on its compile thread, so the harness looks
+  for the panic message wherever `2>` or `2>&1` sent stderr). Pipes run with `pipefail`;
+  redirections are `>`, `<`, `2>` and `2>&1`. `%s` is the test file, `%S` its directory, `%t` a
+  scratch path unique to the test — give it a `.mir` extension (`%t.mir`) when `wukongc` will
+  read it back.
+- **Directives** are LLVM FileCheck's: `CHECK:`, `-NEXT:`, `-SAME:`, `-NOT:`, `-DAG:`, `-LABEL:`,
+  `-EMPTY:`, `-COUNT-<n>:`; `{{regex}}`, `[[NAME:regex]]` / `[[NAME]]`, `[[@LINE+k]]`. A run of
+  blanks matches any run of blanks, and a pattern never spans lines. Give each function its own
+  `CHECK-LABEL: fn name(` so a match cannot wander into the next one. Two `RUN:` lines may share
+  a prefix and add their own (`--check-prefixes=CHECK,CHECK-V2` and `CHECK,CHECK-V3`): each
+  ignores the other's directives. A misspelled directive (`CHECK-NXT:`, `CHECK-NEXT` without its
+  colon, `CHECK_NEXT:`) is an error; a directive of a prefix some `RUN:` line checks never counts
+  as one, however close its name is to a suffix.
+- **`REQUIRES: vec-kernels`** (or `windows`, `unix`, `x86_64`) skips a file on hosts without the
+  feature; the suite names every skipped file. Anything printed below `--target-cpu=x86-64-v3` is
+  the same on every host, so pin that level unless the test is about the 256-bit kernels.
+- **Write the CHECK lines from the pass's semantics, then confirm them**, never by pasting output.
+  Prefer the stable property (the load is in the preheader and not in the body; no `call` is left)
+  over exact numbering and instruction order; capture value and block names with `[[V:v[0-9]+]]`
+  instead of spelling `v17`. Include a case the pass must leave alone (the `may_alias` twin), and
+  check the test fails with the pass taken out of the `RUN:` line.
+- A `.mir` input is the most stable: it isolates the pass from the front end and the lowering,
+  which change what a `.wk` program reaches the optimizer as. Start one from
+  `wukongc --emit=mir-text --passes=<what runs before your pass> f.wk` and trim it, or write it
+  by hand (`docs/internals.md`, "Typed textual MIR").
+- Support files a `RUN:` line reads (a deliberately broken `.mir`, say) go in an `Inputs/`
+  directory beside the test; the harness never runs those as tests. A comment that opens with an
+  all-capitals `WORD:` is read as a directive, so it must name a prefix some `RUN:` line checks
+  (`NOTE:`, `TODO:` and `FIXME:` excepted): reword prose that would start that way.
 
 ## Adding a language feature
 

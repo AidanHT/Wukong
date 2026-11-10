@@ -1,0 +1,94 @@
+; RUN: wukongc --emit=mir --passes=unswitch,simplify-cfg %s | filecheck %s
+;
+; `unswitch` removes a loop-invariant decision from a loop body. A branch on an invariant `i1`
+; becomes one branch in the preheader between two copies of the loop, each with the decision made
+; (`simplify-cfg` then folds the decided branches). A branch on `iv < n` (n invariant) splits the
+; loop at the clamped iteration where the test changes: two back-to-back loops, the first running
+; while the test holds, the second after it.
+
+; CHECK-LABEL: fn invariant_flag(
+; CHECK:         cond_br v2, [[ON:bb[0-9]+]]({{v[0-9]+}}), [[OFF:bb[0-9]+]]({{v[0-9]+}})
+; CHECK:       [[ON]]([[I:v[0-9]+]] i64):
+; CHECK-NEXT:    cmp.slt [[I]], v1
+; CHECK-NEXT:    cond_br
+; CHECK-NOT:     cond_br
+; CHECK-NOT:     fmul
+; CHECK:         fadd
+; CHECK-NOT:     cond_br
+; CHECK:         br [[ON]](
+; CHECK:       [[OFF]]([[J:v[0-9]+]] i64):
+; CHECK-NEXT:    cmp.slt [[J]], v1
+; CHECK-NEXT:    cond_br
+; CHECK-NOT:     cond_br
+; CHECK-NOT:     fadd
+; CHECK:         fmul
+; CHECK-NOT:     cond_br
+; CHECK:         br [[OFF]](
+fn invariant_flag(v0 ptr, v1 i64, v2 i1) -> void {
+  bb0(v0 ptr, v1 i64, v2 i1):
+    v3: i64 = const.i64 0
+    br bb1(v3)
+  bb1(v4 i64):
+    v5: i1 = cmp.slt v4, v1
+    cond_br v5, bb2, bb6
+  bb2:
+    v6: ptr = gep v0, v4 : f32
+    v7: f32 = load f32 v6
+    cond_br v2, bb3, bb4
+  bb3:
+    v8: f32 = fadd v7, v7
+    br bb5(v8)
+  bb4:
+    v9: f32 = fmul v7, v7
+    br bb5(v9)
+  bb5(v10 f32):
+    store v10, v6
+    v11: i64 = const.i64 1
+    v12: i64 = add v4, v11
+    br bb1(v12)
+  bb6:
+    ret
+}
+
+; for i in 0..v1 { x[i] = i < v2 ? x[i] + x[i] : x[i] * x[i] }: the split point is v2 clamped to
+; [0, v1]; the loop below it only adds, the loop after it only multiplies, and the first hands its
+; counter to the second.
+; CHECK-LABEL: fn split_at(
+; CHECK:         [[LT:v[0-9]+]] = cmp.slt v2, v1
+; CHECK-NEXT:    [[MIN:v[0-9]+]] = select [[LT]], v2, v1
+; CHECK:         [[SPLIT:v[0-9]+]] = select {{v[0-9]+}}, {{v[0-9]+}}, [[MIN]]
+; CHECK:         br [[FIRST:bb[0-9]+]](
+; CHECK:       [[SECOND:bb[0-9]+]]({{v[0-9]+}} i64):
+; CHECK-NOT:     fadd
+; CHECK:         fmul
+; CHECK:       [[FIRST]]([[I:v[0-9]+]] i64):
+; CHECK:         [[BELOW:v[0-9]+]] = cmp.slt [[I]], [[SPLIT]]
+; CHECK-NEXT:    cond_br [[BELOW]], {{bb[0-9]+}}, [[SECOND]]([[I]])
+; CHECK-NOT:     fmul
+; CHECK:         fadd
+fn split_at(v0 ptr, v1 i64, v2 i64) -> void {
+  bb0(v0 ptr, v1 i64, v2 i64):
+    v3: i64 = const.i64 0
+    br bb1(v3)
+  bb1(v4 i64):
+    v5: i1 = cmp.slt v4, v1
+    cond_br v5, bb2, bb6
+  bb2:
+    v6: ptr = gep v0, v4 : f32
+    v7: f32 = load f32 v6
+    v13: i1 = cmp.slt v4, v2
+    cond_br v13, bb3, bb4
+  bb3:
+    v8: f32 = fadd v7, v7
+    br bb5(v8)
+  bb4:
+    v9: f32 = fmul v7, v7
+    br bb5(v9)
+  bb5(v10 f32):
+    store v10, v6
+    v11: i64 = const.i64 1
+    v12: i64 = add v4, v11
+    br bb1(v12)
+  bb6:
+    ret
+}

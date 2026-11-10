@@ -51,7 +51,9 @@ compile's time went, and `--depfile=<f>` writes a Make dependency rule over the 
 `--print-after=<pass>` prints the MIR to stderr after each run of a named pass (`docs/internals.md`,
 "Running a chosen pass list"). `--emit=mir-text` prints MIR with every type spelled out, and
 `wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
-(`docs/internals.md`, "Typed textual MIR"). `-g` puts DWARF in an `--emit=obj|exe` artifact — a
+(`docs/internals.md`, "Typed textual MIR"); what each pass does is pinned the same way, by
+FileCheck-style `.mir` filetests under `tests/filetests/` (`cargo test -p wukongc --test
+filetests`; `CONTRIBUTING.md`, "Writing a filetest"). `-g` puts DWARF in an `--emit=obj|exe` artifact — a
 line table from every function's machine code to `file:line:column`, a subprogram per function and
 call-frame information, with the machine code unchanged — so gdb or lldb can break, step and
 backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `perf-<pid>.map` for

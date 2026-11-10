@@ -1,0 +1,34 @@
+// RUN: wukongc --emit=mir -O1 %s > %t.o1
+// RUN: wukongc --emit=mir --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre %s > %t.list
+// RUN: diff %t.o1 %t.list
+// RUN: wukongc --emit=mir -O0 %s > %t.o0
+// RUN: wukongc --emit=mir --passes= %s > %t.none
+// RUN: diff %t.o0 %t.none
+// RUN: not wukongc --emit=mir --passes=mem2reg,bogus %s 2>&1 | filecheck %s --check-prefix=UNKNOWN
+// RUN: not wukongc --emit=mir --print-after=bogus %s 2>&1 | filecheck %s --check-prefix=UNKNOWN
+// RUN: not wukongc --emit=ast --passes=dce %s 2>&1 | filecheck %s --check-prefix=NO-OPTIMIZER
+//
+// A pass list is an executable spelling of an -O level: -O1 is exactly its list and -O0 the empty
+// one (the -O2 list's law is held over the whole corpus by crates/wukongc/tests/mir_text.rs). An
+// unknown name is refused with the list of every pass and program step, and both flags are
+// refused where no optimizer runs.
+
+// UNKNOWN:      error: {{.*}}unknown pass `bogus`
+// UNKNOWN-SAME: sroa, mem2reg, simplify, jump-thread, simplify-cfg, simplify-phis, dce, tre, cse,
+// UNKNOWN-SAME: dse, loop-canon, loop-delete, fuse, licm, bce, unswitch, promote, vectorize
+// UNKNOWN-SAME: inline, unroll, slp, form-switches
+
+// NO-OPTIMIZER: error:
+// NO-OPTIMIZER-SAME: --emit=ast
+
+fn count(n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    return 1 + count(n - 1);
+}
+
+fn main() -> i32 {
+    print(count(5));
+    return 0;
+}

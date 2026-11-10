@@ -1,0 +1,41 @@
+; RUN: wukongc --emit=mir --passes=simplify,licm --print-after=licm %s 2> %t.err > %t.out
+; RUN: filecheck %s --input-file=%t.err --check-prefix=AFTER
+; RUN: wukongc --emit=mir --passes=simplify,licm %s > %t.plain
+; RUN: diff %t.out %t.plain
+;
+; `--print-after=<pass>` writes the function to stderr after every run of that pass that changed
+; it, and a one-line note after every run that did not; stdout is byte-identical to the same
+; compile without the flag. The fixpoint runs licm on `hoist` a second time (simplify ran again
+; after the first change), and that run finds nothing left to hoist.
+
+; AFTER:      ; *** MIR after licm (fn hoist) ***
+; AFTER-NEXT: fn hoist(
+; AFTER:      bb0(
+; AFTER:        fmul v1, v2
+; AFTER:        br bb1(
+; AFTER:      ; *** MIR after licm (fn hoist): unchanged ***
+; AFTER-NEXT: ; *** MIR after licm (fn straight): unchanged ***
+; AFTER-NOT:  MIR after
+; AFTER-NOT:  simplify
+fn hoist(v0 ptr, v1 f32, v2 f32, v3 i64) -> void {
+  bb0(v0 ptr, v1 f32, v2 f32, v3 i64):
+    v4: i64 = const.i64 0
+    br bb1(v4)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v3
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: f32 = fmul v1, v2
+    v8: ptr = gep v0, v5 : f32
+    store v7, v8
+    v9: i64 = const.i64 1
+    v10: i64 = add v5, v9
+    br bb1(v10)
+  bb3:
+    ret
+}
+
+fn straight(v0 i32) -> i32 {
+  bb0(v0 i32):
+    ret v0
+}

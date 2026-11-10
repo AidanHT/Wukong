@@ -1,0 +1,96 @@
+; RUN: wukongc --emit=mir --passes=licm %s | filecheck %s
+;
+; `licm` hoists loop-invariant, side-effect-free work out of a loop into its preheader (here
+; bb0, the loop's only entry). A load is invariant only when nothing in the body may write its
+; location; when it is not in the header, it is hoisted through a guard so a zero-trip entry
+; reads a private dummy slot instead of an address the loop never touches.
+
+; The product of two parameters, and the step constant, move to the preheader.
+; CHECK-LABEL: fn invariant_product(
+; CHECK:       bb0(
+; CHECK:         [[AB:v[0-9]+]] = fmul v2, v3
+; CHECK:         br bb1(
+; CHECK:       bb2:
+; CHECK-NOT:     fmul v2, v3
+; CHECK-NOT:     const
+; CHECK:         fmul {{v[0-9]+}}, [[AB]]
+; CHECK-NOT:     const
+; CHECK:       bb3:
+fn invariant_product(v0 ptr, v1 ptr, v2 f32, v3 f32, v4 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 f32, v4 i64):
+    v5: i64 = const.i64 0
+    br bb1(v5)
+  bb1(v6 i64):
+    v7: i1 = cmp.slt v6, v4
+    cond_br v7, bb2, bb3
+  bb2:
+    v8: ptr = gep v0, v6 : f32
+    v9: f32 = load f32 v8
+    v10: f32 = fmul v2, v3
+    v11: f32 = fmul v9, v10
+    v12: ptr = gep v1, v6 : f32
+    store v11, v12
+    v13: i64 = const.i64 1
+    v14: i64 = add v6, v13
+    br bb1(v14)
+  bb3:
+    ret
+}
+
+; *v0 is `noalias`, so the store into v1 cannot change it: the load is hoisted, reading through
+; `select(<the loop runs>, v0, <dummy slot>)`.
+; CHECK-LABEL: fn invariant_load(
+; CHECK:       bb0(
+; CHECK:         [[DUMMY:v[0-9]+]] = alloca f32
+; CHECK:         [[RUNS:v[0-9]+]] = cmp.slt {{v[0-9]+}}, v2
+; CHECK-NEXT:    [[ADDR:v[0-9]+]] = select [[RUNS]], v0, [[DUMMY]]
+; CHECK-NEXT:    [[S:v[0-9]+]] = load f32 [[ADDR]]
+; CHECK:         br bb1(
+; CHECK:       bb2:
+; CHECK-NOT:     load f32 v0
+; CHECK:         fmul {{v[0-9]+}}, [[S]]
+fn invariant_load(v0 ptr noalias, v1 ptr noalias, v2 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 i64):
+    v3: i64 = const.i64 0
+    br bb1(v3)
+  bb1(v4 i64):
+    v5: i1 = cmp.slt v4, v2
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: f32 = load f32 v0
+    v7: ptr = gep v1, v4 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fmul v8, v6
+    store v9, v7
+    v10: i64 = const.i64 1
+    v11: i64 = add v4, v10
+    br bb1(v11)
+  bb3:
+    ret
+}
+
+; Without `noalias`, the store to v1[i] may be the store to *v0: the load stays in the body.
+; CHECK-LABEL: fn may_alias(
+; CHECK:       bb0(
+; CHECK-NOT:     load
+; CHECK:       bb2:
+; CHECK-NEXT:    load f32 v0
+fn may_alias(v0 ptr, v1 ptr, v2 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 i64):
+    v3: i64 = const.i64 0
+    br bb1(v3)
+  bb1(v4 i64):
+    v5: i1 = cmp.slt v4, v2
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: f32 = load f32 v0
+    v7: ptr = gep v1, v4 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fmul v8, v6
+    store v9, v7
+    v10: i64 = const.i64 1
+    v11: i64 = add v4, v10
+    br bb1(v11)
+  bb3:
+    ret
+}

@@ -1,0 +1,46 @@
+// RUN: wukongc --emit=mir --target-cpu=x86-64-v2 \
+// RUN:   --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce,loop-canon,licm,bce %s \
+// RUN:   | filecheck %s
+// RUN: wukongc --emit=mir --target-cpu=x86-64-v2 \
+// RUN:   --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce,loop-canon,licm %s \
+// RUN:   | filecheck %s --check-prefix=BEFORE
+//
+// Indexing a slice checks the index against the slice's length on every iteration. `bce` versions
+// the loop on one preheader guard -- the first and the last index both in bounds -- so a copy with
+// no check runs when the guard holds, and the original, checked loop runs otherwise (so an
+// out-of-bounds index still traps exactly where it did).
+
+// BEFORE-LABEL: fn total(
+// BEFORE-COUNT-1: cmp.ult
+// BEFORE:         call wukong_rt_bounds_fail(
+// BEFORE-NOT:     cmp.ule
+//
+// CHECK-LABEL: fn total(
+// The original loop keeps its check.
+// CHECK:         call wukong_rt_bounds_fail(
+// The copy reads xs[i] with no comparison against the length and nothing that can trap.
+// CHECK:       [[HEAD:bb[0-9]+]]({{v[0-9]+}} i64, [[I:v[0-9]+]] i64):
+// CHECK-NEXT:    cmp.slt [[I]], v1
+// CHECK-NEXT:    cond_br
+// CHECK-NOT:     cmp.u
+// CHECK-NOT:     call
+// CHECK:         gep {{v[0-9]+}}, [[I]] : i64
+// CHECK-NOT:     cmp.u
+// CHECK-NOT:     call
+// CHECK:         br [[HEAD]](
+// The guard: the last index, n - 1, is at least the first and below the length.
+// CHECK:         [[LAST:v[0-9]+]] = sub v1,
+// CHECK:         [[LEN:v[0-9]+]] = load i64
+// CHECK:         [[LO:v[0-9]+]] = cmp.ule {{v[0-9]+}}, [[LAST]]
+// CHECK:         [[HI:v[0-9]+]] = cmp.ult [[LAST]], [[LEN]]
+// CHECK:         [[OK:v[0-9]+]] = and [[LO]], [[HI]]
+// CHECK:         cond_br [[OK]],
+fn total(xs: []i64, n: i64) -> i64 {
+    let mut s: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
