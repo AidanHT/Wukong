@@ -291,6 +291,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   read-before-write, triangular and conditional nests, an `!=` test the variable steps over, a short
   remainder, accumulating, in-place, short and aliased kernels, a promise for a user function's
   name).
+
 ### FileCheck-style filetests for the optimizer (`gap7/filetests`, N71)
 
 - **Added: `tests/filetests/`, a lit-style suite that pins what each pass does to the MIR.** Each
