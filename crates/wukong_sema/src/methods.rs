@@ -1533,6 +1533,47 @@ mod tests {
         );
         assert!(codes(&ok).is_empty(), "{:?}", codes(&ok));
     }
+
+    /// A signature mismatch is reported once per place: an assignment's own check covers it (the
+    /// shape check every assignment and binary operator also runs used to report it again), and
+    /// comparing two values of different signatures is only `E0428`.
+    #[test]
+    fn a_function_signature_mismatch_is_reported_once() {
+        let two = "fn add(a: f32, b: f32) -> f32 { return a + b; }";
+        for (src, want) in [
+            (
+                format!(
+                    "{APPLY} {two} fn main() -> i32 {{ let mut f: fn(f32) -> f32 = square; \
+                     f = add; return f(1.0) as i32; }}"
+                ),
+                vec!["E0401"],
+            ),
+            (
+                format!(
+                    "{APPLY} {two} fn main() -> i32 {{ let mut t: [fn(f32) -> f32; 1] = [square]; \
+                     t[0] = add; return t[0](1.0) as i32; }}"
+                ),
+                vec!["E0401"],
+            ),
+            (
+                format!(
+                    "{APPLY} {two} fn main() -> i32 {{ let c = 1; \
+                     let m = if c > 0 {{ square }} else {{ add }}; return m(1.0) as i32; }}"
+                ),
+                vec!["E0401"],
+            ),
+            (
+                format!(
+                    "{APPLY} {two} fn main() -> i32 {{ let g = square; let h = add; \
+                     if g == h {{ return 1; }} return 0; }}"
+                ),
+                vec!["E0428"],
+            ),
+        ] {
+            assert_eq!(codes(&src), want, "{src}");
+        }
+    }
+
     /// A function value is made in a function body: a `const`, lowered again at each use, cannot
     /// hold one (`E0411`), alone or inside an aggregate.
     #[test]

@@ -2393,10 +2393,6 @@ impl<'a> Sema<'a> {
     /// both are vectors: a tensor/scalar pairing stays lenient (scalar broadcast), and two scalars
     /// promote via `join` (mixed precision like `(i as f64) + 1.0` must not error).
     fn check_binop_shapes(&mut self, l: &Ty, r: &Ty, span: Span) {
-        // Two function values meeting (an `if`/`match` merge) have one signature.
-        if matches!((l, r), (Ty::Fn { .. }, Ty::Fn { .. })) {
-            self.check_fn_value_type(l, r, span);
-        }
         if matches!(
             (l, r),
             (Ty::Tensor { .. }, Ty::Tensor { .. }) | (Ty::Vector { .. }, Ty::Vector { .. })
@@ -2688,12 +2684,12 @@ impl<'a> Sema<'a> {
     /// interpreter and `1065353216` on native.
     fn check_merge_shapes(&mut self, l: &Ty, r: &Ty, incoming: Option<&Expr>, span: Span) {
         self.check_binop_shapes(l, r, span);
-        // Two aggregates of function values meeting hold one signature at each position (two
-        // function values were compared just above).
-        if !matches!(l, Ty::Fn { .. })
-            && !matches!(r, Ty::Fn { .. })
-            && (holds_fn(l) || holds_fn(r))
-        {
+        // Two function values meeting, or two aggregates holding them, hold one signature at each
+        // position. (A function value meeting a non-function is the type join's to report; an
+        // assignment's place and value are compared by the assignment itself, and two operands of
+        // a binary operator are no merge: comparing them is `E0428`.)
+        let (lf, rf) = (matches!(l, Ty::Fn { .. }), matches!(r, Ty::Fn { .. }));
+        if (lf && rf) || (!lf && !rf && (holds_fn(l) || holds_fn(r))) {
             self.check_fn_value_type(l, r, span);
         }
         if self.aggregate_merge_clash(l, r, incoming) {
