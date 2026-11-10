@@ -661,6 +661,7 @@ mod entry_law {
         ("utf8.rs", include_str!("utf8.rs")),
         ("velem.rs", include_str!("velem.rs")),
         ("vmath.rs", include_str!("vmath.rs")),
+        ("vspell.rs", include_str!("vspell.rs")),
         ("xent.rs", include_str!("xent.rs")),
         ("xent_bwd.rs", include_str!("xent_bwd.rs")),
     ];
