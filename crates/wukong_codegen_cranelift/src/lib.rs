@@ -2131,7 +2131,7 @@ impl<'a> FnTranslator<'a> {
         let status = self.runtime_ref(RT_ASSERT_FAILED);
         let check = self.builder.ins().call(status, &[]);
         let failed = self.builder.inst_results(check)[0];
-        self.return_on_assert_failure(failed, false);
+        self.return_on_assert_failure(failed, None);
         result
     }
 
