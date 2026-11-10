@@ -2384,6 +2384,52 @@ loosens a tighter lane's contract on the one column no other gate executes. (The
 present when the switch landed were also swept on/off by hand; that sweep is history, this test is
 the gate.)
 
+### Natural spellings: a kernel per expression (`spell.rs`, `vspell.rs`)
+
+`for i { o[i] = gelu(x[i]) }` reaches the 256-bit `VM_GELU` kernel through the per-statement
+`match_vmath_stmt` probe, but real code writes activations out — HuggingFace's
+`0.5*x*(1 + tanh(0.7978845608*(x + 0.044715*x*x*x)))`, PyTorch's `x*0.5*(1 + erf(x*M_SQRT1_2))`,
+`x / (1 + exp(-x))`, `min(max(x + 3, 0), 6) / 6`. Those are different functions from the intrinsics in
+the last bits (the language's `tanh` is the piecewise kernel while `gelu()` keeps the exp-composed
+block; `((C1*x)*x)*x` is not `C1*((x*x)*x)`; a division is not a multiplication by a reciprocal;
+`min(max(..))` sends a NaN to `+0` where `hardsigmoid()` keeps it), so substituting an intrinsic's
+kernel would change the answer. P12.10 gives each spelling a kernel of its own instead.
+
+- **The matcher works on values, not syntax.** `FnLowerer::spell_value` turns the store's value —
+  through any leading immutable `let`s — into the tree of operations the lowering will emit
+  (`spell::V`): a `+` with a product operand is the `Fma` `try_contract_fma` builds (left product
+  first), a product bound by a `let` stays a rounded product, `max`/`min`/`fmax`/`fmin`/`clamp`/`if`
+  are the ordered compare-and-selects `minmax.rs`/`sb_clamp` lower them to, `sigmoid`/`softplus` are
+  their own operations (`emit_sigmoid`, `emit_softplus`), a literal is the `f32` it rounds to, and an
+  operation on constants folds in `f32`. `spell::canon` moves a constant operand of a `+`, `*` or
+  fused product first — exact, because with one non-NaN operand the two IEEE operand orders return
+  the same bits, NaN payload included — and the tree is compared for equality with each row of the
+  kernel table. Two non-constant operands are never swapped: `sigmoid(x) * x` returns the sigmoid's
+  sign-flipped NaN where `x * sigmoid(x)` returns the input's, so they are different kernels
+  (`VM_SILU_SX`, `VM_SILU`). A row may name an EXISTING kernel only for a tree that is its operations
+  (`1/(1 + exp(-x))` is `VM_SIGMOID`) or carries the proof that it agrees on every input (the `>=`
+  and `max(x, 0.01*x)` leaky selects).
+- **One definition per kernel.** `wukong_runtime::vspell`'s `spell!` expands each spelling's
+  expression twice, over scalar operations (the twin, the tail, the no-AVX2 fallback) and over AVX2
+  intrinsics (the eight-lane body listed in `vmath`'s `with_vmath8_table`), every transcendental the
+  shared `vmath` kernel the inlined MIR mirrors (`tanh1`/`tanh8`, `erf1`/`erf8`, ...). The NaN a NaN
+  input yields is derived from the expression and pinned in both bodies (`NanRule`), so it cannot
+  follow whichever operand order an optimizing build of the runtime chose.
+- **Codes 36..=58** (`VM_SPELL_FIRST..=VM_SPELL_LAST`) extend `wukong_vmath_f32`'s table; `apply1`
+  and `vmath8_for` stay total over `0..=VM_SPELL_LAST`. They are mirrored as `VMATH_*` in
+  `wukong_mir_build::spell` and as `VM_*` in `wukong_autodiff::tape`, whose `tape_nn::spelling_base`
+  routes each to the backward rule of the activation it spells (every such rule reads `x`, never the
+  forward output) and composes QuickGELU's and the erf GELU's. The calls reuse the
+  `wukong_vmath_f32{,_parallel}` symbols, so no recognizer arm, interpreter intrinsic or `tape.rs`
+  `Syms` entry is new. The PTX tables stop at 35: `--backend=gpu` keeps a spelling on the CPU kernel,
+  and `--backend=gpu-native` declines the program as `UNSUPPORTED`.
+- **Gates.** `vspell_lanes_equal_the_scalar_twin_bit_for_bit` (every code, every lane position, the
+  tail, serial and `_parallel`, NaNs, infinities, subnormals); `spelling_census_tests` (41 spellings x
+  array/slice/tensor x inline/`let`-bound, each row's expected kernel by name, `census_report` prints
+  the hit rate: 15/246 loops before, 231/246 after); `tests/run/spelling_act_*.wk`, which print every
+  lane plus one flag per lane comparing it with the same expression evaluated in a plain `fn` no
+  recognizer sees; and `recognize.rs`'s corpus-wide on/off comparison, which those fixtures join.
+
 ### Aliased buffers: the kernel only where the operands are disjoint
 
 Nothing in the language rejects `mm(x, y, x)`, and a recognized kernel equals the loop it replaces

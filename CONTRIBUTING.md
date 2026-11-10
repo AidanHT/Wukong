@@ -558,6 +558,19 @@ recipe's `Add` arm, `vec_accumulate` / `scalar_accumulate`, and the float-reduct
 a strict function silently goes back to fast-mode bits. Pin it with a case in
 `crates/wukong_mir_build/src/fp_contract_tests.rs`.
 
+**A natural spelling of an activation** (`x / (1.0 + exp(-x))`, a hand-written GELU) is not a new
+recognizer but a row in two tables, and it may only name a kernel that computes **its own** bits.
+Write the expression once in `wukong_runtime::vspell` with `spell!` (the scalar twin and the AVX2
+body come from that one definition; give it the `NanRule` its expression implies for a NaN input),
+add the code to `apply_spell`, to `vmath`'s `with_vmath8_table` and to the `lib.rs` re-export, and
+move `VM_SPELL_LAST`. Then add the tree the lowering emits for it to `wukong_mir_build::spell`'s
+`table()` with its `VMATH_*` mirror (a row naming an existing kernel must prove, in its comment,
+that the two agree on every input), mirror the code in `wukong_autodiff::tape` and route it in
+`tape_nn::spelling_base` (or compose its derivative in `act_backward`), add a census row in
+`spelling_census_tests.rs`, and print every lane of it in a `tests/run/spelling_act_*.wk` fixture
+beside the flag comparing it with the same expression in a plain `fn`. The PTX `vmath` tables do not
+take the code, so `--backend=gpu-native` declines a program that dispatches it.
+
 ## Adding a run-time check
 
 A check that stops the program at run time (a range index, `str_from_utf8`) is a dead-end failure

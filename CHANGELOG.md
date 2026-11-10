@@ -5,6 +5,54 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Recognizers: natural spellings of the activations dispatch, each to its own kernel (`gap7/recognizer-spellings`, P12.10)
+
+- **A hand-written activation runs a 256-bit kernel that computes exactly what it says.** An
+  elementwise `for` loop over `f32` arrays, `[]f32` slices or `Tensor[f32, N]` whose body writes an
+  activation out — HuggingFace's tanh GELU (`0.044715 * x * x * x`), `FastGELU` and `QuickGELU`,
+  PyTorch's and llm.c's tanh GELUs, JAX's CDF-first GELU, the erf GELU over `x / sqrt(2.0)`,
+  `x * 0.7071067811865476` or `(erf(..) + 1.0) / 2.0`, `x / (1.0 + exp(-x))`, `sigmoid(x) * x`,
+  `exp(x) / (1.0 + exp(x))`, `log(1.0 + exp(x))`, `log1p(exp(x))`, mish over each softplus form,
+  `relu6(x + 3) / 6` hard sigmoid / hard swish through `min`/`max`, `fmin`/`fmax` or `clamp`, the
+  leaky-ReLU and ELU selects — used to run the 128-bit generic loop (`sigmoid(x) * x` the wrong
+  kernel, below). It now dispatches to
+  `wukong_vmath_f32`: to an existing kernel where the spelling IS that kernel's operations
+  (`1.0 / (1.0 + exp(-x))` is `sigmoid`, `x * (1.0 / (1.0 + exp(-x)))` is `silu`, the stable
+  softplus, `exp(x) - 1.0` ELU, the `>=` and `max(x, 0.01 * x)` leaky selects), else to one of 23
+  new op codes, 36..=58 (`wukong_runtime::vspell`), each the kernel of one spelling: its scalar twin
+  is the spelling's operations in source order with the lowering's FMA contractions, its AVX2 body is
+  generated from the same definition, and the NaN a NaN input yields is pinned to the spelling's.
+  The matcher (`wukong_mir_build::spell`) reads the store value — through any leading `let`s — as
+  the tree of operations it lowers to and dispatches only on an exact match, commuting only a
+  constant operand; `@parallel` functions and batched `[R, C]` nests dispatch too.
+- **Hit rate.** The new census (`wukong_mir_build::spelling_census_tests`: 41 spellings, each over an
+  array, a slice and a tensor with the element inline and `let`-bound) went from **15 of 246 loops,
+  2 of 41 spellings in every form**, to **231 of 246, 38 of 41**. The three that stay the generic
+  loop must: the cube as `pow(x, 3.0)` is not GELU (NaN below zero), `0.5 * (x * (1 + tanh(..)))`
+  rounds differently from every kernel, and the `let`-bound ReLU select is velem's shape.
+- **Fixed: `sigmoid(x) * x` changed its NaN when recognized.** Both product orders dispatched
+  `VM_SILU`, whose NaN for a NaN input is the input's; `sigmoid(x) * x` returns the sigmoid's
+  sign-flipped NaN, so recognition on and off disagreed on that lane. It now has its own kernel
+  (`VM_SILU_SX`).
+- **The tanh GELU expansion of `tests/run/spelling_value_bindings.wk` dispatches again** — to
+  `VM_GELU_TANH`, never to `gelu()`'s kernel, which it differs from in the last bits
+  (`tests/recognizer-census.txt`: `wukong_vmath_f32*2` -> `*3`). No corpus program lost a dispatch.
+- **Autodiff.** Every new code is differentiable: each routes to the backward rule of the activation
+  it spells (`tape_nn::spelling_base`; every such rule reads the input, never the forward output),
+  and QuickGELU's and the erf GELU's derivatives are composed (`spelling_activation_vjps` gates all
+  23 against the f64 closed form and the finite difference of the spelling's own kernel).
+- **GPU.** The PTX `vmath` tables cover codes 0..=35: `--backend=gpu` keeps a spelling on the CPU
+  kernel, and `--backend=gpu-native` declines a program that dispatches one as `UNSUPPORTED` (before,
+  such a loop lowered as plain MIR and ran on the device; of the pre-existing corpus only
+  `spelling_value_bindings.wk` is affected).
+- **Tests.** `tests/run/spelling_act_{gelu_tanh,gelu_erf,silu_sigmoid,softplus_mish,hard,leaky_elu}.wk`
+  print every lane over NaNs of both signs, +-0, +-inf and large |x| (hex where the scalar semantics
+  pin the bits, else within the declared `5e-6` the runtime's
+  `vspell_relative_error_in_each_spellings_well_conditioned_range` asserts), plus one flag per lane
+  comparing it bit for bit with the same expression in a plain `fn` no recognizer sees. The runtime
+  pins every code's lanes to its twin (`vspell_lanes_equal_the_scalar_twin_bit_for_bit`), the twins
+  to an f64 reference, and the constants to the literals they stand for.
+
 ### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)
 
 - **Each labelled source line prints once.** The human renderer drew one frame per label, so two

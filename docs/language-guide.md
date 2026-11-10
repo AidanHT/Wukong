@@ -2217,9 +2217,30 @@ the language's `tanh`. On `f64` every spelling is the double-precision runtime `
 The tanh-approximation GELU written out by hand — `0.5 * v * (1.0 + tanh(0.7978845608 * (v +
 0.044715 * (v * v * v))))`, in any association — is therefore **not** `gelu()`: its `tanh` is the
 language's piecewise one, `gelu`'s is the exp-composed block, and the two differ in the last bits on
-ordinary inputs. It lowers as written (vectorized, with the inline `tanh`) and is never substituted by
-the GELU kernel (`tests/run/spelling_value_bindings.wk`); call `gelu()` for the kernel. The erf form
-is a different function again.
+ordinary inputs. It is never substituted by the GELU kernel (`tests/run/spelling_value_bindings.wk`);
+call `gelu()` for that kernel. The erf form is a different function again.
+
+**Natural spellings of the activations dispatch too, each to a kernel of its own** ✅. An elementwise
+`for` loop whose body writes an activation out — HuggingFace's `0.5 * x * (1.0 + tanh(0.7978845608 *
+(x + 0.044715 * x * x * x)))`, its `FastGELU` and `QuickGELU` (`x * sigmoid(1.702 * x)`), PyTorch's
+and llm.c's tanh GELUs, JAX's CDF-first form, the erf GELU as `x / sqrt(2.0)`, `x *
+0.7071067811865476` or `x * (erf(..) + 1.0) / 2.0`, `x / (1.0 + exp(-x))`, `sigmoid(x) * x`,
+`exp(x) / (1.0 + exp(x))`, `log(1.0 + exp(x))`, `log1p(exp(x))`, mish over any of those softplus
+forms, `min(max(x + 3.0, 0.0), 6.0) / 6.0` (or `fmin`/`fmax`/`clamp`, with or without the leading
+`x *`), the leaky-ReLU and ELU selects — runs the 256-bit `wukong_vmath_f32` kernel **of that exact
+expression**: the kernel's scalar twin is the spelling's own operations, in the source's order, with
+the fused multiply-adds the lowering contracts and the NaN the spelling returns. So recognition never
+changes an answer: a spelling that rounds differently from every kernel (`0.5 * (x * (1.0 +
+tanh(..)))`, the cube as `pow(x, 3.0)`) lowers as written, and a spelling that IS an existing
+activation's operations (`1.0 / (1.0 + exp(-x))`, `x * sigmoid(x)`, the stable softplus, `exp(x) -
+1.0` in the ELU select) dispatches that activation's kernel. The loaded value may be named first
+(`let v = x[i]`), and intermediates bound by `let` are read as the values they hold — a product bound
+to a name stays a rounded product, which is llm.c's GELU, a kernel of its own. Fixed arrays, `[]f32`
+slices, `Tensor[f32, N]`, `@parallel` functions and batched `[R, C]` nests all dispatch
+(`tests/run/spelling_act_*.wk` compare every lane with the same expression evaluated where no
+recognizer sees it). The spellings are differentiable (`--emit=grad`, `--train`); on
+`--backend=gpu-native` a program that dispatches one is declined as unsupported (its PTX table stops
+at the 36 intrinsic codes), never lowered to different bits.
 
 ### Scalar builtins ✅
 

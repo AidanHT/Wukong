@@ -1862,9 +1862,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **Recognizer spellings still outside the fold** (2026-10-06, `gap/recognizer-coverage`). The
   hoisted-value, GELU-expansion, row-outer column-reduction, out-of-place softmax, hand-tiled GEMM and
   `usize`-counter spellings now dispatch (`docs/language-guide.md`, Attributes), each only where the
-  kernel computes what the source computes. Declined on purpose, and therefore still the 128-bit
-  generic loop: HuggingFace's literal `0.044715 * v * v * v` GELU and the erf GELU (no kernel computes
-  them bit-for-bit — a new `vmath` opcode would); `out[j] = out[j] + x*x` (the source contracts it to
+  kernel computes what the source computes. HuggingFace's literal `0.044715 * v * v * v` GELU, the erf
+  GELU and the other natural activation spellings now dispatch too, each to a `vmath` opcode of its
+  own (2026-11, P12.10; see the next entry). Declined on purpose, and therefore still the 128-bit
+  generic loop: `out[j] = out[j] + x*x` (the source contracts it to
   one FMA, the `colsumsq` kernel squares and adds — write `+=`); among tilings (2026-10-08: ragged
   `min(i0 + T, M)` tails, counted `let i0 = it * T` tiles, runtime extents and tiled contractions now
   dispatch), a counted tile whose point loop is a full `i0..i0 + T` (it names no extent), a tile width
@@ -1881,6 +1882,26 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   (one row); the batched forms keep their existing matchers. Per-site decline remarks ("this nest
   matched GEMM but its operands are not provably disjoint") are not emitted yet: `--remarks=dispatch`
   reports what fired, not why something did not.
+
+- **Natural activation spellings: what still lowers as written** (2026-11, `gap7/recognizer-spellings`,
+  P12.10). The hand-written GELUs (tanh, erf, Fast, Quick), SiLU, sigmoid, softplus, mish,
+  hardsigmoid/hardswish, leaky-ReLU and ELU spellings dispatch to an existing kernel where they ARE
+  its operations, else to one of 23 new `wukong_vmath_f32` codes, 36..=58 (`wukong_runtime::vspell`),
+  each the kernel of its own expression. The census (`wukong_mir_build::spelling_census_tests`, 41
+  spellings over an array, a slice and a tensor, element inline and `let`-bound) went from 15 of 246
+  loops (2 of 41 spellings in every form) to 231 of 246 (38 of 41). Still the generic loop: the cube
+  as `pow(x, 3.0)` (`exp(3*log x)`, NaN below zero — not GELU); `0.5 * (x * (1 + tanh(..)))` and any
+  other regrouping no kernel computes bit for bit (each would need its own opcode); a spelling whose
+  non-constant operands of a `*`/`+` are swapped (`(1 + tanh(..)) * (0.5 * x)`: a NaN input could
+  return the other operand's NaN, so the matcher only commutes a constant); constants other than the
+  ones the kernels bake in (a literal is matched by the `f32` it rounds to: a leaky slope other than
+  `0.01`, an ELU `alpha` other than 1, a QuickGELU slope other than `1.702`); every loop of a
+  `@strict_fp` function or under `--fp=strict` (strict mode turns every recognizer off); and the ReLU
+  select over a `let`-bound value (velem's matcher does not see through the binding).
+  `--backend=gpu-native` declines a program that dispatches one of the new codes (its PTX `mrt_vmath`
+  table covers 0..=35), where before those loops lowered as plain MIR and ran on the device; among the
+  pre-existing corpus only `tests/run/spelling_value_bindings.wk` is affected. `--backend=gpu`
+  offload keeps them on the CPU kernel.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment
