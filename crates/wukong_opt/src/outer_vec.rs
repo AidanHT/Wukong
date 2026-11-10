@@ -526,16 +526,13 @@ fn classify_inst(
     stores_here: bool,
 ) -> Result<(), &'static str> {
     // Every instruction of the vector nest runs once per group, so nothing with an effect a row
-    // could observe may be in it: no call (one call per group would be fewer calls), no slot, no
-    // kernel, barrier or atomic.
-    if matches!(
-        inst.op,
-        Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::AtomicAdd { .. }
-            | Op::Barrier
-            | Op::Alloca { .. }
-    ) {
+    // could observe may be in it: no call of any kind, direct or through a function value (one
+    // call per group would be fewer calls), no slot, no kernel, barrier or atomic. The central
+    // classification (`Op::effects`) answers, so an op added later is kept out until it is
+    // classified as harmless: every memory effect but the plain load and store modelled below.
+    let fx = inst.op.effects();
+    let plain_access = matches!(inst.op, Op::Load(..) | Op::Store { .. });
+    if fx.calls || fx.syncs || fx.allocates || ((fx.reads || fx.writes) && !plain_access) {
         return Err("an instruction the nest cannot widen");
     }
     // An address is read only as the address of the load or store it feeds.

@@ -11803,4 +11803,82 @@ mod tests {
             );
         }
     }
+
+    /// A call through a function value (`Op::CallIndirect`) reaches code no pass can see, and the
+    /// vector nest runs its pre-block once per group of rows. The call's arguments here are the
+    /// same for every row, so a nest that took it for a uniform step would make it once per four
+    /// rows: the callee prints, and `-O2` would print fewer lines than `-O0`. The outer path asks
+    /// the central effect classification (`Op::effects`) and keeps any call out.
+    #[test]
+    fn an_indirect_call_keeps_its_nest_off_the_outer_path() {
+        let nest = |row_start: &str| {
+            format!(
+                "fn say(x: i64) -> i64 {{ print(x); return x; }} \
+                 @unchecked fn k(f: fn(i64) -> i64, a: []f32, @noalias mut y: []f32, rows: i64, \
+                 cols: i64, z: i64) {{ if z > 0 {{ again(z - 1); return; }} let mut r: i64 = 0; \
+                 while r < rows {{ let t: i64 = {row_start}; let mut s: f32 = t as f32; \
+                   let mut c: i64 = 0; \
+                   while c < cols {{ s = s + a[r * cols + c]; c = c + 1; }} \
+                   y[r] = s; r = r + 1; }} }} \
+                 fn again(z: i64) {{ let g: fn(i64) -> i64 = say; \
+                   let mut t: []f32 = alloc_f32(1); let mut u: []f32 = alloc_f32(1); \
+                   k(g, t, u, 1, 1, z); }} "
+            )
+        };
+        // `k` is instantiated for its function-typed parameter (`k$fn1$...`): that instance's name,
+        // and how many indirect calls it makes at -O2.
+        let instance = |src: &str| {
+            let (program, interner) = optimized(src, 2);
+            let f = program
+                .funcs
+                .iter()
+                .find(|f| interner.resolve(f.name).starts_with("k$"))
+                .expect("the instance of k survives");
+            let calls = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, Op::CallIndirect { .. }))
+                .count();
+            (interner.resolve(f.name).to_string(), calls)
+        };
+        // Control: the same nest without the call widens across its rows.
+        let control = format!("{} fn main() -> i32 {{ return 0; }}", nest("cols"));
+        let (name, _) = instance(&control);
+        assert!(
+            outer_widened(&control, &name),
+            "the control nest did not take the outer path"
+        );
+        // With the call, which nothing in `k` can resolve, it stays scalar.
+        let k = nest("f(cols)");
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        let (name, calls) = instance(&shape);
+        assert_eq!(
+            calls, 1,
+            "the case lost its indirect call, or it was copied"
+        );
+        assert!(
+            !outer_widened(&shape, &name),
+            "a nest with an indirect call took the outer path"
+        );
+        // Six rows of three columns: one group of four rows and two epilogue rows, each row's call
+        // printing `3` before the sums print.
+        let src = format!(
+            "{k} fn main() -> i32 {{ let g: fn(i64) -> i64 = say; \
+             let mut a: []f32 = alloc_f32(18); let mut y: []f32 = alloc_f32(6); \
+             let mut j: i64 = 0; while j < 18 {{ a[j] = (j as f32) * 0.5; j = j + 1; }} \
+             k(g, a, y, 6, 3, 0); j = 0; while j < 6 {{ print(y[j]); j = j + 1; }} \
+             return 0; }}"
+        );
+        let mut outs = Vec::new();
+        for level in [0u8, 2u8] {
+            let (program, mut interner) = optimized(&src, level);
+            let main = interner.intern("main");
+            let (code, bytes) = wukong_interp::run_with_output(&program, main, &interner)
+                .unwrap_or_else(|e| panic!("-O{level}: {e}"));
+            outs.push((code, String::from_utf8_lossy(&bytes).to_string()));
+        }
+        assert_eq!(outs[0], outs[1], "-O0 and -O2 disagree");
+        assert_eq!(outs[0].1.matches("3\n").count(), 6, "{}", outs[0].1);
+    }
 }

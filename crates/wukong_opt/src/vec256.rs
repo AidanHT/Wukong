@@ -375,8 +375,8 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
                     return Err("a uniform step with an effect");
                 }
                 // A call the group makes once may trap or never return; the kernel would not make
-                // it at all.
-                if matches!(inst.op, Op::Call { .. }) {
+                // it at all. Any call (`Op::effects`), direct or indirect.
+                if inst.op.is_call() {
                     return Err("a call");
                 }
             }
