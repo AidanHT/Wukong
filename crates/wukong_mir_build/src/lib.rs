@@ -34988,9 +34988,12 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
 
     /// `@parallel` outlining is NOT a recognizer: it is an explicit request for threads, so it must
     /// survive with recognition off. (Inside the outlined body the kernels are gone, like everywhere
-    /// else.) Neither is the `@parallel` reduction tree (P13.7, `par_reduce.rs`): the head loop's
-    /// score reductions still compute it, through the serial twin `wukong_sreduce_f32`, so that
-    /// recognition cannot change a `@parallel` reduction's bits — that call is the only one left.
+    /// else.) Neither is the `@parallel` reduction tree (P13.7, `par_reduce.rs`): with the score nest's
+    /// matmul kernel gone, its inner `acc` reductions are reductions on their own and compute the
+    /// tree, through the serial twin `wukong_sreduce_f32` — that call is the only one left. (With
+    /// recognition on, the matmul kernel computes those sums in its own order instead: for a
+    /// reduction inside a nest a multi-loop kernel takes, recognition does move the bits — the
+    /// language guide's table and the roadmap's sharp edge.)
     #[test]
     fn recognize_off_keeps_parallel_outlining() {
         let src = head_loop_src("@parallel\n");

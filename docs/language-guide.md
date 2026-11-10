@@ -1459,18 +1459,31 @@ matches (an `..=` range, a `step`, an offset index, an addend no kernel has, a l
 outlined region, `@generic`, `WUKONG_NO_RECOGNIZE`) all return the same bits, on any thread count,
 on both backends and at every `-O` level (`tests/run/parallel_reduce_order.wk`). A `bf16`/`f16`
 reduction, cast or uncast, is the same tree over the exactly widened values
-(`tests/run/parallel_reduce_order_lowp.wk`). The order is decided by the program text:
+(`tests/run/parallel_reduce_order_lowp.wk`).
+
+All of that is about a reduction loop *on its own*. A reduction nested in a loop nest that a
+multi-loop kernel replaces whole — a matmul (GEMM, NT-GEMM), a GEMV or vector·matrix product, a
+column reduction, a norm, a loss, a softmax backward — is part of that kernel's computation and has
+the kernel's documented order when the kernel fires. When it does not — recognition off, `@generic`,
+a spelling the recognizer does not match, or the may-overlap arm a versioned nest runs when its
+buffers turn out to overlap at run time — the inner loop is a reduction on its own again and takes
+the parallel tree. So for those nests, whether the kernel fired does change the low-order bits. Both
+orders are deterministic, and `@strict_fp` replaces both with the source order. The order is decided
+by the program text and, for such a nest, by whether its kernel fires:
 
 | the reduction | its order |
 |---|---|
-| an `f32` reduction loop in a fast `@parallel` function (`bf16`/`f16` and narrow-integer addends included) | the parallel reduction tree |
+| an `f32` reduction loop on its own in a fast `@parallel` function (`bf16`/`f16` and narrow-integer addends included) | the parallel reduction tree |
 | the same loop without `@parallel` | the vectorizer's tree if the vectorizer takes it, else the source's left fold; a `bf16`/`f16` one read through `as f32` runs the half kernel's own order |
+| an `f32` reduction loop that is the inner reduction of a nest a multi-loop kernel takes (matmul, GEMV, vector·matrix, column reduction, norm, loss, softmax backward), `@parallel` or not | that kernel's own order when it fires; when it declines — recognition off, `@generic`, an unmatched spelling, or a versioned nest's may-overlap arm — the order the loop has on its own (the two rows above) |
 | an `f64`, integer or `bf16`/`f16`-accumulator reduction, `@parallel` or not | as without `@parallel`: the vectorizer's tree where it applies (integer folds are exact in any order) |
 | any reduction in a `@strict_fp` function | the source's left fold |
 | a `while` loop, a `for x in array` loop, a body that is not one fold statement, an addend that calls a user function or reads the accumulator | the source's left fold |
 
-So removing `@parallel` from an `f32` reduction — never a decline — is what moves it to another tree,
-and `@strict_fp` is the way to make the bits independent of the annotation. A spelling no kernel
+So for a reduction loop on its own, removing `@parallel` — never a decline — is what moves it to
+another tree, and `@strict_fp` is the way to make the bits independent of the annotation and of
+every kernel. `@tile` cannot strip-mine such a loop, since a strip-mined body folds in source order:
+it is `E0309` (`tests/fail/tile_on_parallel_reduction.wk`). A spelling no kernel
 matches runs on one thread: it fills a chunk buffer with its addends (a product addend `a * b` as its
 two factors) and folds each chunk with the runtime's serial reduction `wukong_sreduce_f32`, which is
 what `--remarks=dispatch` reports for it where the kernel shape reports
@@ -1523,8 +1536,10 @@ fixed arithmetic order:
 
 A matmul that is **not** recognized — declined by the matcher, written under `@generic`, or built
 with `WUKONG_NO_RECOGNIZE` — computes the loop as written: `s + a*b` contracts to one FMA, and the
-inner reduction follows the vectorized-reduction partition described above. The two orders coincide
-when the contraction is shorter than one vector group (K ≤ 3), and the corpus pins exactly that with
+inner reduction follows the vectorized-reduction partition described above (in a fast `@parallel`
+function, the parallel reduction tree, which agrees with the kernel's order only at K = 1). Without
+`@parallel` the two orders coincide when the contraction is shorter than one vector group (K ≤ 3),
+and the corpus pins exactly that with
 non-dyadic data whose fused and unfused results differ in every lane
 (`tests/run/lang_generic_gemm_fma_order.wk`). Past that, a recognized and an unrecognized matmul may
 differ in the last bits: both are documented reassociations of the same sum, and neither is "the"
@@ -2248,10 +2263,13 @@ This is the contract of Clang's `-ffp-contract=on` (fusion within one expression
 statements). GCC's GNU-dialect default, `-ffp-contract=fast`, also fuses across statements; Wukong
 never does. `--fp=strict` / `@strict_fp` is `-ffp-contract=off`.
 
-**Reduction order (fast mode).** A float sum loop `s = s + e(i)` (or `s += e(i)`) is reassociated,
-into one of two fixed trees, and the program text alone picks which — the `@parallel` attribute of the
-enclosing function and the accumulator's type (the table under [Attributes](#attributes-) gives the
-whole rule) — never whether a kernel fired, a thread count, a backend or an `-O` level:
+**Reduction order (fast mode).** A float sum loop `s = s + e(i)` (or `s += e(i)`) on its own is
+reassociated into one of two fixed trees, and the program text alone picks which — the `@parallel`
+attribute of the enclosing function and the accumulator's type (the table under
+[Attributes](#attributes-) gives the whole rule) — never whether a kernel fired, a thread count, a
+backend or an `-O` level. (A sum loop nested in a nest that a recognized multi-loop kernel replaces
+whole — a matmul, a GEMV, a column reduction, a norm — has that kernel's order when it fires; see
+*Recognized kernels* below.)
 
 - **Sequential vectorized** (no `@parallel`, or an `f64` accumulator): the vectorizer's
   lane-partitioned tree — `U` independent eight-lane
@@ -2275,11 +2293,14 @@ whole rule) — never whether a kernel fired, a thread count, a backend or an `-
   accumulator. The kernel shape `for k in 0..n { s += f(x[k], y[k]) }` runs it on all cores
   (`wukong_sreduce_f32_parallel`, or the `bf16`/`f16` `_parallel` twins); every other spelling runs it
   on one thread through the kernel's serial twin. The result is the same on one core or sixteen,
-  natively or in the interpreter, recognized or not (`tests/run/parallel_reduce_order.wk`).
+  natively or in the interpreter, recognized or not (`tests/run/parallel_reduce_order.wk`) —
+  for a reduction loop that is not the inner loop of a nest a multi-loop kernel takes.
 
 The two trees differ from each other and from the source's left-to-right fold, so adding or removing
-`@parallel` on a function changes the low-order bits of its `f32` reductions — that annotation and
-`@strict_fp` are the only switches; see the `@parallel` note under [Attributes](#attributes-). Max/min
+`@parallel` on a function changes the low-order bits of its `f32` reductions. For a reduction loop
+on its own that annotation and `@strict_fp` are the only switches (`@tile` on such a loop is
+refused, `E0309`); a reduction inside a recognized multi-loop nest also moves with recognition (see
+below and the `@parallel` note under [Attributes](#attributes-)). Max/min
 reductions use the same trees; their finite non-zero result is order-independent, but because
 `fmax`/`fmin` return `b` on a NaN or a `±0` tie, *which* NaN or which zero survives — and whether a NaN
 survives at all — depends on the order.
@@ -2298,7 +2319,9 @@ runtime kernel that evaluates the same mathematical expression in its own docume
 blocks and packs the `K` sum and accumulates with FMA, a fused softmax/norm kernel reduces each row
 with its own lane tree. The result is deterministic and identical across backends, thread counts and
 `-O` levels, but it is not the source's order; `@generic` keeps the loop (with contraction and the
-vectorizer's reduction tree), `@strict_fp` keeps the source order.
+vectorizer's reduction tree — in a fast `@parallel` function, the parallel reduction tree, as for
+any other declined nest), `@strict_fp` keeps the source order. Whether such a kernel fires
+therefore changes the low-order bits of the reductions inside its nest, `@parallel` or not.
 
 **NaN in the math intrinsics.** Every math intrinsic returns a NaN for a NaN argument. *Which* NaN
 (sign and payload) is pinned only where the runtime documents it — its elementwise kernels return

@@ -239,7 +239,7 @@ impl FnLowerer<'_> {
     /// value is the parallel reduction tree, whichever lowering computes it; the strip-miner lowers
     /// the fold body statement by statement, which is the source's left fold. Tiling it would change
     /// the result bits, not just the schedule, and `@parallel` and `@strict_fp` are the only switches
-    /// that choose a reduction's order. So the width has nowhere to go: `E0309`, nothing consumed,
+    /// that choose such a loop's order. So the width has nowhere to go: `E0309`, nothing consumed,
     /// exactly as for a loop form the strip-miner cannot take.
     pub(super) fn tile_on_parallel_reduction(&mut self, stmt_attrs: &[Attr], loop_span: Span) {
         let span = self.tile_span(stmt_attrs, loop_span);

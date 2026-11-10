@@ -47,8 +47,11 @@
 //!
 //! ## The `@parallel` reduction order (P13.7)
 //!
-//! A `@parallel` `f32` reduction has one value whichever way it runs: the multicore kernel, its
-//! serial twin, or the compiler's chunk-buffer lowering of a spelling no kernel matches.
+//! A `@parallel` `f32` reduction loop on its own has one value whichever way it runs: the multicore
+//! kernel, its serial twin, or the compiler's chunk-buffer lowering of a spelling no kernel matches.
+//! (A reduction that is the inner loop of a nest a multi-loop kernel takes — a matmul, a column
+//! reduction, a norm — has that kernel's order when it fires; the language guide documents it, and
+//! this sweep does not cover it.)
 //! [`parallel_reductions_do_not_depend_on_threads_backend_or_recognition`] runs the programs that
 //! spell one reduction several ways ([`REDUCTION_ORDER_PROGRAMS`]) on the interpreter and native at
 //! `-O0` and `-O2`, on 1, 2, 3 and 8 runtime threads (`WUKONG_NUM_THREADS`), with recognition off

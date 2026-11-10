@@ -1698,11 +1698,24 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **FMA contraction is per expression.** Under the default `--fp=fast` a compound `s += y*z` outside
   a vectorized reduction is not contracted while `s = s + y*z` is; a strict function that wants a
   single-rounding multiply-add writes the explicit `fma(a, b, c)`, which is one rounding in every
-  mode. (The reduction-order edge that stood here is closed, 2026-10-12, `gap7/parallel-reduce-order`:
-  a `@parallel` `f32` reduction is the parallel reduction tree on every path — kernel or not, any range
-  spelling or addend, inside an outlined region or not, `@generic` or not, any thread count — and a
-  `bf16`/`f16` one is that tree on the widened values. Only adding or removing `@parallel` itself, or
-  `@strict_fp`, changes a reduction's tree; the language guide's table under Attributes states it.)
+  mode. (The reduction-order edge that stood here is closed for a reduction loop on its own,
+  2026-10-12, `gap7/parallel-reduce-order`: such a `@parallel` `f32` reduction is the parallel
+  reduction tree on every path — kernel or not, any range spelling or addend, inside an outlined
+  region or not, `@generic` or not, any thread count — and a `bf16`/`f16` one is that tree on the
+  widened values. For that loop only adding or removing `@parallel` itself, or `@strict_fp`, changes
+  its tree; the language guide's table under Attributes states it. The edge below is what is left.)
+
+- **A reduction inside a recognized multi-loop nest moves with recognition.** A reduction loop
+  nested in a nest that a multi-loop kernel replaces whole — a matmul (GEMM, NT-GEMM), a GEMV or
+  vector·matrix product, a column reduction, a norm, a loss, a softmax backward — has the kernel's
+  own order when the kernel fires and another when it declines: in a fast `@parallel` function the
+  parallel reduction tree, otherwise the vectorizer's tree or the source fold. Recognition off
+  (`WUKONG_NO_RECOGNIZE`), `@generic`, a spelling the matcher does not take, or the may-overlap arm a
+  versioned nest picks when its buffers overlap at run time therefore change low-order bits with no
+  diagnostic. Each order is deterministic (independent of threads, `-O` level, backend and host), and
+  `@strict_fp` replaces both with the source order. Closing it means either giving each such kernel
+  the parallel tree on its inner sum — at a large cost to the GEMM and column kernels, whose speed is
+  their accumulation order — or treating a declined nest's inner reduction as that kernel's order.
 
 - **A `@parallel` reduction no kernel matches runs on one thread.** Its bits are the parallel tree's
   (above), but the chunk-buffer lowering (`wukong_mir_build::par_reduce`) fills one buffer and folds

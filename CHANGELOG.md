@@ -5,11 +5,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### A `@parallel` reduction has one value, whichever way it runs (`gap7/parallel-reduce-order`, P13.7)
+### A `@parallel` reduction loop has one value, whichever way it runs (`gap7/parallel-reduce-order`, P13.7)
 
 - **Changed: every `f32` reduction loop of a fast `@parallel` function computes the parallel
   reduction tree**, the 8,192-element-chunk tree of the runtime's reduction kernel, over its addends
-  in iteration order. Before, only the kernel shape `for k in 0..n { s += f(x[k], y[k]) }` did; an
+  in iteration order — every such loop on its own, that is; a reduction inside a nest that a
+  multi-loop kernel takes is the next bullet. Before, only the kernel shape `for k in 0..n { s += f(x[k], y[k]) }` did; an
   `..=` range, a `step`, a non-zero start, an offset index, an addend with no kernel, `@generic`,
   `WUKONG_NO_RECOGNIZE`, an unsigned counter — and the kernel shape itself inside an outlined region
   body — silently fell back to the vectorizer's lane tree or the source fold: on the data of
@@ -21,6 +22,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   body that is not one fold statement, `while` and `for x in array` loops keep their orders; the
   language guide's table under Attributes gives the whole rule, and the guide no longer calls a
   decline "always correct" without saying which bits.
+- **Not covered: a reduction nested in a nest a multi-loop kernel replaces whole** — a matmul
+  (GEMM, NT-GEMM), a GEMV or vector·matrix product, a column reduction, a norm, a loss, a softmax
+  backward. When that kernel fires the inner reduction has the kernel's own documented order (a
+  column sum's row-ascending fold, a GEMM's FMA accumulation over `K`); when it declines — recognition off,
+  `@generic`, a spelling the matcher does not take, or the may-overlap arm a versioned nest picks at
+  run time — the inner loop is a reduction on its own and takes the tree. So for such a nest whether
+  the kernel fired still moves the low-order bits, as it does without `@parallel`; both orders are
+  deterministic, and `@strict_fp` replaces both with the source order. The guide's table has the row,
+  and the roadmap keeps it as a sharp edge.
 - **Changed: the `bf16`/`f16` `_parallel` reductions are the `f32` tree on the widened values**
   (`wukong_{sum,dot,reduce}_{bf16,f16}_parallel`): one chunk reducer over `TreeElem` (`f32`, `Bf16`,
   `F16`) in `reduce.rs`, so a half reduction is bit-for-bit `wukong_sreduce_f32` on a widened copy,

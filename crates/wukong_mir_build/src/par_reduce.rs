@@ -1,6 +1,7 @@
 //! **The `@parallel` reduction tree** (P13.7): in a fast-mode `@parallel` function, the value of an
-//! `f32` reduction loop is a function of the program alone — never of whether a multicore kernel
-//! fired.
+//! `f32` reduction loop on its own is a function of the program alone — never of whether a
+//! multicore kernel fired. (A reduction that is the inner loop of a nest a multi-loop kernel takes
+//! whole is the exception listed at the end.)
 //!
 //! `@parallel` licenses one reassociation of a float fold, and only one: the tree of the runtime's
 //! reduction kernel (`wukong_runtime::reduce::tree` — fixed 8,192-element chunks, a 64-element
@@ -42,6 +43,14 @@
 //! tree; integer folds are exact in any order), a body that is not a single fold statement, an
 //! addend that calls anything but a math intrinsic or reads the accumulator, a `while` loop and a
 //! `for x in array` loop (both keep the source fold, as they do without `@parallel`).
+//!
+//! Nor a reduction that is the inner loop of a nest a multi-loop recognizer replaces whole (GEMM /
+//! NT-GEMM, GEMV / gevm, the column reductions, the norms and losses, softmax backward): while that
+//! recognizer fires the loop never reaches this module and has the kernel's own order. When it
+//! declines — recognition off, `@generic`, an unmatched spelling, a versioned nest's may-overlap
+//! arm — the inner loop is a reduction on its own and takes the tree here, since `par_reduce`
+//! survives into region bodies and versioned fallbacks. So for such a nest whether the kernel fired
+//! still moves the bits; the language guide's table and the roadmap's sharp edge say so.
 //!
 //! The GPU backends are outside the contract, like every recognized kernel there: `--backend=gpu`
 //! offloads the ops of `wukong_sreduce_f32` it supports to a device reduction of its own order, and

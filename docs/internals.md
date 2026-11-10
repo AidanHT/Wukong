@@ -1904,6 +1904,15 @@ lowers as before) on a non-`f32` accumulator, a body that is not one fold statem
 user call, and an addend or bound that reads the accumulator; both kernel arms now decline the last
 case too, since the source re-evaluates the bound every iteration and a kernel reads it once.
 
+The contract is about a reduction loop on its own. A fold that is the inner loop of a nest a
+multi-loop recognizer consumes whole (GEMM/NT-GEMM, GEMV/gevm, the column reductions, the norms and
+losses, softmax backward) never reaches these arms while that recognizer fires: the kernel computes
+it, in the kernel's own order. When the recognizer declines (`recognize` off, `@generic`, an
+unmatched spelling) or a versioned nest runs its may-overlap arm, the inner loop is lowered like any
+other — and because `par_reduce` survives into region bodies and versioned fallbacks, it takes the
+tree. For such a nest the order still depends on whether the kernel fired; the language guide's
+table has the row and the roadmap keeps it as a sharp edge.
+
 Gates: `par_reduce_tests.rs` (which lowering each spelling takes, and the corpus census of paths),
 `reduce.rs`'s `the_kernel_is_the_documented_tree` and
 `tree_is_independent_of_thread_count_and_completion_order`, `lowp.rs`'s
