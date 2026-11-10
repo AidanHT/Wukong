@@ -182,7 +182,7 @@ not duplicate them. In summary, Wukong:
   `@strict_fp` / `--fp=strict` evaluate in source order instead), **fuses** adjacent elementwise loops, and
   **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, SROA,
   mem2reg, const-fold, CSE, DSE, DCE, loop deletion, LICM, scalar promotion, loop unrolling,
-  straight-line SLP packing, outer-loop vectorization of row-wise nests) runs at
+  straight-line SLP packing) runs at
   `-O1` and above. Op-graph fusion across
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
