@@ -1,5 +1,6 @@
 // RUN: wukongc --emit=mir -O1 %s > %t.o1
-// RUN: wukongc --emit=mir --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre %s > %t.list
+// RUN: wukongc --emit=mir --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre,devirt \
+// RUN:   %s > %t.list
 // RUN: diff %t.o1 %t.list
 // RUN: wukongc --emit=mir -O0 %s > %t.o0
 // RUN: wukongc --emit=mir --passes= %s > %t.none
@@ -16,7 +17,7 @@
 // UNKNOWN:      error: {{.*}}unknown pass `bogus`
 // UNKNOWN-SAME: sroa, mem2reg, simplify, jump-thread, simplify-cfg, simplify-phis, dce, tre, cse,
 // UNKNOWN-SAME: dse, loop-canon, loop-delete, fuse, licm, bce, unswitch, promote, vectorize
-// UNKNOWN-SAME: inline, unroll, slp, form-switches
+// UNKNOWN-SAME: inline, devirt, unroll, slp, form-switches
 
 // NO-OPTIMIZER: error:
 // NO-OPTIMIZER-SAME: --emit=ast
