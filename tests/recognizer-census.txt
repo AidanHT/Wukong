@@ -500,7 +500,7 @@ spelling_softmax_out_of_place.wk: wukong_norm_f32 wukong_norm_f32*3
 spelling_tiled_gemm.wk: wukong_sgemm wukong_sgemm*3
 spelling_tiled_gemm_ragged.wk: wukong_sgemm wukong_sgemm*4
 spelling_usize_dims.wk: veckernel*1 wukong_sum_bf16 wukong_velem_f32 wukong_velem_f32*2
-spelling_value_bindings.wk: wukong_velem_f32 wukong_vmath_f32 wukong_vmath_f32*2
+spelling_value_bindings.wk: wukong_velem_f32 wukong_vmath_f32 wukong_vmath_f32*3
 sret_diverging_arms.wk:
 sroa_aggregate_locals.wk:
 stack_color_kills.wk: veckernel*2 wukong_sgemm wukong_velem_f32

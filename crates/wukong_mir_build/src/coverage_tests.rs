@@ -12,6 +12,9 @@ use wukong_mir::verify::verify_function;
 use wukong_mir::{BinOp, CmpOp, Function, Op, Program, ValueId};
 use wukong_span::{Interner, SourceId};
 
+use crate::spell::{
+    VMATH_ELU_EXPM1, VMATH_GELU_ERF_MUL, VMATH_GELU_TANH_HF, VMATH_SILU_DIV, VMATH_SILU_SX,
+};
 use crate::{
     lower_program, lower_program_reporting_dispatch, LowerOptions, NORM_LOGSOFTMAX, NORM_SOFTMAX,
     VMATH_GELU, VMATH_SILU,
@@ -234,11 +237,22 @@ fn hoisted_form(x: [f32; 64], mut o: [f32; 64]) {
     }
 }
 
-/// HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently from the kernel
-/// (`((C1*v)*v)*v` contracted into the FMA vs the kernel's `fma(C1, (v*v)*v, v)`), and the erf form
-/// is a different function. Neither may be substituted.
+/// The single `wukong_vmath_f32` op code `name` dispatches, if it dispatches exactly one call.
+fn vmath_code(prog: &Program, interner: &Interner, name: &str) -> Option<i128> {
+    let f = func(prog, interner, name);
+    match call_args(f, interner, "wukong_vmath_f32").as_slice() {
+        [args] => const_int(f, args[3]),
+        _ => None,
+    }
+}
+
+/// HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently from the GELU
+/// kernel (`((C1*v)*v)*v` contracted into the FMA vs the kernel's `fma(C1, (v*v)*v, v)`), and the
+/// erf form is a different function: neither may be substituted by `VMATH_GELU`. Each dispatches
+/// the kernel of ITS OWN expression (P12.10, `spell.rs`) -- and a regrouping no kernel computes
+/// (`0.5 * (x * (1 + tanh(..)))`) dispatches nothing.
 #[test]
-fn gelu_spellings_that_are_not_the_kernel_do_not_dispatch() {
+fn gelu_spellings_dispatch_their_own_kernels_never_the_gelu_kernel() {
     let src = "module m
 fn hf_literal(x: [f32; 64], mut o: [f32; 64]) {
     for i in 0..64 {
@@ -258,12 +272,85 @@ fn regrouped(x: [f32; 64], mut o: [f32; 64]) {
 }
 ";
     let (prog, _, interner) = lower_src(src);
-    for name in ["hf_literal", "erf_form", "regrouped"] {
-        assert!(
-            kernels(func(&prog, &interner, name), &interner).is_empty(),
-            "{name} must not dispatch"
-        );
+    assert_eq!(
+        vmath_code(&prog, &interner, "hf_literal"),
+        Some(VMATH_GELU_TANH_HF as i128)
+    );
+    assert_eq!(
+        vmath_code(&prog, &interner, "erf_form"),
+        Some(VMATH_GELU_ERF_MUL as i128)
+    );
+    assert!(
+        kernels(func(&prog, &interner, "regrouped"), &interner).is_empty(),
+        "regrouped must not dispatch"
+    );
+}
+
+/// The two operand orders of the gated SiLU product are different functions on a NaN input
+/// (`x * sigmoid(x)` returns the input NaN, `sigmoid(x) * x` the sigmoid's sign-flipped one), so
+/// only the first is `VMATH_SILU`; the second has its own kernel. Both used to dispatch `VMATH_SILU`.
+#[test]
+fn the_two_silu_product_orders_dispatch_different_kernels() {
+    let src = "module m
+fn xs(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = x[i] * sigmoid(x[i]);
     }
+}
+fn sx(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = sigmoid(x[i]) * x[i];
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    assert_eq!(vmath_code(&prog, &interner, "xs"), Some(VMATH_SILU as i128));
+    assert_eq!(
+        vmath_code(&prog, &interner, "sx"),
+        Some(VMATH_SILU_SX as i128)
+    );
+}
+
+/// A spelling inside a `@parallel` function dispatches per chunk of the outlined region, and a
+/// batched `[R, C]` nest one flat call -- the spelling matcher sits under every `match_vmath_body`
+/// caller.
+#[test]
+fn a_spelling_dispatches_on_the_parallel_and_batched_paths_too() {
+    let src = "module m
+@parallel
+fn par(x: [f32; 4096], mut o: [f32; 4096]) {
+    for i in 0..4096 {
+        o[i] = x[i] / (1.0 + exp(-x[i]));
+    }
+}
+fn batched(x: [f32; 256], mut o: [f32; 256]) {
+    for r in 0..16 {
+        for c in 0..16 {
+            o[r * 16 + c] = if x[r * 16 + c] > 0.0 { x[r * 16 + c] } else { expm1(x[r * 16 + c]) };
+        }
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    let mut codes: Vec<Option<i128>> = Vec::new();
+    for f in &prog.funcs {
+        if !interner.resolve(f.name).starts_with("par") {
+            continue;
+        }
+        for k in ["wukong_vmath_f32", "wukong_vmath_f32_parallel"] {
+            for args in call_args(f, &interner, k) {
+                codes.push(const_int(f, args[3]));
+            }
+        }
+    }
+    assert!(
+        !codes.is_empty() && codes.iter().all(|c| *c == Some(VMATH_SILU_DIV as i128)),
+        "par: {codes:?}"
+    );
+    assert_eq!(
+        vmath_code(&prog, &interner, "batched"),
+        Some(VMATH_ELU_EXPM1 as i128)
+    );
 }
 
 // ---- P12.6: unsigned 64-bit counters -----------------------------------------------------------

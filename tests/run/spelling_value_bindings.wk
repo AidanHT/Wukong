@@ -75,7 +75,9 @@ module tests.run.spelling_value_bindings
 //     into the GELU kernel on the premise that the source's `tanh` is the kernel's internal
 //     `1 - 2/(exp(2z)+1)`. The language's `tanh` is now the runtime's piecewise kernel on every
 //     spelling, while `gelu` keeps the exp-composed block inside, so the expansion is NOT `gelu`
-//     bit for bit (it differs at x = -4, -3.5, -3, -2, -1.5 and 0.5 here) and must lower as written.
+//     bit for bit (it differs at x = -4, -3.5, -3, -2, -1.5 and 0.5 here) and must compute what it
+//     says. Since P12.10 it dispatches the kernel of its OWN expression (`VM_GELU_TANH`, op code 36,
+//     wukong_runtime/src/vspell.rs), never `gelu`'s; the flags below hold it to the written loop.
 //
 // Values: x[i] = 0.5*i - 4 over 16 lanes. The first block is gelu(x)*1000 truncated toward zero,
 // the second silu(x) = x/(1+e^-x) *1000 truncated, both from the exact formulas in f64 (every lane
