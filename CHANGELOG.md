@@ -55,13 +55,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   all three.
 - **Still scalar:** a predicated or checked scatter, a lane test inside a lane-serial region or
   after a store, an if-converted body, a call (direct or through a function value) or a
-  row-varying `bf16`/`f16` value inside the outer path, an `i32` outer counter indexing through a widening cast, a lane-serial region in a search
-  loop, and one that contains or spans an if-converted step (a listed access the if-conversion
-  predicated or merged, such as a scatter in an `if` arm, or any masked, merged or predicated step
-  between the first and the last listed access; an if-converted step outside that span widens
-  beside the region); no AVX2 gather or scatter is emitted (every per-lane access is a scalar load
-  or store).
+  row-varying `bf16`/`f16` value inside the outer path, an `i32` outer counter indexing through a
+  widening cast, a lane-serial region in a search loop, and one that contains or spans an
+  if-converted step (a listed access the if-conversion predicated or merged, such as a scatter in
+  an `if` arm, or any masked, merged or predicated step between the first and the last listed
+  access; an if-converted step outside that span widens beside the region); no AVX2 gather or
+  scatter is emitted (every per-lane access is a scalar load or store).
   None of these forms has been timed: each is a rule, not a measured win.
+
 ### The AOT runtime cache: `--emit=exe` stops re-LTOing the runtime on every link (`gap7/aot-link-cache`, N51)
 
 - **The runtime half of a link is built once.** Every `--emit=exe` link used to compile the
