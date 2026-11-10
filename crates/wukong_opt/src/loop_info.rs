@@ -4043,6 +4043,29 @@ mod tests {
         assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
     }
 
+    /// The summaries describe a direct call's callee. A call through a function value
+    /// (`Op::CallIndirect`) has none to look up — here either of two pure functions, picked at run
+    /// time — so it stays an opaque effect, carried beside the loop's store, even for the consumer
+    /// that has the summaries.
+    #[test]
+    fn an_indirect_call_is_carried_even_with_the_summaries() {
+        let src =
+            "fn sq(x: f32) -> f32 { return x * x; } fn half(x: f32) -> f32 { return x * 0.5; } \
+                   @unchecked fn k(sel: i64, x: []f32, mut o: []f32, n: i64) { \
+                   let fs: [fn(f32) -> f32; 2] = [sq, half]; let f: fn(f32) -> f32 = fs[sel]; \
+                   let mut i: i64 = 0; while i < n { o[i] = f(x[i]); i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (f, l) = serial_loop(src, "k");
+        let in_loop = l
+            .blocks
+            .iter()
+            .flat_map(|b| &f.blocks[b.0 as usize].insts)
+            .filter(|i| matches!(i.op, Op::CallIndirect { .. }))
+            .count();
+        assert_eq!(in_loop, 1, "the loop lost its indirect call");
+        assert_eq!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+    }
+
     // ---- stage 4: carried values -------------------------------------------------------------
 
     /// This and the integer case below are spelled as counting `while` loops: a `for` reduction
