@@ -4,10 +4,11 @@
 //! located source carry the original's location onto the copy: inlining (the callee's body, spliced
 //! into its caller), loop unrolling and unroll-and-jam (each copy of the body), bounds-check
 //! versioning and unswitching (each copy of the loop) and jump threading (the private copy of a
-//! block). The vectorizer gives each widened step its scalar step's location, and the guard, trip
-//! and exit it adds the loop's. Every other new value stays unknown, which is sound (an entry may be
-//! lost, never invented). The corpus census below measures what survives `-O2` across `tests/run`,
-//! and pins it from below.
+//! block). The vectorizer gives each widened step its scalar step's location (each lane's copy of a
+//! lane-serial step and each instruction of an outer-vectorized nest included), a lane test its
+//! bounds check's, and the guard, trip and exit it adds the loop's. Every other new value stays
+//! unknown, which is sound (an entry may be lost, never invented). The corpus census below measures
+//! what survives `-O2` across `tests/run`, and pins it from below.
 
 use std::path::{Path, PathBuf};
 
@@ -185,6 +186,133 @@ fn vectorized_values_keep_the_scalar_lines() {
     assert!(!vectors.is_empty(), "the loop was widened");
     for v in vectors {
         assert_eq!(line(&sm, f, v), Some(4), "{v:?} widens the body's line");
+    }
+}
+
+/// (e) A nest widened across its rows (`vectorize::outer`): lane `k` runs row `r + k`'s inner
+/// loop, so each vector value is a lane-wise copy of a scalar step of the nest and keeps that
+/// step's line — the row sum's multiply-add is line 8's.
+#[test]
+fn outer_vectorized_values_keep_the_nest_lines() {
+    let src = "\
+@unchecked
+fn mv(a: []f32, x: []f32, @noalias mut y: []f32, rows: i64, cols: i64) {
+    let mut r: i64 = 0;
+    while r < rows {
+        let mut s: f32 = 0.0;
+        let mut c: i64 = 0;
+        while c < cols {
+            s = s + a[r * cols + c] * x[c];
+            c = c + 1;
+        }
+        y[r] = s;
+        r = r + 1;
+    }
+}
+";
+    let (p, interner, sm) = optimized(src, 2);
+    let f = func(&p, &interner, "mv");
+    assert!(
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.params)
+            .any(|v| f.value_type(*v).is_vector()),
+        "the nest was not widened across its rows (no vector accumulator)"
+    );
+    let vectors: Vec<(ValueId, &Op)> = results(f)
+        .filter(|(v, _)| f.value_type(*v).is_vector())
+        .collect();
+    let sum = |op: &Op| matches!(op, Op::Fma(..) | Op::Bin(BinOp::FAdd | BinOp::FMul, ..));
+    assert!(vectors.iter().any(|(_, op)| sum(op)), "no vector row sum");
+    for (v, op) in vectors {
+        assert!(f.value_loc(v).is_some(), "{v:?} = {op:?} has no location");
+        if sum(op) {
+            assert_eq!(
+                line(&sm, f, v),
+                Some(8),
+                "{v:?} = {op:?} is the row sum's step"
+            );
+        }
+    }
+}
+
+/// (f) A lane-serial region runs its steps lane by lane, in iteration order, in the vector body:
+/// each lane's copy of a step keeps that step's line. The region runs from the gather `h[j]` on
+/// line 8 to the scatter `h[k]` on line 9 (two indices, so the two accesses keep two addresses);
+/// line 9, the update's add and store, reads no memory, so no load of the function may sit on it.
+#[test]
+fn lane_serial_copies_keep_their_own_lines() {
+    let src = "\
+@unchecked
+fn move_add(@noalias mut h: []f32, q: []i32, p: []i32, x: []f32, y: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i] * 0.5 + y[i] * 0.25 - 1.0;
+        let j: i64 = q[i] as i64;
+        let k: i64 = p[i] as i64;
+        let g: f32 = h[j];
+        h[k] = g + v * v;
+        i = i + 1;
+    }
+}
+";
+    let (p, interner, sm) = optimized(src, 2);
+    let f = func(&p, &interner, "move_add");
+    assert!(
+        results(f).any(|(v, _)| f.value_type(v).is_vector()),
+        "the loop was not widened around its lane-serial region"
+    );
+    let mut gathers = 0;
+    for (v, op) in results(f) {
+        if !matches!(op, Op::Load(..)) {
+            continue;
+        }
+        assert_ne!(
+            line(&sm, f, v),
+            Some(9),
+            "{v:?} = {op:?}: line 9 loads nothing"
+        );
+        if line(&sm, f, v) == Some(8) {
+            gathers += 1;
+        }
+    }
+    assert!(
+        gathers >= 5,
+        "{gathers} loads on line 8: four lanes of the vector body and the scalar loop's"
+    );
+}
+
+/// (g) A checked gather's lane test — the group's indices tested at once and the mask folded to
+/// one branch — sits on its bounds check's line, 4, like every other vector value of the body; the
+/// loop's own line, 3, is the search exit's.
+#[test]
+fn a_lane_test_keeps_its_bounds_check_line() {
+    let src = "\
+fn g(t: []f32, q: []i32, x: []f32, @noalias mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = t[q[i] as i64] * x[i] + 1.0;
+        i = i + 1;
+    }
+}
+";
+    let (p, interner, sm) = optimized(src, 2);
+    let f = func(&p, &interner, "g");
+    let vectors: Vec<(ValueId, &Op)> = results(f)
+        .filter(|(v, _)| f.value_type(*v).is_vector())
+        .collect();
+    assert!(
+        vectors
+            .iter()
+            .any(|(_, op)| matches!(op, Op::Shuffle { .. })),
+        "no lane test folded its mask: {vectors:?}"
+    );
+    for (v, op) in vectors {
+        assert_eq!(
+            line(&sm, f, v),
+            Some(4),
+            "{v:?} = {op:?} is the body's line"
+        );
     }
 }
 

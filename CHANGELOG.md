@@ -5,6 +5,63 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Vectorizer: calls, checked gathers, lane-serial regions and outer loops (`gap7/vectorizer-3`, N37, N41)
+
+- **A call no longer keeps its loop scalar.** A call to a function the optimizer's effect
+  summaries prove side-effect free (`wukong_opt::effects`: writes nothing the caller can see, no
+  I/O) is replicated once per lane, in lane order, on each lane's own arguments, while the rest of
+  the body stays 4-wide; a call whose arguments are the same in every lane runs once per group.
+  A call that reads memory is a load from anywhere, so it widens only in a loop that stores
+  nothing (a sum). At most one call that may trap or never return may sit in a widened body (it is
+  then the one step that can stop the program, and stops it at the scalar loop's iteration), and
+  only a speculatable call may run before a lane test. A call with an effect — `print`, a write —
+  still declines. A compare passed as a `bool` argument reaches each lane's call as that lane's
+  truth, never as the raw lane of the widened mask. `bce` now versions a loop whose calls are
+  side-effect free and always return (`tests/run/vec7_call_lanes.wk`).
+- **Checked gathers widen.** `t[q[i]]` over a `[]T` keeps a bounds check `bce` cannot prove (the
+  index is data), which used to be a second loop exit the vectorizer refused. A body that passes
+  checks on every iteration is now flattened: a check on `i + k` is discharged once in the vector
+  loop's guard, any other is a **lane test** — the group's indices are checked at once, and a
+  group with a failing lane leaves for the scalar loop at its first iteration, which stops at the
+  same iteration with the same message (`tests/run/vec7_checked_gather.wk`,
+  `tests/run/vec7_checked_gather_trap.wk`: the first failure in iteration order, `index 106`, on
+  every backend and level). Nothing may store before the last test, and every load before it must
+  read memory that exists (a `[]T` element under a guard on its length, or a gather an earlier
+  test checked). `bce`'s cold slow copies and any loop `bce` would version next are left alone.
+- **Lane-serial regions: read-modify-write and multiple scatters.** A histogram `h[q[i]] += v`, two
+  scatters into one object, a scatter beside a store to its object, and a gather beside a store to
+  a buffer it may be reading now widen: the accesses that may meet (and every step reading what
+  they computed) run lane by lane — lane 0's, then lane 1's, every step of a lane before the next
+  lane's — so they happen in exactly the scalar loop's order, repeated indices included, while the
+  arithmetic around them stays 4-wide (`tests/run/vec7_lane_serial.wk`). `loop_info::dependence`
+  lists such pairs (`DepSummary::serial`) instead of failing when the vectorizer asks, and then
+  also takes a scatter of a typed element beside a slice's in-loop data-pointer read as
+  independent (no type punning). `WUKONG_NO_LANE_SERIAL` makes the vectorizer ask for the plain
+  verdict, which restores both declines. A body whose every access would have to run lane by lane
+  (an unpromised scatter, a bare histogram) is still declined by the replication rule.
+- **Outer-loop vectorization (N41).** A two-deep nest whose inner loop carries a row's own state
+  the inner path cannot widen in parallel — a float sum (a matrix-vector product), a float
+  min/max, a recurrence (per-row Horner) — is widened **across its rows**: lane `k` runs the inner
+  loop for row `r + k` with its own accumulator, in the scalar loop's order, so every row's result
+  is bit-exact (`tests/run/vec7_outer_loops.wk`). The inner trip must not depend on the row, the
+  nest may store only before or after its inner loop, at the row's own element, into objects
+  provably apart from everything else it touches, and the rows past the last whole group run in
+  the original nest. A recurrence over row-major (gathered) rows stays with unroll-and-jam.
+  `WUKONG_NO_OUTER_VEC` turns it off.
+- **Source locations.** Every value the new forms create keeps a source line at `-O2`: a lane test
+  its bounds check's, each lane's copy of a lane-serial step or per-lane call its step's, and an
+  outer-vectorized nest's values the scalar instruction each one reproduces (the guard, trip and
+  counter step the outer loop's exit test's). `crates/wukong_opt/tests/source_locations.rs` pins
+  all three.
+- **Still scalar:** a predicated or checked scatter, a lane test inside a lane-serial region or
+  after a store, an if-converted body, a call (direct or through a function value) or a
+  row-varying `bf16`/`f16` value inside the outer path, an `i32` outer counter indexing through a widening cast, a lane-serial region in a search
+  loop, and one that contains or spans an if-converted step (a listed access the if-conversion
+  predicated or merged, such as a scatter in an `if` arm, or any masked, merged or predicated step
+  between the first and the last listed access; an if-converted step outside that span widens
+  beside the region); no AVX2 gather or scatter is emitted (every per-lane access is a scalar load
+  or store).
+  None of these forms has been timed: each is a rule, not a measured win.
 ### The AOT runtime cache: `--emit=exe` stops re-LTOing the runtime on every link (`gap7/aot-link-cache`, N51)
 
 - **The runtime half of a link is built once.** Every `--emit=exe` link used to compile the

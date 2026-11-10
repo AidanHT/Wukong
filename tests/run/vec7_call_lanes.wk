@@ -1,0 +1,213 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3184
+// EXPECT-OUT: 3318
+// EXPECT-OUT: 3580
+// EXPECT-OUT: 3970
+// EXPECT-OUT: 4488
+// EXPECT-OUT: 5134
+// EXPECT-OUT: 5908
+// EXPECT-OUT: 6810
+// EXPECT-OUT: 7840
+// EXPECT-OUT: 8998
+// EXPECT-OUT: 10284
+// EXPECT-OUT: 178
+// EXPECT-OUT: 250
+// EXPECT-OUT: 292
+// EXPECT-OUT: 304
+// EXPECT-OUT: 286
+// EXPECT-OUT: 238
+// EXPECT-OUT: 160
+// EXPECT-OUT: 52
+// EXPECT-OUT: -86
+// EXPECT-OUT: -254
+// EXPECT-OUT: -452
+// EXPECT-OUT: 256
+// EXPECT-OUT: 617
+// EXPECT-OUT: 978
+// EXPECT-OUT: 1339
+// EXPECT-OUT: 1700
+// EXPECT-OUT: 2061
+// EXPECT-OUT: 2422
+// EXPECT-OUT: 2783
+// EXPECT-OUT: 3144
+// EXPECT-OUT: 3505
+// EXPECT-OUT: 3866
+// EXPECT-OUT: 28
+// EXPECT-OUT: 104
+// EXPECT-OUT: 64
+// EXPECT-OUT: 40
+// EXPECT-OUT: 124
+// EXPECT-OUT: 84
+// EXPECT-OUT: 52
+// EXPECT-OUT: 28
+// EXPECT-OUT: 104
+// EXPECT-OUT: 64
+// EXPECT-OUT: 40
+module tests.run.vec7_call_lanes
+
+// Calls inside widened loops (-O2). A call to a function the optimizer's effect summaries prove
+// side-effect free no longer keeps its loop scalar: each lane of a group calls it on that lane's
+// own arguments, in lane order (which is iteration order), and everything around the call stays
+// 4-wide. `tri` and `h` call themselves, so the inliner never splices them and the summaries never
+// call them "always returns" - each is the one step of its loop that could stop the program, which
+// is the most a widened loop may hold.
+//
+// The kernels are kept OUT of line (they and `again` call each other, which the inliner never
+// splices). n = 11 is two groups of four and a scalar tail of three, so every kernel's vector loop,
+// its exit and its epilogue all run. `call_f32` and `call_uniform` are `@unchecked`; `call_i64` is
+// checked, so its loop keeps three bounds checks (`bce` does not version a loop with a call that may
+// not return) which the vector loop's guard discharges once.
+//
+// Every expected line below is the scalar loop's answer, derived by hand from the source:
+//
+//   tri(x, 0) = x;  tri(x, d) = tri(x/2 + 1, d - 1) * 3/4 + x, so
+//   tri(b, 1) = (b/2 + 1) * 3/4 + b = 11b/8 + 3/4 and
+//   tri(x, 2) = tri(x/2 + 1, 1) * 3/4 + x = 97x/64 + 51/32.
+//   call_f32: x[j] = j/4, y[j] = 1 - j/8, a = 2x + y = 1 + 3j/8,
+//             o[j] = tri(a, 2)/2 - x*y, printed as o[j] * 2048 (every value is a multiple of
+//             1/2048, and every intermediate is exact in f32, so no rounding or fma contraction
+//             can move it). j = 0: a = 1, tri = 199/64, o = 199/128, printed 3184.
+//   call_i64: h(i, 0) = 3i + 1; h(i, d) = h(i + 1, d - 1) - 1, so h(i, 2) = 3i + 5.
+//             x[j] = 7 - j, o[j] = (5x + 2)(3j + 5) - x.
+//   call_uniform: o[j] = x[j] * tri(c, 2) + y[j] with c = 3: tri(3, 2) = 393/64 (one call per
+//             group: its argument is the same in every lane); x[j] = j/4, y[j] = 1 - j/8,
+//             printed as o[j] * 256.
+//   call_bool: a widened compare handed to a `bool` parameter - each lane passes its own truth.
+//             sel(b, v, 0) = b ? v : 0 - v;  sel(b, v, d) = sel(b, v/2, d - 1) + 1, so
+//             sel(b, v, 2) = (b ? v/4 : -v/4) + 2 and o[j] = sel(x > 0, 2x, 2)/2 + x is
+//             5x/4 + 1 where x > 0 and 3x/4 + 1 where x <= 0. x[j] = (5j mod 7)/4 - 3/4:
+//             -3/4, 1/2, 0, -1/2 | 3/4, 1/4, -1/4, -3/4 | 1/2, 0, -1/2 (each group mixes
+//             both answers), printed as o[j] * 64.
+
+fn tri(x: f32, d: i64) -> f32 {
+    if d <= 0 {
+        return x;
+    }
+    return tri(x * 0.5 + 1.0, d - 1) * 0.75 + x;
+}
+
+fn sel(b: bool, v: f32, d: i64) -> f32 {
+    if d <= 0 {
+        if b {
+            return v;
+        }
+        return 0.0 - v;
+    }
+    return sel(b, v * 0.5, d - 1) + 1.0;
+}
+
+fn h(i: i64, d: i64) -> i64 {
+    if d <= 0 {
+        return i * 3 + 1;
+    }
+    return h(i + 1, d - 1) - 1;
+}
+
+@unchecked
+fn call_f32(x: []f32, y: []f32, mut o: []f32, n: i64, d: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let a: f32 = x[i] * 2.0 + y[i];
+        o[i] = tri(a, d) * 0.5 - x[i] * y[i];
+        i = i + 1;
+    }
+}
+
+fn call_i64(x: []i64, mut o: []i64, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = (x[i] * 5 + 2) * h(i, 2) - x[i];
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn call_uniform(x: []f32, y: []f32, mut o: []f32, n: i64, c: f32, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * tri(c, 2) + y[i];
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn call_bool(x: []f32, @noalias mut o: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = sel(x[i] > 0.0, x[i] * 2.0, 2) * 0.5 + x[i];
+        i = i + 1;
+    }
+}
+
+fn again(z: i64) {
+    let mut t: []f32 = alloc_f32(1);
+    let mut u: []i64 = alloc_i64(1);
+    let mut v: []f32 = alloc_f32(1);
+    call_f32(t, t, t, 1, 0, z);
+    call_i64(u, u, 1, z);
+    call_uniform(t, t, t, 1, 1.0, z);
+    call_bool(t, v, 1, z);
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(11);
+    let mut y: []f32 = alloc_f32(11);
+    let mut o: []f32 = alloc_f32(11);
+    let mut xi: []i64 = alloc_i64(11);
+    let mut oi: []i64 = alloc_i64(11);
+    let mut j: i64 = 0;
+    while j < 11 {
+        x[j] = (j as f32) * 0.25;
+        y[j] = 1.0 - (j as f32) * 0.125;
+        xi[j] = 7 - j;
+        j = j + 1;
+    }
+    call_f32(x, y, o, 11, 2, 0);
+    j = 0;
+    while j < 11 {
+        print((o[j] * 2048.0) as i64);
+        j = j + 1;
+    }
+    call_i64(xi, oi, 11, 0);
+    j = 0;
+    while j < 11 {
+        print(oi[j]);
+        j = j + 1;
+    }
+    call_uniform(x, y, o, 11, 3.0, 0);
+    j = 0;
+    while j < 11 {
+        print((o[j] * 256.0) as i64);
+        j = j + 1;
+    }
+    let mut xb: []f32 = alloc_f32(11);
+    j = 0;
+    while j < 11 {
+        xb[j] = (((j * 5) % 7) as f32) * 0.25 - 0.75;
+        j = j + 1;
+    }
+    call_bool(xb, o, 11, 0);
+    j = 0;
+    while j < 11 {
+        print((o[j] * 64.0) as i64);
+        j = j + 1;
+    }
+    return 0;
+}

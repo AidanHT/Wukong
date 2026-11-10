@@ -30,7 +30,8 @@
 //!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`). A body
 //!    with a raw-AVX2 recipe form and a trip of 2048 or more instead calls a 256-bit kernel
 //!    (`Op::VecKernelCall`) ahead of the original loop, which the 128-bit path then widens as the
-//!    remainder ([`OptimizeOptions::vec_kernels`]).
+//!    remainder ([`OptimizeOptions::vec_kernels`]). A two-deep nest whose inner loop carries a
+//!    row's float sum or recurrence is widened across its rows instead.
 //!
 //! `cse`, `dse` and `licm` all consult [`alias`], the provenance analysis that answers *can a store
 //! through `q` be seen by a load through `p`?* — the question `mir_build`'s type erasure

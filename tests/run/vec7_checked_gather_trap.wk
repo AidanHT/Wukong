@@ -1,0 +1,56 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: 7
+// EXPECT-STDERR: index out of bounds: the len is 5 but the index is 106
+module tests.run.vec7_checked_gather_trap
+
+// A checked gather that fails, inside a widened loop (-O2). The loop's vector body tests the
+// group's four gathered indices together; group 4..7 holds two that fail (iterations 6 and 7), and
+// a later group holds another (iteration 9). The group leaves for the scalar loop at its first
+// iteration, which re-runs iterations 4 and 5, stops at iteration 6's check, and reports what the
+// scalar loop always reported: the first failing index in iteration order, 106, against the
+// length 5. A vector loop that checked lanes out of order, or trapped from inside the group,
+// would name 107 or 109, or stop without the message. Every index is distinct, so the message
+// names the iteration.
+//
+// `7` is printed before the call; nothing after it may appear, and the exit status is 1, on the
+// interpreter and natively, at every level.
+
+fn k(t: []f32, q: []i32, x: []f32, @noalias mut o: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = t[q[i] as i64] * x[i] + 1.0;
+        i = i + 1;
+    }
+}
+
+fn again(z: i64) {
+    let mut t: []f32 = alloc_f32(1);
+    let mut u: []f32 = alloc_f32(1);
+    let mut q: []i32 = alloc_i32(1);
+    k(t, q, t, u, 1, z);
+}
+
+fn main() -> i32 {
+    let mut t: []f32 = alloc_f32(5);
+    let mut q: []i32 = alloc_i32(13);
+    let mut x: []f32 = alloc_f32(13);
+    let mut o: []f32 = alloc_f32(13);
+    let mut j: i64 = 0;
+    while j < 13 {
+        q[j] = (j % 5) as i32;
+        x[j] = j as f32;
+        j = j + 1;
+    }
+    q[6] = 106;
+    q[7] = 107;
+    q[9] = 109;
+    print(7);
+    k(t, q, x, o, 13, 0);
+    print(o[0]);
+    return 0;
+}

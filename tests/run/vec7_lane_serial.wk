@@ -1,0 +1,388 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 376
+// EXPECT-OUT: 751
+// EXPECT-OUT: 0
+// EXPECT-OUT: 580
+// EXPECT-OUT: 1168
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1169
+// EXPECT-OUT: 493
+// EXPECT-OUT: 973
+// EXPECT-OUT: 26
+// EXPECT-OUT: 795
+// EXPECT-OUT: 35
+// EXPECT-OUT: 29
+// EXPECT-OUT: 44
+// EXPECT-OUT: 52
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 32
+// EXPECT-OUT: 40
+// EXPECT-OUT: 48
+// EXPECT-OUT: 56
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: -32
+// EXPECT-OUT: -12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 52
+// EXPECT-OUT: 96
+// EXPECT-OUT: 148
+// EXPECT-OUT: 208
+// EXPECT-OUT: 276
+// EXPECT-OUT: 352
+// EXPECT-OUT: 436
+// EXPECT-OUT: 528
+// EXPECT-OUT: 628
+// EXPECT-OUT: 736
+// EXPECT-OUT: 1808
+// EXPECT-OUT: 1824
+// EXPECT-OUT: 1840
+// EXPECT-OUT: 4960
+// EXPECT-OUT: 5208
+// EXPECT-OUT: 5456
+// EXPECT-OUT: 88
+// EXPECT-OUT: 5184
+// EXPECT-OUT: 5432
+// EXPECT-OUT: 28
+// EXPECT-OUT: 696
+// EXPECT-OUT: 5408
+// EXPECT-OUT: -8
+// EXPECT-OUT: 540
+// EXPECT-OUT: 1688
+// EXPECT-OUT: 5632
+// EXPECT-OUT: 10
+// EXPECT-OUT: 28
+// EXPECT-OUT: 18
+// EXPECT-OUT: 8
+// EXPECT-OUT: 26
+// EXPECT-OUT: 16
+// EXPECT-OUT: 38
+// EXPECT-OUT: 24
+// EXPECT-OUT: 78
+// EXPECT-OUT: 58
+// EXPECT-OUT: 22
+// EXPECT-OUT: 34
+// EXPECT-OUT: 22
+// EXPECT-OUT: 118
+// EXPECT-OUT: 530368
+// EXPECT-OUT: 733690
+// EXPECT-OUT: 0
+// EXPECT-OUT: 735952
+// EXPECT-OUT: 994984
+// EXPECT-OUT: 0
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 13
+// EXPECT-OUT: -2
+// EXPECT-OUT: 14
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+module tests.run.vec7_lane_serial
+
+// Lane-serial regions (-O2). A read-modify-write scatter `h[q[i]] += v`, two scatters into one
+// object, a scatter beside a store to its object, and a gather beside a store to a buffer it may be
+// reading used to keep their loops scalar: no vector order keeps those accesses in the scalar
+// loop's order. One order does - lane by lane. The vectorizer now runs the accesses that may meet
+// (and every step that reads what they computed) once per lane, lane 0 first, every step of a lane
+// before the next lane's, while the arithmetic around them stays 4-wide. With repeated indices
+// - two lanes of a group hitting one bin - lane k + 1 reads what lane k wrote, exactly as
+// iteration i + k + 1 reads what iteration i + k wrote.
+//
+// The kernels are kept OUT of line (they and `again` call each other). Every expected line is the
+// scalar loop's answer, derived by hand from the loops below; every value is a small dyadic
+// fraction, exact in f32, printed scaled to an integer:
+//
+//   hist:     h[0..6] = 0; q[j] = j^2 mod 6, x[j] = j/2, y[j] = 3 - j/2, so
+//             v = x/2 + y/4 - 1 = (j - 2)/8, and h[q[j]] += v*v for j < 23; printed h[b] * 64.
+//             The group j = 4..7 hits bin 4 (j = 4) and bin 1 twice (j = 5, 7).
+//   two_scat: o[0..7] = 0; p[j] = 3j mod 7, q[j] = (5j + 1) mod 7, x[j] = j - 4, a = 3x - 7,
+//             b = a*a + x; o[p[j]] = a, then o[q[j]] = b - 2a, for j < 19.
+//   beside:   o[0..13] = -1; q[j] = (7j + 2) mod 13, x[j] = j/4; o[q[j]] = 2x + 1, then
+//             o[j] = x/2, for j < 13; printed o[k] * 8.
+//   alias:    o[k] = 100 + k (16 slots) is both the gather's source and the store's target;
+//             q[j] = (5j + 3) mod 16, x[j] = j/4, a = 2x + 1, o[j] = a*a - 3, then g = o[q[j]]
+//             (read AFTER this iteration's store, BEFORE any later one), y[j] = 3g + a, for
+//             j < 13; printed o[k] * 16 then y[j] * 16.
+//   checked:  o[k] = k/2 (14 slots), ix[j] = (9j + 4) mod 14; o[j] = o[ix[j]] * 2 + 1 through
+//             checked slices for j < 14 - the gather reads o itself; printed o[k] * 2.
+//   hist_sel: the histogram's arrays, h[0..6] = 0; c = 2x + y/2 - 1 = 3j/4 + 1/2, e = c*c - y,
+//             and h[q[j]] = sel(c > 4, h[q[j]] + e, 1) for j < 23, where sel(b, v, 0) = b ? v :
+//             0 - v and sel(b, v, d) = sel(b, v/2, d - 1) + 1, so the update is (h + e)/2 + 1
+//             for j >= 5 and 1 - (h + e)/2 below. The compare is widened before the region and
+//             reaches each lane's call as that lane's `bool`; folding the 23 updates bin by bin
+//             in j order gives h = 8287/64, 366845/2048, 0, 45997/256, 124373/512, 0 (bins 2
+//             and 5 are never hit); printed h[b] * 4096.
+//   scat_hdr: no lane-serial region at all - a plain scatter o[q[j]] = 2x + 1 whose loop re-reads
+//             o's data pointer every iteration (scat_hdr and scat_hdr2 call each other, and licm
+//             leaves that read in place). Index and value come from local tables, so the scatter's
+//             one possible conflict is that header read, and a typed f32 element never lands on a
+//             slice header (no punning): widened, and kept scalar under WUKONG_NO_LANE_SERIAL,
+//             which reverts that exemption with the regions. o[0..7] = -1, q[j] = j^2 mod 7 =
+//             0 1 4 2 | 2 4 1 0 | 1 4 2 2 | 4 1 0 1 (bins hit twice inside a group), x[j] = j/4,
+//             for j < 16: the last writer of each bin wins, o = 8, 17/2, 13/2, -1, 7, -1, -1;
+//             printed o[k] * 2.
+
+@unchecked
+fn hist(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i] * 0.5 + y[i] * 0.25 - 1.0;
+        h[q[i] as i64] = h[q[i] as i64] + v * v;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn two_scat(@noalias mut o: []i32, p: []i32, q: []i32, x: []i32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let a: i32 = x[i] * 3 - 7;
+        let b: i32 = a * a + x[i];
+        o[p[i] as i64] = a;
+        o[q[i] as i64] = b - a * 2;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn beside(@noalias mut o: []f32, x: []f32, q: []i32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[q[i] as i64] = x[i] * 2.0 + 1.0;
+        o[i] = x[i] * 0.5;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn alias(t: []f32, q: []i32, x: []f32, mut o: []f32, @noalias mut y: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let j: i64 = q[i] as i64;
+        let a: f32 = x[i] * 2.0 + 1.0;
+        let b: f32 = a * a - 3.0;
+        o[i] = b;
+        let g: f32 = t[j];
+        y[i] = g * 3.0 + a;
+        i = i + 1;
+    }
+}
+
+fn checked(ix: []i32, x: []f32, mut o: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[ix[i] as i64] * 2.0 + 1.0;
+        i = i + 1;
+    }
+}
+
+fn sel(b: bool, v: f32, d: i64) -> f32 {
+    if d <= 0 {
+        if b {
+            return v;
+        }
+        return 0.0 - v;
+    }
+    return sel(b, v * 0.5, d - 1) + 1.0;
+}
+
+@unchecked
+fn hist_sel(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let c: f32 = x[i] * 2.0 + y[i] * 0.5 - 1.0;
+        let e: f32 = c * c - y[i];
+        let pos: bool = c > 4.0;
+        let j: i64 = q[i] as i64;
+        let g: f32 = h[j];
+        h[j] = sel(pos, g + e, 1);
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn scat_hdr(@noalias mut o: []f32, n: i64, z: i64) {
+    if z > 0 {
+        scat_hdr2(o, n, z - 1);
+        return;
+    }
+    let mut q: [i32; 16] = [0; 16];
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut j: i64 = 0;
+    while j < 16 {
+        q[j] = ((j * j) % 7) as i32;
+        x[j] = (j as f32) * 0.25;
+        j = j + 1;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[q[i] as i64] = x[i] * 2.0 + 1.0;
+        i = i + 1;
+    }
+}
+
+fn scat_hdr2(mut o: []f32, n: i64, z: i64) {
+    scat_hdr(o, n, z);
+}
+
+fn again(z: i64) {
+    let mut t: []f32 = alloc_f32(1);
+    let mut u: []f32 = alloc_f32(1);
+    let mut q: []i32 = alloc_i32(1);
+    let mut r: []i32 = alloc_i32(1);
+    hist(u, q, t, t, 1, z);
+    two_scat(r, q, q, q, 1, z);
+    beside(u, t, q, 1, z);
+    alias(t, q, t, t, u, 1, z);
+    checked(q, t, t, 1, z);
+    hist_sel(u, q, t, t, 1, z);
+}
+
+fn main() -> i32 {
+    let mut j: i64 = 0;
+
+    let mut h: []f32 = alloc_f32(6);
+    let mut hq: []i32 = alloc_i32(23);
+    let mut hx: []f32 = alloc_f32(23);
+    let mut hy: []f32 = alloc_f32(23);
+    while j < 23 {
+        hq[j] = ((j * j) % 6) as i32;
+        hx[j] = (j as f32) * 0.5;
+        hy[j] = 3.0 - (j as f32) * 0.5;
+        j = j + 1;
+    }
+    hist(h, hq, hx, hy, 23, 0);
+    j = 0;
+    while j < 6 {
+        print((h[j] * 64.0) as i64);
+        j = j + 1;
+    }
+
+    let mut so: []i32 = alloc_i32(7);
+    let mut sp: []i32 = alloc_i32(19);
+    let mut sq: []i32 = alloc_i32(19);
+    let mut sx: []i32 = alloc_i32(19);
+    j = 0;
+    while j < 19 {
+        sp[j] = ((j * 3) % 7) as i32;
+        sq[j] = ((j * 5 + 1) % 7) as i32;
+        sx[j] = (j as i32) - 4;
+        j = j + 1;
+    }
+    two_scat(so, sp, sq, sx, 19, 0);
+    j = 0;
+    while j < 7 {
+        print(so[j]);
+        j = j + 1;
+    }
+
+    let mut bo: []f32 = alloc_f32(13);
+    let mut bx: []f32 = alloc_f32(13);
+    let mut bq: []i32 = alloc_i32(13);
+    j = 0;
+    while j < 13 {
+        bo[j] = -1.0;
+        bx[j] = (j as f32) * 0.25;
+        bq[j] = ((j * 7 + 2) % 13) as i32;
+        j = j + 1;
+    }
+    beside(bo, bx, bq, 13, 0);
+    j = 0;
+    while j < 13 {
+        print((bo[j] * 8.0) as i64);
+        j = j + 1;
+    }
+
+    let mut ao: []f32 = alloc_f32(16);
+    let mut aq: []i32 = alloc_i32(13);
+    let mut ax: []f32 = alloc_f32(13);
+    let mut ay: []f32 = alloc_f32(13);
+    j = 0;
+    while j < 16 {
+        ao[j] = 100.0 + (j as f32);
+        j = j + 1;
+    }
+    j = 0;
+    while j < 13 {
+        aq[j] = ((j * 5 + 3) % 16) as i32;
+        ax[j] = (j as f32) * 0.25;
+        j = j + 1;
+    }
+    alias(ao, aq, ax, ao, ay, 13, 0);
+    j = 0;
+    while j < 16 {
+        print((ao[j] * 16.0) as i64);
+        j = j + 1;
+    }
+    j = 0;
+    while j < 13 {
+        print((ay[j] * 16.0) as i64);
+        j = j + 1;
+    }
+
+    let mut co: []f32 = alloc_f32(14);
+    let mut ci: []i32 = alloc_i32(14);
+    j = 0;
+    while j < 14 {
+        co[j] = (j as f32) * 0.5;
+        ci[j] = ((j * 9 + 4) % 14) as i32;
+        j = j + 1;
+    }
+    checked(ci, co, co, 14, 0);
+    j = 0;
+    while j < 14 {
+        print((co[j] * 2.0) as i64);
+        j = j + 1;
+    }
+
+    let mut hs: []f32 = alloc_f32(6);
+    hist_sel(hs, hq, hx, hy, 23, 0);
+    j = 0;
+    while j < 6 {
+        print((hs[j] * 4096.0) as i64);
+        j = j + 1;
+    }
+
+    let mut ho: []f32 = alloc_f32(7);
+    j = 0;
+    while j < 7 {
+        ho[j] = -1.0;
+        j = j + 1;
+    }
+    scat_hdr(ho, 16, 0);
+    j = 0;
+    while j < 7 {
+        print((ho[j] * 2.0) as i64);
+        j = j + 1;
+    }
+    return 0;
+}

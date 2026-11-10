@@ -218,8 +218,8 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
     if p.early.is_some() {
         return Err("a search loop's early exit");
     }
-    if !p.len_checks.is_empty() {
-        return Err("a bounds check inside an arm");
+    if !p.len_checks.is_empty() || p.spine {
+        return Err("a bounds check inside the body");
     }
     // A reduction kernel regroups its addends (`wukong_mir::vec_kernel`'s canonical tree), which
     // computes the scalar loop's serial fold exactly for one kind only: an integer sum, which wraps
@@ -370,8 +370,14 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
             // Address arithmetic, constants and invariants: rebuilt ahead of the call where a
             // stream or a scalar needs them, never part of the recipe.
             (Plan::Scalar | Plan::InvariantPtrLoad, LinInst::Real { block, idx }) => {
-                if f.blocks[block.0 as usize].insts[*idx].result.is_none() {
+                let inst = &f.blocks[block.0 as usize].insts[*idx];
+                if inst.result.is_none() {
                     return Err("a uniform step with an effect");
+                }
+                // A call the group makes once may trap or never return; the kernel would not make
+                // it at all. Any call (`Op::effects`), direct or indirect.
+                if inst.op.is_call() {
+                    return Err("a call");
                 }
             }
             (Plan::VecLoad, LinInst::Real { block, idx }) => {
