@@ -1,0 +1,9 @@
+; RUN: not wukongc --emit=mir --verify-each %s 2>&1 | filecheck %s
+;
+; `ret` returns a value of the function's declared return type.
+
+; CHECK: internal compiler error (MIR verify): return value: v0 has type i32 but expected i64
+fn f(v0 i32) -> i64 {
+  bb0(v0 i32):
+    ret v0
+}

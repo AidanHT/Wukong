@@ -207,6 +207,11 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => vec![*ptr, *value],
         Op::Gep { ptr, index, .. } => vec![*ptr, *index],
         Op::Call { args, .. } => args.clone(),
+        Op::CallIndirect { callee, args, .. } => {
+            let mut v = vec![*callee];
+            v.extend(args.iter().copied());
+            v
+        }
         // A CPU raw-AVX2 microkernel call reads its buffer, scalar, and length operands. `analyze`
         // does not inspect this op at all (it only classifies `Op::Call`), so such a program can be
         // reported *eligible* here and is instead declined during lowering — `lower.rs` emits
@@ -272,7 +277,10 @@ pub fn mem_tainted(func: &Function) -> HashSet<u32> {
     for b in &func.blocks {
         for inst in &b.insts {
             if let Some(r) = inst.result {
-                if matches!(inst.op, Op::Load(..) | Op::Call { .. }) {
+                if matches!(
+                    inst.op,
+                    Op::Load(..) | Op::Call { .. } | Op::CallIndirect { .. }
+                ) {
                     tainted.insert(r.0);
                 }
             }
@@ -471,6 +479,11 @@ fn scan_function_calls(
 
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.insts.iter().enumerate() {
+            // A call through a function value reaches a callee PTX cannot name (`lower.rs`
+            // declines it too); decline here so eligibility and lowering agree.
+            if matches!(inst.op, Op::CallIndirect { .. }) {
+                return Err("an indirect call (through a function value)".to_string());
+            }
             if let Op::Call { func: callee, args } = &inst.op {
                 let name = interner.resolve(*callee).to_string();
                 if let Some(callee_fn) = program.function(*callee) {

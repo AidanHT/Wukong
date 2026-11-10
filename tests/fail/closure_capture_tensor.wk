@@ -1,0 +1,24 @@
+// EXPECT-CODE: E0418
+// EXPECT-COUNT: 1
+module tests.fail.closure_capture_tensor
+
+// A closure copies what it captures: a scalar, an enum, a pointer, a fixed-size array, a tuple, a
+// struct, a slice or a `str` (as its fat pointer) can be copied into a parameter of the function
+// the closure is lifted to. A tensor view carries a shape the copy would not, so reading the
+// tensor `t` inside the closure is rejected where it is read. Reading the element first
+// (`let w = t[1];`) or capturing a pointer (`let pt = &t;`) is the fix.
+// tests/run/closure_capture_views.wk is the positive control for slices and `str`.
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn second(t: Tensor[f32, 2], x: f32) -> f32 {
+    return apply(|y| y * t[1], x); //~ E0418
+}
+
+fn main() -> i32 {
+    let a: [f32; 2] = [1.0, 2.0];
+    print(second(a, 2.0));
+    return 0;
+}

@@ -1,0 +1,53 @@
+// RUN: wukongc --emit=mir --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre %s \
+// RUN:   | filecheck %s
+// RUN: wukongc --emit=mir --passes=mem2reg,simplify,simplify-cfg,simplify-phis,dce %s \
+// RUN:   | filecheck %s --check-prefix=BEFORE
+//
+// `tre` (tail-recursion elimination, part of -O1) turns a self-call whose result is returned into
+// a branch back to a loop header that carries the parameters. An integer `+` (or `*`, `&`, `|`,
+// `^`) around the call gets an accumulator parameter; a float one never does, because
+// reassociating it would change the rounding.
+
+// CHECK-LABEL: fn gcd(
+// CHECK-NOT:     call gcd
+// CHECK:         br [[LOOP:bb[0-9]+]](v0, v1)
+// CHECK:         [[R:v[0-9]+]] = srem
+// CHECK-NEXT:    br [[LOOP]]({{v[0-9]+}}, [[R]])
+// CHECK-NOT:     call gcd
+// BEFORE-LABEL: fn gcd(
+// BEFORE:         call gcd(
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return a;
+    }
+    return gcd(b, a % b);
+}
+
+// n + sum_to(n - 1): the loop carries n and a running sum that starts at 0.
+// CHECK-LABEL: fn sum_to(
+// CHECK-NOT:     call sum_to
+// CHECK:         [[ZERO:v[0-9]+]] = const.i64 0
+// CHECK-NEXT:    br [[LOOP:bb[0-9]+]](v0, [[ZERO]])
+// CHECK:         [[SUM:v[0-9]+]] = add [[ACC:v[0-9]+]], [[N:v[0-9]+]]
+// CHECK-NEXT:    br [[LOOP]]({{v[0-9]+}}, [[SUM]])
+// CHECK:       [[LOOP]]([[N]] i64, [[ACC]] i64):
+// CHECK-NOT:     call sum_to
+// BEFORE-LABEL: fn sum_to(
+// BEFORE:         call sum_to(
+fn sum_to(n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    return n + sum_to(n - 1);
+}
+
+// The same shape over f64 keeps its recursion.
+// CHECK-LABEL: fn fsum(
+// CHECK:         [[C:v[0-9]+]] = call fsum(
+// CHECK-NEXT:    fadd v1, [[C]]
+fn fsum(n: i64, x: f64) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    return x + fsum(n - 1, x);
+}

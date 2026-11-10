@@ -1,0 +1,38 @@
+; RUN: wukongc --emit=mir --passes=dce %s | filecheck %s
+;
+; `dce` removes pure instructions whose results nothing uses, dead `alloca`s, dead loads, and
+; unused calls to callees the call-effect summary proves side-effect free. A store is an effect
+; and stays.
+
+; CHECK-LABEL: fn dead_arithmetic(
+; CHECK-NEXT:    bb0(v0 i32, v1 ptr):
+; CHECK-NEXT:    store v0, v1
+; CHECK-NEXT:    ret v0
+fn dead_arithmetic(v0 i32, v1 ptr) -> i32 {
+  bb0(v0 i32, v1 ptr):
+    v2: i32 = const.i32 5
+    v3: i32 = mul v0, v2
+    v4: i32 = add v3, v0
+    store v0, v1
+    ret v0
+}
+
+; `twice` reads and writes no memory and always returns, so an unused call to it is dead.
+; CHECK-LABEL: fn twice(
+; CHECK:         add v0, v0
+; CHECK-LABEL: fn calls(
+; CHECK-NEXT:    bb0(v0 i32, v1 ptr):
+; CHECK-NEXT:    ret v0
+fn twice(v0 i32) -> i32 {
+  bb0(v0 i32):
+    v1: i32 = add v0, v0
+    ret v1
+}
+
+fn calls(v0 i32, v1 ptr) -> i32 {
+  bb0(v0 i32, v1 ptr):
+    v2: i32 = call twice(v0)
+    v3: ptr = alloca i32
+    v4: f32 = load f32 v1
+    ret v0
+}

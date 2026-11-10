@@ -37,9 +37,10 @@
 //! `apply(f, ..)` the closure value `(L, $cap$L$0)` read from those locals. A closure that uses `f`
 //! captures those hidden locals instead (`ClosureInfo::bound`). No use of `f` survives this pass.
 //!
-//! **What a capture carries.** One the closure only reads is a copy: a scalar by value, an
-//! aggregate (an array, tuple, struct or data-carrying enum) as a fresh buffer filled when the
-//! closure value is evaluated (`capture_value`; a `let`'s hidden local already is one). One the
+//! **What a capture carries.** One the closure only reads is a copy: a scalar (or a function value)
+//! by value, an aggregate (an array, tuple, struct or data-carrying enum) as a fresh buffer filled
+//! when the closure value is evaluated, a slice or `str` as a fresh copy of its 16-byte fat pointer
+//! — another view of the same elements (`capture_value`; a `let`'s hidden local already is one). One the
 //! closure writes (`ClosureInfo::by_ref`) is the element `&mut c`: the lifted function's parameter
 //! is a `*mut T`, and `lower_fn` binds the name to the storage it points at (`bind_by_ref`), so the
 //! body reads and writes the enclosing variable itself. A capture's type is the width the variable
@@ -298,12 +299,17 @@ impl Lifter<'_> {
         let StmtKind::Let {
             pat,
             init: Some(init),
+            mutable,
             ..
         } = &mut s.kind
         else {
             return None;
         };
-        if !matches!(init.kind, ExprKind::Closure { .. }) || !matches!(pat.kind, PatKind::Ident(_))
+        // A `let mut` of a closure is a function variable holding the lifted function's address
+        // (sema refuses one whose closure captures, `E0422`): lifted like a literal anywhere else.
+        if *mutable
+            || !matches!(init.kind, ExprKind::Closure { .. })
+            || !matches!(pat.kind, PatKind::Ident(_))
         {
             return None;
         }

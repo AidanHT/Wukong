@@ -149,6 +149,9 @@ pub mod lower;
 #[cfg(feature = "gpu")]
 pub mod fusion;
 
+#[cfg(all(test, feature = "gpu"))]
+mod indirect_tests;
+
 /// Whole-program **cooperative megakernel** (Phase 8 / M13): compile an eligible Wukong program into
 /// one persistent `.visible .entry` kernel run by a block of threads, recognized ops executed
 /// cooperatively across the block (no per-op launches, activations resident in one shared frame).

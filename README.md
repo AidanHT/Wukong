@@ -51,7 +51,9 @@ compile's time went, and `--depfile=<f>` writes a Make dependency rule over the 
 `--print-after=<pass>` prints the MIR to stderr after each run of a named pass (`docs/internals.md`,
 "Running a chosen pass list"). `--emit=mir-text` prints MIR with every type spelled out, and
 `wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
-(`docs/internals.md`, "Typed textual MIR"). `-g` puts DWARF in an `--emit=obj|exe` artifact — a
+(`docs/internals.md`, "Typed textual MIR"); what each pass does is pinned the same way, by
+FileCheck-style `.mir` filetests under `tests/filetests/` (`cargo test -p wukongc --test
+filetests`; `CONTRIBUTING.md`, "Writing a filetest"). `-g` puts DWARF in an `--emit=obj|exe` artifact — a
 line table from every function's machine code to `file:line:column`, a subprogram per function and
 call-frame information, with the machine code unchanged — so gdb or lldb can break, step and
 backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `perf-<pid>.map` for
@@ -59,7 +61,13 @@ backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `p
 several artifacts from one compile — on stdout under `==> <stage> <==` headers, or each at
 `<stem>.<ext>` with `-o <stem>` (language guide, "Several artifacts at once"); `wukongc --repl` is an
 interactive session: items are kept, statements run, an expression prints its value, and
-`:type <expr>` asks sema (language guide, "The REPL").
+`:type <expr>` asks sema (language guide, "The REPL"). `--emit=exe` builds the program-independent
+runtime half of the link once — the generated runtime shim and, against a release-profile runtime,
+one fat-LTO static library of it (formerly a whole-runtime LTO on every link) — into the AOT runtime
+cache and reuses it on every later link: `wukongc --print=runtime-cache` prints where it is
+(`WUKONG_CACHE_DIR`, else `%LOCALAPPDATA%\wukong\cache` or `~/.cache/wukong`), `wukongc
+--clear-cache` empties it, and `WUKONG_CACHE_TRACE=1` traces each hit, miss and rebuild
+(`docs/internals.md`, "The AOT runtime cache").
 
 ## Why Wukong
 
@@ -137,7 +145,12 @@ not duplicate them. In summary, Wukong:
   (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read
   capture is copied, a written one shared by reference) are dispatched statically — every generic and higher-order function is specialized per
   instantiation (and per closure), so no vtable or function pointer exists at run time
-  (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Every concrete instantiation
+  (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Where a program does
+  want one, a **function value** is an ordinary value: `fn(T) -> R` in a `let mut`, a field, an
+  array element or a return value, made from a named function or a closure that captures nothing,
+  and called through the pointer — a dispatch table `ops[op](a, b)`, a higher-order function given
+  a run-time choice — and the optimizer turns a call whose function it can see back into a direct
+  call (`tests/run/fn_values*.wk`). Every concrete instantiation
   is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,
   with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype, and its `T = f32`
   instance reaches the kernel builtins (`E0415`/`E0416` for any other binding); and

@@ -671,11 +671,11 @@ fn plan_loop(
     };
     for b in &l.blocks {
         for inst in &f.block(*b).insts {
+            // Every effect but a plain store: a call of any kind, a barrier, an atomic — except a
+            // direct call the summaries prove harmless.
             match &inst.op {
                 Op::Call { func, .. } if harmless(func) => {}
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier | Op::AtomicAdd { .. } => {
-                    return None
-                }
+                op if op.has_side_effects() && !matches!(op, Op::Store { .. }) => return None,
                 _ => {}
             }
         }

@@ -188,6 +188,20 @@ fn build(
             func.blocks.len()
         ));
     }
+    // A call through a function value reaches code no rule here can see: neither its result nor
+    // anything it writes has a VJP, and a write it made to a buffer on the gradient path would be
+    // silently missing from the adjoint. Refuse it by name.
+    if func.blocks[0]
+        .insts
+        .iter()
+        .any(|i| matches!(i.op, Op::CallIndirect { .. }))
+    {
+        return Err(format!(
+            "autodiff: `{fname}` calls through a function value (an indirect call); its callee is \
+             not known at compile time, so it has no VJP rule — call the function by name, or \
+             pass it to a function-typed parameter, which is resolved at compile time"
+        ));
+    }
     for &wi in wrt {
         let p = *func
             .params
@@ -1356,6 +1370,11 @@ pub(crate) fn map_operands(op: &Op, mut f: impl FnMut(ValueId) -> ValueId) -> Op
             func: *func,
             args: args.iter().map(|a| f(*a)).collect(),
         },
+        Op::CallIndirect { callee, args, ret } => Op::CallIndirect {
+            callee: f(*callee),
+            args: args.iter().map(|a| f(*a)).collect(),
+            ret: ret.clone(),
+        },
         Op::Splat(v) => Op::Splat(f(*v)),
         Op::ExtractLane(v, k) => Op::ExtractLane(f(*v), *k),
         Op::Iota(ty) => Op::Iota(ty.clone()),
@@ -1411,6 +1430,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::AtomicAdd { .. } => "atomic.add",
         Op::Gep { .. } => "gep",
         Op::Call { .. } => "call",
+        Op::CallIndirect { .. } => "call_indirect",
         Op::FuncAddr(..) => "func_addr",
         Op::GlobalAddr(..) => "global_addr",
         Op::Splat(..) => "splat",
@@ -1430,3 +1450,6 @@ fn op_name(op: &Op) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod indirect_tests;

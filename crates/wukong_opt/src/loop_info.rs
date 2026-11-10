@@ -2382,18 +2382,23 @@ fn dependence(
     // The exception is a call the effect summaries prove side-effect free ([`DepFacts::calls`]):
     // it writes nothing the loop can see, so it is no access at all — unless it reads memory, when
     // it is a load from anywhere, and only a loop that stores nothing leaves what it reads alone.
+    // Every other memory effect but a plain load or store (`Op::effects`: an unsummarized or
+    // indirect call, a vector kernel, an atomic), none of which the access list below models, is
+    // carried.
     let mut call_reads = false;
     for &b in &l.blocks {
         for inst in &ctx.f.blocks[b.0 as usize].insts {
-            match &inst.op {
-                Op::Call { func, .. } => match facts.calls.and_then(|e| e.get(*func)) {
-                    Some(effect) => call_reads |= effect.reads_memory,
-                    None => return carried("a call in the loop may touch any memory"),
-                },
-                Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
-                    return carried("a call in the loop may touch any memory")
+            let op = &inst.op;
+            if let Op::Call { func, .. } = op {
+                if let Some(effect) = facts.calls.and_then(|e| e.get(*func)) {
+                    call_reads |= effect.reads_memory;
+                    continue;
                 }
-                _ => {}
+            }
+            if !matches!(op, Op::Load(..) | Op::Store { .. })
+                && (op.may_read_memory() || op.may_write_memory())
+            {
+                return carried("a call in the loop may touch any memory");
             }
         }
     }

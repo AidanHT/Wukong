@@ -729,16 +729,8 @@ fn extract<'a>(p: &'a Function, nslots: usize, it: &Interner) -> Result<IterBody
         Some(Op::Cmp(CmpOp::Ult, a, b)) if *a == hh => (true, *b),
         _ => return Err(shape("the header is not `counter < bound`")),
     };
-    let pure = |op: &Op| {
-        !matches!(
-            op,
-            Op::Store { .. }
-                | Op::AtomicAdd { .. }
-                | Op::Call { .. }
-                | Op::Barrier
-                | Op::VecKernelCall { .. }
-        )
-    };
+    // No side effect of any kind (`Op::effects`): a store, an atomic, a call, a barrier.
+    let pure = |op: &Op| !op.has_side_effects();
     if !entry.insts.iter().all(|i| pure(&i.op)) {
         return Err(shape("the entry block has side effects"));
     }

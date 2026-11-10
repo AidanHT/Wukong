@@ -27,6 +27,22 @@ fn run_dir() -> PathBuf {
         .join("run")
 }
 
+/// The runtime cache every link in this file goes through unless a test makes its own: under the
+/// target directory, so a test run never writes the user's real cache (`%LOCALAPPDATA%\wukong\cache`
+/// or `~/.cache/wukong`), and shared, so only the first link of a run builds the runtime entry.
+fn shared_cache() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("wukong-runtime-cache")
+}
+
+/// The compiler under test, linking through [`shared_cache`] with cache tracing off (a developer's
+/// own `WUKONG_CACHE_TRACE` would otherwise reach every stderr this file inspects).
+fn wukongc() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    cmd.env(wukong_driver::CACHE_DIR_ENV, shared_cache())
+        .env_remove(wukong_driver::CACHE_TRACE_ENV);
+    cmd
+}
+
 /// Which link path `wukongc --emit=exe` will take here. The rlib half of the decision is not
 /// mirrored but *shared*: it calls the driver's own `runtime_rlib_in`, so the probe cannot drift
 /// from `wukong_driver::rustc_link`. (It drifted once already — the probe hardcoded
@@ -92,7 +108,7 @@ fn build_and_run_exe(tmp: &Path, src: &Path, stem: &str) -> Result<(Option<i32>,
     // passing `-o`.
     let exe = tmp.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
     let _ = std::fs::remove_file(&exe);
-    let emit = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+    let emit = wukongc()
         .current_dir(tmp) // the `.o` / `_shim.rs` / `_rt.c` intermediates land here
         .arg("--emit=exe")
         .arg("-o")
@@ -114,7 +130,7 @@ fn build_and_run_exe(tmp: &Path, src: &Path, stem: &str) -> Result<(Option<i32>,
 
 /// Run `src` on the interpreter (the oracle) for the comparison baseline.
 fn run_interp(src: &Path) -> (Option<i32>, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+    let out = wukongc()
         .arg("--run")
         .arg(src)
         .output()
@@ -229,8 +245,9 @@ fn exe_matches_run() {
          EVERY `wukong_*` symbol unresolved, the rlib holds LLVM bitcode rather than native objects \
          (the workspace `[profile.release]` sets `lto = \"thin\"`, so cargo builds the runtime with \
          `-C linker-plugin-lto`) and `rlib_holds_bitcode_members` failed to classify it — that \
-         probe is what makes `rustc_link` add `-C lto=thin -C opt-level=3`, and without it no \
-         release-profile executable links at all. If instead exactly one or two `wukong_*` symbols \
+         probe is what makes `rustc_link` build the runtime cache entry as a fat-LTO static \
+         library (`-C lto=fat -C opt-level=3`), and without it no release-profile executable \
+         links at all. If instead exactly one or two `wukong_*` symbols \
          are unresolved, the rlib `runtime_rlib_in` picked is simply STALE — rebuild the workspace. \
          (This gate previously reported every one of these states as \"no linker toolchain to \
          produce an exe\" and passed green, which is why the break went unreported. Note it must be \
@@ -379,7 +396,7 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
     }
     let exe = emit_dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
     let emitted = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
+        wukongc()
             .current_dir(&emit_dir)
             .arg("--emit=exe")
             .arg("-o")
@@ -390,7 +407,7 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
         // The JIT is the same Cranelift codegen as the object: a program it cannot compile either
         // is a native-backend limitation (with its own diagnostic), not an AOT defect.
         let native = outcome(
-            Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            wukongc()
                 .current_dir(&native_dir)
                 .arg("--error-format=json")
                 .arg("--run")
@@ -423,12 +440,7 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
         ));
     }
     let ran = outcome(Command::new(&exe).current_dir(&exe_dir));
-    let oracle = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
-            .current_dir(&oracle_dir)
-            .arg("--run")
-            .arg(src),
-    );
+    let oracle = outcome(wukongc().current_dir(&oracle_dir).arg("--run").arg(src));
     // `--run` reports a failed assertion as its result and discards the stdout the program had
     // produced; the executable has already written it. Exit code, message and the prefix agree.
     if oracle.0 == Some(1) && oracle.2.contains("assertion failed") {
@@ -584,6 +596,7 @@ fn cc_fallback_discovered_from_the_cli_matches_run() {
     let exe = tmp.join(format!("cc_floats{}", std::env::consts::EXE_SUFFIX));
     let emitted = outcome(
         Command::new(&bin)
+            .env(wukong_driver::CACHE_DIR_ENV, shared_cache())
             .current_dir(&tmp)
             .arg("--emit=exe")
             .arg("-o")
@@ -607,12 +620,7 @@ fn cc_fallback_discovered_from_the_cli_matches_run() {
     // double whose shortest digits are 0.3333333333333333; u64::MAX prints unsigned.
     let expected = "1.25\n0.1\n0.3333333333333333\n-7\n18446744073709551615\n";
     assert_eq!((ran.0, ran.1.as_str()), (Some(3), expected), "{}", ran.2);
-    let oracle = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
-            .current_dir(&tmp)
-            .arg("--run")
-            .arg(&src),
-    );
+    let oracle = outcome(wukongc().current_dir(&tmp).arg("--run").arg(&src));
     assert_eq!((oracle.0, oracle.1.as_str()), (Some(3), expected));
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -659,7 +667,7 @@ fn main() -> i32 {
     for level in ["-O0", "-O2"] {
         let exe = tmp.join(format!("dbg_prog{level}{}", std::env::consts::EXE_SUFFIX));
         let built = outcome(
-            Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            wukongc()
                 .current_dir(&tmp)
                 .arg("--emit=exe")
                 .arg("-g")
@@ -734,7 +742,7 @@ fn main() -> i32 {
     .unwrap();
     let stem = tmp.join("pruned_multi");
     let emitted = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
+        wukongc()
             .current_dir(&tmp)
             .arg("--emit=mir,exe")
             .arg("-o")
@@ -748,11 +756,7 @@ fn main() -> i32 {
     assert_eq!((ran.0, ran.1.as_str()), (Some(0), "42\n"), "{}", ran.2);
     assert_eq!(run_interp(&src), (Some(0), "42\n".to_string()));
     let listed = std::fs::read_to_string(stem.with_extension("mir-low")).unwrap();
-    let alone = outcome(
-        Command::new(env!("CARGO_BIN_EXE_wukongc"))
-            .arg("--emit=mir")
-            .arg(&src),
-    );
+    let alone = outcome(wukongc().arg("--emit=mir").arg(&src));
     assert_eq!(alone.0, Some(0), "{}", alone.2);
     assert!(
         listed.contains("used") && !listed.contains("never_called"),
@@ -760,4 +764,292 @@ fn main() -> i32 {
     );
     assert!(alone.1.contains("never_called"), "{}", alone.1);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---------------------------------------------------------------------------------------------
+// N51: the runtime cache. Each test below links through its OWN empty cache directory (never the
+// shared one, never the user's), with `WUKONG_CACHE_TRACE=1` so every cache decision is a line on
+// the compiler's stderr. The program needs only the `wukong_rt_*` runtime, so it links on either
+// link path and the cache under test is whichever one this box takes (`rust-native-*` for a
+// dev-profile runtime rlib, `rust-lto-*` for a release one, `cc-*` for the C fallback).
+// ---------------------------------------------------------------------------------------------
+
+/// Hand-derived: 12 * 12 = 144, then -3, and `main` returns 5.
+const CACHE_PROGRAM: &str = "fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn main() -> i32 {
+    print(square(12));
+    print(-3);
+    return 5;
+}
+";
+const CACHE_EXPECTED: (Option<i32>, &str) = (Some(5), "144\n-3\n");
+
+/// A fresh scratch directory and a fresh, empty cache directory for one cache test.
+fn cache_scratch(name: &str) -> (PathBuf, PathBuf) {
+    let base = std::env::temp_dir()
+        .join("wukong_exe_runtime_cache")
+        .join(format!("{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let tmp = base.join("work");
+    std::fs::create_dir_all(&tmp).expect("create the cache-test scratch dir");
+    std::fs::write(tmp.join("cached.wk"), CACHE_PROGRAM).unwrap();
+    (tmp, base.join("cache"))
+}
+
+/// `wukongc` with `cache` as its runtime cache and cache tracing on.
+fn traced(cache: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    cmd.env(wukong_driver::CACHE_DIR_ENV, cache)
+        .env(wukong_driver::CACHE_TRACE_ENV, "1");
+    cmd
+}
+
+/// `--emit=exe` `<tmp>/cached.wk` into `<tmp>/<out>` through `cache`, asserting the link succeeds,
+/// and return its stderr (the cache trace) together with what the executable did.
+fn cached_link(cache: &Path, tmp: &Path, out: &str) -> (String, (Option<i32>, String)) {
+    let exe = tmp.join(format!("{out}{}", std::env::consts::EXE_SUFFIX));
+    let built = outcome(
+        traced(cache)
+            .current_dir(tmp)
+            .arg("--emit=exe")
+            .arg("-o")
+            .arg(&exe)
+            .arg(tmp.join("cached.wk")),
+    );
+    assert_eq!(built.0, Some(0), "the link failed:\n{}", built.2);
+    let ran = outcome(Command::new(&exe).current_dir(tmp));
+    (built.2, (ran.0, ran.1))
+}
+
+/// The entry directories (and stray build directories) the cache holds.
+fn cache_entries(cache: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(cache.join("aot-runtime"))
+        .map(|dir| {
+            dir.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn expected_run() -> (Option<i32>, String) {
+    (CACHE_EXPECTED.0, CACHE_EXPECTED.1.to_string())
+}
+
+/// The first link builds the runtime entry and publishes it; the second finds it (`hit`, no build)
+/// and produces an executable that behaves identically. `--print=runtime-cache` names the
+/// directory the entry is in, the entry's key material names the inputs it was built from, and
+/// `--clear-cache` removes the entry so the next link builds it again.
+#[test]
+fn runtime_cache_second_link_reuses_the_entry() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!("runtime_cache_second_link_reuses_the_entry: no link toolchain - skipped");
+        return;
+    }
+    let (tmp, cache) = cache_scratch("reuse");
+    let printed = outcome(traced(&cache).arg("--print=runtime-cache"));
+    assert_eq!(printed.0, Some(0), "{}", printed.2);
+    assert_eq!(
+        PathBuf::from(printed.1.trim_end()),
+        cache.join("aot-runtime"),
+        "--print=runtime-cache must print <WUKONG_CACHE_DIR>/aot-runtime"
+    );
+    assert!(cache_entries(&cache).is_empty());
+
+    let (first, ran) = cached_link(&cache, &tmp, "first");
+    assert_eq!(ran, expected_run(), "the first executable");
+    assert!(
+        first.contains("runtime cache: miss") && first.contains("runtime cache: built"),
+        "an empty cache must build the entry:\n{first}"
+    );
+    assert!(first.contains("runtime cache: published"), "{first}");
+    let entries = cache_entries(&cache);
+    assert_eq!(entries.len(), 1, "exactly one entry: {entries:?}");
+    let entry = cache.join("aot-runtime").join(&entries[0]);
+    let material = std::fs::read_to_string(entry.join("material.txt")).unwrap();
+    match &link {
+        LinkPath::Rustc => {
+            assert!(
+                entries[0].starts_with("rust-native-") || entries[0].starts_with("rust-lto-"),
+                "{entries:?}"
+            );
+            // The key names the toolchain (`rustc -vV`), the runtime rlib it was built from, the
+            // shim source and the build recipe (each pinned against the production builder in
+            // `wukong_driver`'s `aot_material_tests`).
+            assert!(material.contains("\nrustc release: "), "{material}");
+            assert!(material.contains("\nruntime "), "{material}");
+            assert!(material.contains("libwukong_runtime"), "{material}");
+            assert!(material.contains("\nshim "), "{material}");
+            assert!(material.contains("\nrecipe "), "{material}");
+        }
+        LinkPath::CcFallback(_) => {
+            assert!(entries[0].starts_with("cc-"), "{entries:?}");
+            assert!(material.contains("\ncc-version "), "{material}");
+            assert!(material.contains("\nsource "), "{material}");
+            assert!(material.contains("\nrecipe "), "{material}");
+        }
+        LinkPath::None => unreachable!(),
+    }
+
+    let (second, ran) = cached_link(&cache, &tmp, "second");
+    assert_eq!(
+        ran,
+        expected_run(),
+        "the executable linked from the cached entry"
+    );
+    assert!(
+        second.contains("runtime cache: hit"),
+        "the second link must reuse the entry:\n{second}"
+    );
+    assert!(
+        !second.contains("runtime cache: built"),
+        "the second link must build nothing:\n{second}"
+    );
+    assert_eq!(cache_entries(&cache), entries, "a hit adds no entry");
+
+    let cleared = outcome(traced(&cache).arg("--clear-cache"));
+    assert_eq!(cleared.0, Some(0), "{}", cleared.2);
+    assert!(
+        cleared.2.contains("removed 1 runtime cache entry"),
+        "{}",
+        cleared.2
+    );
+    assert!(cache_entries(&cache).is_empty());
+    let (third, ran) = cached_link(&cache, &tmp, "third");
+    assert_eq!(ran, expected_run());
+    assert!(third.contains("runtime cache: built"), "{third}");
+    let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+}
+
+/// Two compilers linking at once into one EMPTY cache both succeed: each misses and builds, one
+/// publishes, the other adopts the published entry (or, if it started late, hits it). The cache
+/// ends with exactly one entry and no abandoned build directory.
+#[test]
+fn runtime_cache_concurrent_links_into_an_empty_cache_both_succeed() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!("runtime_cache_concurrent_links: no link toolchain - skipped");
+        return;
+    }
+    let (tmp, cache) = cache_scratch("race");
+    let children: Vec<(PathBuf, std::process::Child)> = (0..2)
+        .map(|i| {
+            let exe = tmp.join(format!("racer{i}{}", std::env::consts::EXE_SUFFIX));
+            let child = traced(&cache)
+                .current_dir(&tmp)
+                .arg("--emit=exe")
+                .arg("-o")
+                .arg(&exe)
+                .arg(tmp.join("cached.wk"))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn wukongc");
+            (exe, child)
+        })
+        .collect();
+    let mut traces = Vec::new();
+    for (exe, child) in children {
+        let out = child.wait_with_output().expect("wait for wukongc");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "a concurrent link failed ({link:?}):\n{stderr}"
+        );
+        let ran = outcome(Command::new(&exe).current_dir(&tmp));
+        assert_eq!((ran.0, ran.1), expected_run(), "{}", exe.display());
+        traces.push(stderr);
+    }
+    let all = traces.join("\n");
+    assert!(all.contains("runtime cache: published"), "{all}");
+    let entries = cache_entries(&cache);
+    assert_eq!(
+        entries.len(),
+        1,
+        "one entry and no leftover `.tmp-*` build directory: {entries:?}\n{all}"
+    );
+    assert!(!entries[0].starts_with(".tmp-"), "{entries:?}");
+    let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+}
+
+/// A corrupted entry is detected, reported and rebuilt, and the executable linked after the rebuild
+/// is correct: the runtime artifact truncated (a partial write), then the manifest deleted (an
+/// interrupted publish). After each rebuild the next link is a plain hit again.
+#[test]
+fn runtime_cache_rebuilds_a_corrupted_entry() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!("runtime_cache_rebuilds_a_corrupted_entry: no link toolchain - skipped");
+        return;
+    }
+    let (tmp, cache) = cache_scratch("corrupt");
+    let (first, ran) = cached_link(&cache, &tmp, "first");
+    assert_eq!(ran, expected_run());
+    assert!(first.contains("runtime cache: built"), "{first}");
+    let entries = cache_entries(&cache);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = cache.join("aot-runtime").join(&entries[0]);
+    // The largest file the entry holds: the runtime artifact (or, for the C fallback, possibly its
+    // source), a file the manifest lists - never the small manifest or key material themselves.
+    let artifact = std::fs::read_dir(&entry)
+        .unwrap()
+        .flatten()
+        .max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .unwrap()
+        .path();
+    let bytes = std::fs::read(&artifact).unwrap();
+    std::fs::write(&artifact, &bytes[..bytes.len() / 2]).unwrap();
+
+    let (second, ran) = cached_link(&cache, &tmp, "second");
+    assert_eq!(
+        ran,
+        expected_run(),
+        "the executable linked after the rebuild"
+    );
+    assert!(
+        second.contains("runtime cache: invalid entry") && second.contains("runtime cache: built"),
+        "a truncated artifact must be detected and rebuilt:\n{second}"
+    );
+
+    std::fs::remove_file(entry.join("manifest")).unwrap();
+    let (third, ran) = cached_link(&cache, &tmp, "third");
+    assert_eq!(ran, expected_run());
+    assert!(
+        third.contains("no manifest") && third.contains("runtime cache: built"),
+        "a missing manifest must be detected and rebuilt:\n{third}"
+    );
+    let (fourth, ran) = cached_link(&cache, &tmp, "fourth");
+    assert_eq!(ran, expected_run());
+    assert!(
+        fourth.contains("runtime cache: hit") && !fourth.contains("runtime cache: built"),
+        "the rebuilt entry is valid:\n{fourth}"
+    );
+    assert_eq!(cache_entries(&cache), entries);
+    let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+}
+
+/// An empty `WUKONG_CACHE_DIR` disables the cache: the link still succeeds, from a private build
+/// that is not kept, and `--print=runtime-cache` says why there is no directory (exit 1).
+#[test]
+fn an_empty_cache_dir_disables_the_runtime_cache() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!("an_empty_cache_dir_disables_the_runtime_cache: no link toolchain - skipped");
+        return;
+    }
+    let (tmp, _cache) = cache_scratch("disabled");
+    let (trace, ran) = cached_link(Path::new(""), &tmp, "private");
+    assert_eq!(ran, expected_run());
+    assert!(trace.contains("runtime cache: not cached"), "{trace}");
+    let printed = outcome(traced(Path::new("")).arg("--print=runtime-cache"));
+    assert_eq!(printed.0, Some(1), "{}", printed.2);
+    assert!(printed.1.is_empty());
+    assert!(printed.2.contains("disabled"), "{}", printed.2);
+    let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
 }

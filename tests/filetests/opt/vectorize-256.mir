@@ -1,0 +1,54 @@
+; REQUIRES: vec-kernels
+; RUN: wukongc --emit=mir --target-cpu=x86-64-v3 --passes=vectorize %s | filecheck %s
+; RUN: wukongc --emit=mir --target-cpu=x86-64-v2 --passes=vectorize %s \
+; RUN:   | filecheck %s --check-prefix=V2
+;
+; At x86-64-v3, on a host that assembles the raw-AVX2 loop kernels, the vectorizer first hands a
+; long enough run of the loop (a multiple of 8 f32 lanes, above a minimum trip count) to a
+; synthesized 256-bit kernel (`veckernel`, a `VecKernelCall`): its pointer operands and scalars are
+; marshalled through two small slots. The 128-bit vector loop and the scalar loop follow, for what
+; is left. At x86-64-v2 no kernel is built.
+
+; CHECK-LABEL: fn axpy(
+; CHECK:       bb0(
+; CHECK-DAG:     [[PTRS:v[0-9]+]] = alloca [2 x ptr]
+; CHECK-DAG:     [[SCALARS:v[0-9]+]] = alloca [1 x f32]
+; The kernel's share: the trip count rounded down to a multiple of 8.
+; CHECK:         const.i64 -8
+; CHECK:         [[KN:v[0-9]+]] = select
+; CHECK:         store {{v[0-9]+}}, {{v[0-9]+}}
+; CHECK:         store {{v[0-9]+}}, {{v[0-9]+}}
+; CHECK:         store v2, {{v[0-9]+}}
+; CHECK-NEXT:    veckernel #0(ptrs=[[PTRS]], scalars=[[SCALARS]], n=[[KN]])
+; Then the 128-bit loop, then the scalar one.
+; CHECK:         const.i64 -4
+; CHECK:         load <4 x f32>
+; CHECK:         fmul
+; CHECK:         br bb1(
+; CHECK-NOT:     veckernel
+;
+; V2-LABEL: fn axpy(
+; V2-NOT:     veckernel
+; V2-NOT:     alloca
+; V2:         load <4 x f32>
+fn axpy(v0 ptr noalias, v1 ptr noalias, v2 f32, v3 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 i64):
+    v4: i64 = const.i64 0
+    br bb1(v4)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v3
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fmul v8, v2
+    v10: ptr = gep v1, v5 : f32
+    v11: f32 = load f32 v10
+    v12: f32 = fadd v9, v11
+    store v12, v10
+    v13: i64 = const.i64 1
+    v14: i64 = add v5, v13
+    br bb1(v14)
+  bb3:
+    ret
+}

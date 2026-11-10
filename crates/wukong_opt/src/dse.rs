@@ -214,7 +214,8 @@ impl Pass for Dse {
                             )
                         });
                     }
-                    Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
+                    // Any other reader: a call of any kind or an atomic add (`Op::effects`).
+                    op if op.may_read_memory() => {
                         // A call may read through any pointer it was given, or any pointer reachable
                         // from one — but never a stack slot of this function that never escaped.
                         // An atomic add reads its own location, which is escaped by construction.
@@ -367,7 +368,7 @@ impl PathSearch {
                             return false;
                         }
                     }
-                    Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
+                    op if op.may_read_memory() => {
                         if !alias.is_private_stack(ptr) {
                             return false;
                         }

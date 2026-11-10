@@ -1,0 +1,24 @@
+// EXPECT-CODE: E0411
+// EXPECT-COUNT: 1
+module tests.fail.fn_value_const
+
+// A `const` initializer is not one stored value: it is evaluated again at every use. A function
+// value made there escaped the analyses that must see every function used as a value (a
+// recognized kernel called through `MM` ran without its aliasing guard) and named its function in
+// the scope of each use. Bind the function with `let` where it is used.
+
+fn mm(a: [f32; 4], mut c: [f32; 4]) {
+    for i in 0..4 {
+        c[i] = a[i] * 2.0;
+    }
+}
+
+const MM: fn([f32; 4], [f32; 4]) = mm; //~ E0411
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0; 4];
+    let f = MM;
+    f(x, x);
+    print(x[0]);
+    return 0;
+}

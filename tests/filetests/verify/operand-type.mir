@@ -1,0 +1,10 @@
+; RUN: not wukongc --emit=mir --verify-each %s 2>&1 | filecheck %s
+;
+; Binary operations take two operands of the result's type: no implicit widening in MIR.
+
+; CHECK: internal compiler error (MIR verify): add: v0 has type i32 but expected i64
+fn f(v0 i32, v1 i64) -> i64 {
+  bb0(v0 i32, v1 i64):
+    v2: i64 = add v0, v1
+    ret v2
+}

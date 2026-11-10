@@ -1,0 +1,72 @@
+; RUN: wukongc --emit=mir --passes=jump-thread %s | filecheck %s
+;
+; `jump-thread` sends an edge whose destination's branch it already decides to a private copy of
+; that destination, which jumps straight to the decided successor. The decision comes from a
+; constant edge argument, or from a compare of the same two values the predecessor's own branch
+; already made.
+
+; The edge from bb1 carries the constant true into bb3's branch condition.
+; CHECK-LABEL: fn flag_edge(
+; CHECK:       bb1:
+; CHECK-NOT:     br bb3
+; CHECK:         br [[COPY:bb[0-9]+]]{{$}}
+; CHECK:       bb2:
+; CHECK:         br bb3(
+; CHECK:       bb4:
+; CHECK-NEXT:    const.i32 10
+; CHECK:       [[COPY]]:
+; CHECK-NEXT:    br bb4{{$}}
+fn flag_edge(v0 i32, v1 i1) -> i32 {
+  bb0(v0 i32, v1 i1):
+    cond_br v1, bb1, bb2
+  bb1:
+    v2: i1 = const.i1 1
+    br bb3(v2)
+  bb2:
+    v3: i32 = const.i32 0
+    v4: i1 = cmp.sgt v0, v3
+    br bb3(v4)
+  bb3(v5 i1):
+    cond_br v5, bb4, bb5
+  bb4:
+    v6: i32 = const.i32 10
+    ret v6
+  bb5:
+    v7: i32 = const.i32 20
+    ret v7
+}
+
+; bb3 re-tests `v0 < v1`, which each arm of bb0's branch already knows: both edges are threaded,
+; and no path tests it twice.
+; CHECK-LABEL: fn implied(
+; CHECK:         cond_br {{v[0-9]+}}, bb1, bb2
+; CHECK:       bb1:
+; CHECK-NEXT:    br [[T:bb[0-9]+]]{{$}}
+; CHECK:       bb2:
+; CHECK-NEXT:    br [[F:bb[0-9]+]]{{$}}
+; CHECK:       [[X:bb[0-9]+]]:
+; CHECK-NEXT:    ret v0
+; CHECK:       [[Y:bb[0-9]+]]:
+; CHECK-NEXT:    ret v1
+; CHECK:       [[T]]:
+; CHECK-NOT:     cond_br
+; CHECK:         br [[X]]{{$}}
+; CHECK:       [[F]]:
+; CHECK-NOT:     cond_br
+; CHECK:         br [[Y]]{{$}}
+fn implied(v0 i32, v1 i32) -> i32 {
+  bb0(v0 i32, v1 i32):
+    v2: i1 = cmp.slt v0, v1
+    cond_br v2, bb1, bb2
+  bb1:
+    br bb3
+  bb2:
+    br bb3
+  bb3:
+    v3: i1 = cmp.slt v0, v1
+    cond_br v3, bb4, bb5
+  bb4:
+    ret v0
+  bb5:
+    ret v1
+}

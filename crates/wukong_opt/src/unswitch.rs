@@ -387,12 +387,12 @@ fn clonable(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> Option<bool> 
         }
         for inst in &blk.insts {
             n += 1;
-            match inst.op {
+            match &inst.op {
                 Op::Call { .. } => has_calls = true,
-                Op::Alloca { .. }
-                | Op::VecKernelCall { .. }
-                | Op::Barrier
-                | Op::AtomicAdd { .. } => return None,
+                // An allocation, or any other effect but a plain store (`Op::effects`): a vector
+                // kernel, an indirect call, a barrier, an atomic.
+                Op::Alloca { .. } => return None,
+                op if op.has_side_effects() && !matches!(op, Op::Store { .. }) => return None,
                 _ => {}
             }
             if inst.result.is_some_and(|r| f.value_type(r).is_vector()) {

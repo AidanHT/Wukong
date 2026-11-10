@@ -1,0 +1,183 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 15
+// EXPECT-OUT: 11
+// EXPECT-OUT: -11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 42
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 25
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: -8
+// EXPECT-OUT: 27
+// EXPECT-OUT: 0
+// EXPECT-OUT: 125
+// EXPECT-OUT: -1
+// EXPECT-OUT: 8
+// EXPECT-OUT: 49
+// EXPECT-OUT: 512
+// EXPECT-OUT: 7
+// EXPECT-OUT: 81
+// EXPECT-OUT: 81
+// EXPECT-OUT: 16
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 8
+// EXPECT-OUT: 27
+// EXPECT-OUT: 64
+// EXPECT-OUT: 125
+// EXPECT-OUT: 216
+// EXPECT-OUT: 343
+module tests.run.fn_values_dispatch
+
+// Dispatch through function values chosen at run time. Expectations by hand:
+//   execute: a dispatch table [add, mul, sub, neg] indexed by each instruction's op, the
+//     accumulator printed after every instruction, from 0:
+//     add 5 -> 5; mul 3 -> 15; sub 4 -> 11; neg -> -11; mul -2 -> 22; add 20 -> 42
+//   map6 with a run-time function value from the table [sq, cube] over xs = [1, -2, 3, 0, 5, -1],
+//     every lane: sq -> 1 4 9 0 25 1; cube -> 1 -8 27 0 125 -1
+//   collatz_len(6) with the step function passed at run time:
+//     6 3 10 5 16 8 4 2 1 is 8 steps                                         = 8
+//   keep(sq): a function-typed parameter bound at compile time, stored as a value: sq(7) = 49
+//   by_name(1) = cube: cube(8) = 512; by_name(2) = the identity closure: 7
+//   outer forwards its parameter to apply_twice: given sq at compile time and given the
+//     run-time value fs[0] = sq, both compute sq(sq(3))                       = 81, 81
+//   the identity closure from by_name passed on at run time: apply_twice(id, 16) = 16
+//   fill8 is `@parallel`, but its loop calls a run-time function value (fs[1] = cube), which
+//     the region proof cannot see, so it runs serially: every lane, cube(0..8)
+//     = 0 1 8 27 64 125 216 343
+
+struct Instr {
+    op: i32,
+    arg: i32,
+}
+
+struct Holder {
+    f: fn(i32) -> i32,
+}
+
+fn op_add(acc: i64, x: i64) -> i64 {
+    return acc + x;
+}
+
+fn op_mul(acc: i64, x: i64) -> i64 {
+    return acc * x;
+}
+
+fn op_sub(acc: i64, x: i64) -> i64 {
+    return acc - x;
+}
+
+fn op_neg(acc: i64, _x: i64) -> i64 {
+    return 0 - acc;
+}
+
+fn execute(table: [fn(i64, i64) -> i64; 4], prog: [Instr; 6]) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..6 {
+        let ins = prog[i];
+        acc = table[ins.op](acc, ins.arg as i64);
+        print(acc);
+    }
+    return acc;
+}
+
+fn sq(x: i32) -> i32 {
+    return x * x;
+}
+
+fn cube(x: i32) -> i32 {
+    return x * x * x;
+}
+
+fn map6(f: fn(i32) -> i32, xs: [i32; 6], mut out: [i32; 6]) {
+    for i in 0..6 {
+        out[i] = f(xs[i]);
+    }
+}
+
+fn collatz(n: i64) -> i64 {
+    if n % 2 == 0 {
+        return n / 2;
+    }
+    return 3 * n + 1;
+}
+
+fn collatz_len(start: i64, next: fn(i64) -> i64) -> i32 {
+    let mut n = start;
+    let mut steps = 0;
+    while n != 1 {
+        n = next(n);
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+fn keep(f: fn(i32) -> i32) -> Holder {
+    return Holder { f: f };
+}
+
+fn by_name(c: i32) -> fn(i32) -> i32 {
+    return match c {
+        0 => sq,
+        1 => cube,
+        _ => |x: i32| x,
+    };
+}
+
+fn apply_twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(f(x));
+}
+
+fn outer(f: fn(i32) -> i32, x: i32) -> i32 {
+    return apply_twice(f, x);
+}
+
+@parallel
+fn fill8(mut out: [i32; 8], f: fn(i32) -> i32) {
+    for i in 0..8 {
+        out[i] = f(i);
+    }
+}
+
+fn main() -> i32 {
+    let table: [fn(i64, i64) -> i64; 4] = [op_add, op_mul, op_sub, op_neg];
+    let prog: [Instr; 6] = [
+        Instr { op: 0, arg: 5 },
+        Instr { op: 1, arg: 3 },
+        Instr { op: 2, arg: 4 },
+        Instr { op: 3, arg: 0 },
+        Instr { op: 1, arg: -2 },
+        Instr { op: 0, arg: 20 },
+    ];
+    let total = execute(table, prog);
+    let xs: [i32; 6] = [1, -2, 3, 0, 5, -1];
+    let mut out: [i32; 6] = [0; 6];
+    let fs: [fn(i32) -> i32; 2] = [sq, cube];
+    for j in 0..2 {
+        map6(fs[j], xs, out);
+        for i in 0..6 {
+            print(out[i]);
+        }
+    }
+    print(collatz_len(6, collatz));
+    let h = keep(sq);
+    print(h.f(7));
+    print(by_name(1)(8));
+    let id = by_name(2);
+    print(id(7));
+    print(outer(sq, 3));
+    print(outer(fs[0], 3));
+    print(apply_twice(id, 16));
+    let mut o8: [i32; 8] = [0; 8];
+    fill8(o8, fs[1]);
+    for i in 0..8 {
+        print(o8[i]);
+    }
+    return (total - 42) as i32;
+}

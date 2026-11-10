@@ -12,7 +12,8 @@ cargo run -p wukongc -- --run examples/<name>.wk
 ```
 
 Inspect any stdout-printing stage with `--emit=tokens|ast|mir-high|mir|grad|llvm-ir` (only
-`--emit=obj` and `--emit=exe` write a file, via `-o`), e.g.:
+`--emit=obj` and `--emit=exe` write a file, via `-o`; the first `--emit=exe` builds the runtime half
+of the link into the AOT runtime cache, `wukongc --print=runtime-cache`, and later ones reuse it), e.g.:
 
 ```sh
 cargo run -p wukongc -- --emit=mir -O3 examples/dot.wk

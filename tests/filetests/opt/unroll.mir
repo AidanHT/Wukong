@@ -1,0 +1,76 @@
+; RUN: wukongc --emit=mir --passes=unroll %s | filecheck %s
+;
+; The `unroll` step unrolls a counted two-block loop: completely when its exact trip count is small,
+; otherwise four iterations per trip of a main loop guarded so its bound cannot wrap, followed by
+; a one-at-a-time remainder loop. Its cleanup sweep (simplify, simplify-cfg, simplify-phis, cse,
+; dce) then folds the copies.
+
+; Exactly four iterations: straight-line code, x[0] + x[1] + x[2] + x[3], with no loop left.
+; CHECK-LABEL: fn sum4(
+; CHECK-NOT:     cond_br
+; CHECK:         [[A:v[0-9]+]] = load i64 v0
+; CHECK:         [[B:v[0-9]+]] = load i64
+; CHECK-NEXT:    [[AB:v[0-9]+]] = add [[A]], [[B]]
+; CHECK:         [[C:v[0-9]+]] = load i64
+; CHECK-NEXT:    [[ABC:v[0-9]+]] = add [[AB]], [[C]]
+; CHECK:         [[D:v[0-9]+]] = load i64
+; CHECK-NEXT:    [[ABCD:v[0-9]+]] = add [[ABC]], [[D]]
+; CHECK-NEXT:    ret [[ABCD]]
+; CHECK-NOT:     br
+fn sum4(v0 ptr) -> i64 {
+  bb0(v0 ptr):
+    v1: i64 = const.i64 0
+    v4: i64 = const.i64 4
+    v9: i64 = const.i64 1
+    br bb1(v1, v1)
+  bb1(v2 i64, v3 i64):
+    v5: i1 = cmp.slt v2, v4
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: ptr = gep v0, v2 : i64
+    v7: i64 = load i64 v6
+    v8: i64 = add v3, v7
+    v10: i64 = add v2, v9
+    br bb1(v10, v8)
+  bb3:
+    ret v3
+}
+
+; An unknown trip count n. The main loop runs while i < n - 3; when n - 3 would wrap below the
+; smallest i64, the bound is that smallest value instead, so the main loop never runs past n.
+; CHECK-LABEL: fn sum_n(
+; CHECK:         [[THREE:v[0-9]+]] = const.i64 3
+; CHECK-NEXT:    [[LIM:v[0-9]+]] = sub v1, [[THREE]]
+; CHECK-NEXT:    [[NOWRAP:v[0-9]+]] = cmp.slt [[LIM]], v1
+; CHECK-NEXT:    [[FLOOR:v[0-9]+]] = const.i64 -9223372036854775808
+; CHECK-NEXT:    [[BOUND:v[0-9]+]] = select [[NOWRAP]], [[LIM]], [[FLOOR]]
+; CHECK:       bb1([[I:v[0-9]+]] i64, [[ACC:v[0-9]+]] i64):
+; CHECK-NEXT:    [[GO:v[0-9]+]] = cmp.slt [[I]], [[BOUND]]
+; CHECK-NEXT:    cond_br [[GO]], bb2, [[REM:bb[0-9]+]]([[I]], [[ACC]])
+; CHECK:       bb2:
+; CHECK-COUNT-4: load i64
+; CHECK-NOT:     load
+; CHECK:         br bb1(
+; The remainder loop takes over the counter and the sum, one element per trip, up to n.
+; CHECK:       [[REM]]([[J:v[0-9]+]] i64, {{v[0-9]+}} i64):
+; CHECK-NEXT:    cmp.slt [[J]], v1
+; CHECK:         load i64
+; CHECK-NOT:     load
+; CHECK:         br [[REM]](
+fn sum_n(v0 ptr, v1 i64) -> i64 {
+  bb0(v0 ptr, v1 i64):
+    v2: i64 = const.i64 0
+    br bb1(v2, v2)
+  bb1(v3 i64, v4 i64):
+    v5: i1 = cmp.slt v3, v1
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: ptr = gep v0, v3 : i64
+    v7: i64 = load i64 v6
+    v8: i64 = add v4, v7
+    v9: i64 = const.i64 1
+    v10: i64 = add v3, v9
+    br bb1(v10, v8)
+  bb3:
+    ret v4
+}

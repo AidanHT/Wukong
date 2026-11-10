@@ -1,0 +1,101 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 30
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 119
+// EXPECT-OUT: 103
+// EXPECT-OUT: wukong
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+module tests.run.closure_capture_views
+
+// A closure captures a slice or a `str` as its 16-byte fat pointer `(data, len)`: the copy is
+// another view of the same elements, exactly what passing it to a parameter makes. Expectations by
+// hand, with xs = [1, 2, 3, 4] on the heap:
+//   map4(|i| xs[i] * 2), every lane                                            = 2, 4, 6, 8
+//   apply_i(|_| xs.len() * 2 + 2, 0) reads the length through the captured view = 4 * 2 + 2 = 10
+//   each(|i| xs[i] = xs[i] + 1) writes through the view (a by-reference capture of xs), and the
+//     enclosing function sees every lane                                       = 2, 3, 4, 5
+//   sum_of(ys), ys = [5, 10, 15] a slice parameter captured by fold's closure  = 30
+//   pick copies view (= arr = [0.5, 1.5, 2.5], unsized to []f32) at its `let`; view is
+//     reassigned to [9, 9, 9] afterwards, and pick keeps the view it copied: pick(1) = 1.5
+//   name = "wukong" (w u k o n g): its length 6; bytes 0 and 5 ('w', 'g')      = 6, 119, 103
+//   printed as text from inside a closure                                      = wukong
+//   tail = name[3..6] = "ong" (111, 110, 103), a view into the same bytes: a closure counting
+//     the bytes below 'p' = 112 so far, after each byte                        = 1, 2, 3
+
+fn map4(f: fn(i32) -> f32) {
+    for i in 0..4 {
+        print(f(i));
+    }
+}
+
+fn apply_i(f: fn(i32) -> i64, x: i32) -> i64 {
+    return f(x);
+}
+
+fn each(f: fn(i32), n: i32) {
+    for i in 0..n {
+        f(i);
+    }
+}
+
+fn fold(f: fn(i32, i32) -> i32, n: i32) -> i32 {
+    let mut acc = 0;
+    for i in 0..n {
+        acc = f(acc, i);
+    }
+    return acc;
+}
+
+fn sum_of(ys: []i32) -> i32 {
+    return fold(|acc, i| acc + ys[i], ys.len() as i32);
+}
+
+fn main() -> i32 {
+    let xs = alloc_f32(4);
+    for i in 0..4 {
+        xs[i] = (i + 1) as f32;
+    }
+    map4(|i| xs[i] * 2.0);
+    print(apply_i(|_i| xs.len() * 2 + 2, 0));
+    each(|i| { xs[i] = xs[i] + 1.0; }, 4);
+    for i in 0..4 {
+        print(xs[i]);
+    }
+    let ys: [i32; 3] = [5, 10, 15];
+    print(sum_of(ys));
+    let arr: [f32; 3] = [0.5, 1.5, 2.5];
+    let other: [f32; 3] = [9.0, 9.0, 9.0];
+    let mut view: []f32 = arr;
+    let pick = |i: i32| -> f32 { view[i] };
+    view = other;
+    print(pick(1));
+    let name: str = "wukong";
+    let show = |i: i32| -> i32 { name[i] as i32 };
+    print(name.len());
+    print(show(0));
+    print(show(5));
+    each(|_i| { println(name); }, 1);
+    let tail = name[3..6];
+    let mut below = 0;
+    each(|i| {
+        if (tail[i] as i32) < 112 {
+            below = below + 1;
+        }
+        print(below);
+    }, 3);
+    free(xs);
+    return 0;
+}

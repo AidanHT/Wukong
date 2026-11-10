@@ -1,0 +1,17 @@
+; RUN: not wukongc --emit=mir %S/Inputs/unknown-op.mir 2>&1 | filecheck %s --check-prefix=OP
+; RUN: not wukongc --emit=mir %S/Inputs/untyped-result.mir 2>&1 | filecheck %s --check-prefix=UNTYPED
+; RUN: not wukongc --emit=mir %S/Inputs/unknown-type.mir 2>&1 | filecheck %s --check-prefix=TYPE
+; RUN: not wukongc --emit=mir %S/Inputs/veckernel.mir 2>&1 | filecheck %s --check-prefix=VECKERNEL
+; RUN: not wukongc --emit=mir %S/Inputs/unclosed.mir 2>&1 | filecheck %s --check-prefix=UNCLOSED
+;
+; A `.mir` input that does not parse is `<file>:<line>: invalid MIR: <why>`, exit 1. The inputs
+; live in Inputs/ (support files the harness never runs as tests), one error each; this file is
+; only their RUN lines and checks.
+
+; OP:        error: {{.*}}unknown-op.mir:3: invalid MIR: unknown operation `frobnicate`
+; UNTYPED:   error: {{.*}}untyped-result.mir:3: invalid MIR: `v1` has no type annotation
+; UNTYPED-SAME: (dump with --emit=mir-text, not --emit=mir)
+; TYPE:      error: {{.*}}unknown-type.mir:3: invalid MIR: unknown type `i33`
+; VECKERNEL: error: {{.*}}veckernel.mir:3: invalid MIR: vector-kernel recipes have no textual form;
+; VECKERNEL-SAME: dump with --target-cpu=x86-64-v2
+; UNCLOSED:  error: {{.*}}unclosed.mir:3: invalid MIR: function `f` is not closed with `}`

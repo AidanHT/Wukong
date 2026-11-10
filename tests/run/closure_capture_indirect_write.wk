@@ -1,0 +1,120 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 33
+// EXPECT-OUT: 44
+// EXPECT-OUT: 8
+// EXPECT-OUT: 21
+// EXPECT-OUT: 42
+// EXPECT-OUT: 63
+// EXPECT-OUT: 84
+// EXPECT-OUT: 31
+// EXPECT-OUT: 62
+// EXPECT-OUT: 93
+// EXPECT-OUT: 124
+// EXPECT-OUT: 41
+// EXPECT-OUT: 82
+// EXPECT-OUT: 123
+// EXPECT-OUT: 164
+// EXPECT-OUT: 51
+// EXPECT-OUT: 102
+// EXPECT-OUT: 153
+// EXPECT-OUT: 204
+// EXPECT-OUT: 61
+// EXPECT-OUT: 122
+// EXPECT-OUT: 183
+// EXPECT-OUT: 244
+// EXPECT-OUT: 620
+module tests.run.closure_capture_indirect_write
+
+// An aggregate a closure passes to a call through a function value is captured BY REFERENCE: a
+// function type does not say which parameters are `mut`, and an aggregate is passed by reference,
+// so the function the value holds may write it in place exactly as `bump(a)` written directly
+// does. It used to be captured by copy, and the write landed in the closure's private copy (every
+// lane below stayed 1, 2, 3, 4). Expectations by hand: `bump` adds 10, 20, 30, 40 to the four
+// lanes, once per call, starting from a = [1, 2, 3, 4]:
+//   a call's result     pick()(a), apply returns 7        -> 7;   a = 11, 22, 33, 44
+//   a captured `let`    f(a), apply returns 7 + 1         -> 8;   a = 21, 42, 63, 84
+//   a struct field      o.op(a)                                    a = 31, 62, 93, 124
+//   an array element    ops[0](a)                                  a = 41, 82, 123, 164
+//   a closure's own function-typed parameter, bound to `bump` by `apply_w`
+//                       g(a)                                       a = 51, 102, 153, 204
+//   a `let`-bound closure calling f(a), called once               a = 61, 122, 183, 244
+//   the sum through a read-only function value, s(a) + 10 = (61 + 122 + 183 + 244) + 10 = 620
+
+struct Ops {
+    op: fn([i32; 4]),
+}
+
+fn bump(mut a: [i32; 4]) {
+    a[0] = a[0] + 10;
+    a[1] = a[1] + 20;
+    a[2] = a[2] + 30;
+    a[3] = a[3] + 40;
+}
+
+fn sum4(a: [i32; 4]) -> i32 {
+    return a[0] + a[1] + a[2] + a[3];
+}
+
+fn pick() -> fn([i32; 4]) {
+    return bump;
+}
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn apply_w(f: fn(fn([i32; 4]), i32) -> i32, x: i32) -> i32 {
+    return f(bump, x);
+}
+
+fn show(a: [i32; 4]) {
+    print(a[0]);
+    print(a[1]);
+    print(a[2]);
+    print(a[3]);
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 4] = [1, 2, 3, 4];
+    print(apply(|x| {
+        pick()(a);
+        x
+    }, 7));
+    show(a);
+    let f: fn([i32; 4]) = bump;
+    print(apply(|x| {
+        f(a);
+        x + 1
+    }, 7));
+    show(a);
+    let o = Ops { op: bump };
+    apply(|x| {
+        o.op(a);
+        x
+    }, 0);
+    show(a);
+    let ops: [fn([i32; 4]); 1] = [bump];
+    apply(|x| {
+        ops[0](a);
+        x
+    }, 0);
+    show(a);
+    apply_w(|g, x| {
+        g(a);
+        x
+    }, 0);
+    show(a);
+    let c = |x: i32| {
+        f(a);
+        x
+    };
+    c(0);
+    show(a);
+    let s: fn([i32; 4]) -> i32 = sum4;
+    print(apply(|x| s(a) + x, 10));
+    return 0;
+}

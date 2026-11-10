@@ -1,0 +1,83 @@
+; RUN: wukongc --emit=mir --passes=form-switches %s | filecheck %s
+;
+; `form-switches` turns a chain of four or more equality tests of one integer against constants
+; into a single `switch` terminator, the chain's final else as its default. A shorter chain stays
+; a chain of compares.
+
+; CHECK-LABEL: fn four_cases(
+; CHECK-NEXT:    bb0(v0 i32):
+; CHECK-NEXT:    switch v0, [[DEFAULT:bb[0-9]+]] [1: [[B1:bb[0-9]+]], 2: [[B2:bb[0-9]+]], 3: [[B3:bb[0-9]+]], 4: [[B4:bb[0-9]+]]]
+; CHECK-NOT:     cmp.eq
+; CHECK:       [[B1]]:
+; CHECK-NEXT:    const.i32 10
+; CHECK:       [[B2]]:
+; CHECK-NEXT:    const.i32 20
+; CHECK:       [[B3]]:
+; CHECK-NEXT:    const.i32 30
+; CHECK:       [[B4]]:
+; CHECK-NEXT:    const.i32 40
+; CHECK:       [[DEFAULT]]:
+; CHECK-NEXT:    const.i32 0
+fn four_cases(v0 i32) -> i32 {
+  bb0(v0 i32):
+    v1: i32 = const.i32 1
+    v2: i1 = cmp.eq v0, v1
+    cond_br v2, bb1, bb2
+  bb1:
+    v3: i32 = const.i32 10
+    ret v3
+  bb2:
+    v4: i32 = const.i32 2
+    v5: i1 = cmp.eq v0, v4
+    cond_br v5, bb3, bb4
+  bb3:
+    v6: i32 = const.i32 20
+    ret v6
+  bb4:
+    v7: i32 = const.i32 3
+    v8: i1 = cmp.eq v0, v7
+    cond_br v8, bb5, bb6
+  bb5:
+    v9: i32 = const.i32 30
+    ret v9
+  bb6:
+    v10: i32 = const.i32 4
+    v11: i1 = cmp.eq v0, v10
+    cond_br v11, bb7, bb8
+  bb7:
+    v12: i32 = const.i32 40
+    ret v12
+  bb8:
+    v13: i32 = const.i32 0
+    ret v13
+}
+
+; CHECK-LABEL: fn three_cases(
+; CHECK-NOT:     switch
+; CHECK-COUNT-3: cmp.eq v0,
+fn three_cases(v0 i32) -> i32 {
+  bb0(v0 i32):
+    v1: i32 = const.i32 1
+    v2: i1 = cmp.eq v0, v1
+    cond_br v2, bb1, bb2
+  bb1:
+    v3: i32 = const.i32 10
+    ret v3
+  bb2:
+    v4: i32 = const.i32 2
+    v5: i1 = cmp.eq v0, v4
+    cond_br v5, bb3, bb4
+  bb3:
+    v6: i32 = const.i32 20
+    ret v6
+  bb4:
+    v7: i32 = const.i32 3
+    v8: i1 = cmp.eq v0, v7
+    cond_br v8, bb5, bb6
+  bb5:
+    v9: i32 = const.i32 30
+    ret v9
+  bb6:
+    v10: i32 = const.i32 0
+    ret v10
+}

@@ -1,0 +1,105 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 106
+// EXPECT-OUT: 108
+// EXPECT-OUT: 110
+// EXPECT-OUT: 113
+// EXPECT-OUT: 312
+// EXPECT-OUT: 97
+// EXPECT-OUT: 98
+// EXPECT-OUT: 96
+// EXPECT-OUT: 94
+// EXPECT-OUT: 92
+// EXPECT-OUT: -12
+// EXPECT-OUT: 105
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 112
+module tests.run.fn_values_captured
+
+// A closure that captures a run-time function value, passed to a higher-order function. The
+// lifted closure takes its captures first (`k`, `g`, ..), then its own parameters, and a
+// function-typed capture makes it a function the compiler instantiates per binding. A call
+// through the higher-order function's parameter passes the closure's environment ahead of the
+// call's own arguments; the instance collector used to line the call's arguments up against the
+// lifted closure's parameters without that environment, so the closure was never instantiated and
+// the call named a function that was never compiled (`apply(|x| k + g(x), 3)` with `g` second).
+// Expectations by hand, with g = twice, h = neg, k = 100:
+//   apply(|x| k + g(x), 3)                = 100 + 6                              = 106
+//   apply(c, 4), c = |x| k + g(x)         = 100 + 8                              = 108
+//   apply(|x| g(x) + k, 5)                = 10 + 100                             = 110
+//   apply2(|a, b| g(a) + h(b) + k, 7, 1)  = 14 - 1 + 100                         = 113
+//   apply_twice(|x| g(x) + k, 3)          = L(3) = 106, L(106) = 212 + 100       = 312
+//   forward(|x| k - g(x), 2)              = apply(L, 2) + 1 = 96 + 1             = 97
+//   map4(|x| k - g(x), [1, 2, 3, 4])      = 98, 96, 94, 92 (every lane)
+//   m = neg (chosen at run time), apply(|x| m(x) * 3, 4) = -4 * 3                = -12
+//   with(|a, y| a(|x| x + k, y), 5)       = apply(|x| x + 100, 5)                = 105
+//   ap = apply (a run-time value), ap(|x| x + 1, 3) (captures nothing)           = 4
+//   ap(dbl, 3), dbl = |x| x * 2 (captures nothing)                               = 6
+//   apply(|x| k + apply(g, x), 6)         = 100 + 12                             = 112
+
+fn twice(x: i32) -> i32 {
+    return x * 2;
+}
+
+fn neg(x: i32) -> i32 {
+    return 0 - x;
+}
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn apply2(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 {
+    return f(a, b);
+}
+
+fn apply_twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(f(x));
+}
+
+fn forward(f: fn(i32) -> i32, x: i32) -> i32 {
+    return apply(f, x) + 1;
+}
+
+fn map4(f: fn(i32) -> i32, xs: [i32; 4]) -> [i32; 4] {
+    let mut out: [i32; 4] = [0; 4];
+    for i in 0..4 {
+        out[i] = f(xs[i]);
+    }
+    return out;
+}
+
+fn with(h: fn(fn(fn(i32) -> i32, i32) -> i32, i32) -> i32, k: i32) -> i32 {
+    return h(apply, k);
+}
+
+fn main() -> i32 {
+    let g: fn(i32) -> i32 = twice;
+    let k = 100;
+    print(apply(|x| k + g(x), 3));
+    let c = |x: i32| k + g(x);
+    print(apply(c, 4));
+    print(apply(|x| g(x) + k, 5));
+    let h: fn(i32) -> i32 = neg;
+    print(apply2(|a, b| g(a) + h(b) + k, 7, 1));
+    print(apply_twice(|x| g(x) + k, 3));
+    print(forward(|x| k - g(x), 2));
+    let ys = map4(|x| k - g(x), [1, 2, 3, 4]);
+    print(ys[0]);
+    print(ys[1]);
+    print(ys[2]);
+    print(ys[3]);
+    let mut m: fn(i32) -> i32 = twice;
+    if k > 50 {
+        m = neg;
+    }
+    print(apply(|x| m(x) * 3, 4));
+    print(with(|a: fn(fn(i32) -> i32, i32) -> i32, y: i32| a(|x| x + k, y), 5));
+    let ap: fn(fn(i32) -> i32, i32) -> i32 = apply;
+    print(ap(|x| x + 1, 3));
+    let dbl = |x: i32| x * 2;
+    print(ap(dbl, 3));
+    print(apply(|x| k + apply(g, x), 6));
+    return 0;
+}

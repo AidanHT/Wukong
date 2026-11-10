@@ -81,7 +81,10 @@ The module implements the interpreter's language, not LLVM's defaults:
   decimals that are inexact in `float` are all valid IR;
 - `atomic_add(place, v)` (MIR `atomic.add`) is one `atomicrmw add ptr P, iN V seq_cst` whose old
   value is named and never read — wrapping integer addition, sequentially consistent, exactly the
-  interpreter's add-and-mask and the Cranelift `atomic_rmw add`.
+  interpreter's add-and-mask and the Cranelift `atomic_rmw add`;
+- a call through a function value (MIR `call_indirect`) is a `call T %f(..)` through the `ptr`,
+  typed by the MIR signature (the argument types and the result), and a function's address is an
+  identity `getelementptr` of `@name`.
 
 It names the host's `target datalayout` and `target triple` (x86-64 Windows: `e-m:w-…` /
 `x86_64-pc-windows-msvc`; x86-64 Linux: `e-m:e-…` / `x86_64-unknown-linux-gnu`). The layout is the
@@ -214,11 +217,12 @@ wukongc --emit=exe -O2 examples/fib.wk   # -> fib.exe, via Cranelift + the rustc
 ./fib.exe                                   # prints 55 (main returns 0)
 ```
 
-`--emit=exe` also leaves the intermediate object `fib.o` beside the invocation — the same artifact
-`--emit=obj` produces. The *generated link inputs* (the Rust shim, or the C runtime on the fallback
-path) go into a temporary scratch directory keyed by pid and file stem and are deleted when the link
-finishes, so they stay out of your working directory and two concurrent links of the same stem cannot
-collide. Only if that scratch directory cannot be created does the driver fall back to the historical
-behaviour of writing them beside the invocation — and on that path the generated `{stem}_rt.c` is left
-behind (only the Rust shim is removed explicitly). Note `-o` is accepted only with `--emit=obj` or `--emit=exe`; every other stage prints its
-artifact on stdout.
+The intermediate object (the same artifact `--emit=obj` produces) and the empty driver crate rustc
+compiles to drive the link go into a temporary scratch directory keyed by pid and file stem and are
+deleted when the link finishes, so they stay out of your working directory and two concurrent links
+of the same stem cannot collide; only if that directory cannot be created are they written beside the
+invocation. The *runtime* link inputs — the generated Rust shim compiled against `wukong_runtime`
+(a fat-LTO static library for a release-profile runtime), or the C runtime compiled to an object on
+the fallback path — are built once into the AOT runtime cache and reused by every later link
+(`wukongc --print=runtime-cache`, `wukongc --clear-cache`). Note `-o` is accepted only with
+`--emit=obj` or `--emit=exe`; every other stage prints its artifact on stdout.

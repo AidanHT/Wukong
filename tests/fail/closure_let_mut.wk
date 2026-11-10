@@ -2,13 +2,15 @@
 // EXPECT-COUNT: 1
 module tests.fail.closure_let_mut
 
-// A closure-bound local names the one closure it is initialized with: calls through it are
-// resolved at compile time. A `mut` binding could be reassigned another closure at run time, so
-// it is rejected; bind each closure to a name of its own. tests/run/closure_let.wk is the positive
-// control.
+// A `let mut` binding holds a run-time function value, which is only the address of code. A
+// closure that captures nothing can be one (and the variable can then be reassigned), but this
+// one captures `k`, whose value would have nowhere to live. Bind it with a plain `let`, where
+// every call through the name is resolved at compile time. tests/run/closure_let.wk is the
+// positive control, tests/run/fn_values.wk the capture-free `let mut`.
 
 fn main() -> i32 {
-    let mut inc = |x: i32| x + 1; //~ E0422
+    let k = 1;
+    let mut inc = |x: i32| x + k; //~ E0422
     print(inc(1));
     return 0;
 }

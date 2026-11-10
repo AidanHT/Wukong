@@ -1,0 +1,94 @@
+; RUN: wukongc --emit=mir --passes=fuse %s | filecheck %s
+;
+; `fuse` merges two adjacent counted loops over the same range into one, the second body after the
+; first, when every cross-loop dependence keeps its order: the second loop may read what the first
+; wrote at the same or an earlier iteration, never a later one.
+
+; y[i] = x[i] + x[i], then z[i] = y[i] * y[i]: one loop, both bodies, indexed by one counter.
+; CHECK-LABEL: fn same_index(
+; CHECK:       bb1([[I:v[0-9]+]] i64):
+; CHECK-NEXT:    cmp.slt [[I]],
+; CHECK-NEXT:    cond_br
+; CHECK:       bb2:
+; CHECK:         fadd
+; CHECK:         store
+; CHECK:         gep v1, [[I]] : f32
+; CHECK:         fmul
+; CHECK:         gep v2, [[I]] : f32
+; CHECK:         store
+; CHECK-NOT:     cond_br
+fn same_index(v0 ptr noalias, v1 ptr noalias, v2 ptr noalias) -> void {
+  bb0(v0 ptr, v1 ptr, v2 ptr):
+    v3: i64 = const.i64 0
+    v4: i64 = const.i64 256
+    br bb1(v3)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v4
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fadd v8, v8
+    v10: ptr = gep v1, v5 : f32
+    store v9, v10
+    v11: i64 = const.i64 1
+    v12: i64 = add v5, v11
+    br bb1(v12)
+  bb3:
+    br bb4(v3)
+  bb4(v13 i64):
+    v14: i1 = cmp.slt v13, v4
+    cond_br v14, bb5, bb6
+  bb5:
+    v15: ptr = gep v1, v13 : f32
+    v16: f32 = load f32 v15
+    v17: f32 = fmul v16, v16
+    v18: ptr = gep v2, v13 : f32
+    store v17, v18
+    v19: i64 = const.i64 1
+    v20: i64 = add v13, v19
+    br bb4(v20)
+  bb6:
+    ret
+}
+
+; The second loop reads y[i + 1], which the first loop writes one iteration later: fused, it would
+; read the old value. Both loops stay.
+; CHECK-LABEL: fn read_ahead(
+; CHECK-COUNT-2: cond_br
+fn read_ahead(v0 ptr noalias, v1 ptr noalias, v2 ptr noalias) -> void {
+  bb0(v0 ptr, v1 ptr, v2 ptr):
+    v3: i64 = const.i64 0
+    v4: i64 = const.i64 255
+    br bb1(v3)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v4
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fadd v8, v8
+    v10: ptr = gep v1, v5 : f32
+    store v9, v10
+    v11: i64 = const.i64 1
+    v12: i64 = add v5, v11
+    br bb1(v12)
+  bb3:
+    br bb4(v3)
+  bb4(v13 i64):
+    v14: i1 = cmp.slt v13, v4
+    cond_br v14, bb5, bb6
+  bb5:
+    v21: i64 = const.i64 1
+    v22: i64 = add v13, v21
+    v15: ptr = gep v1, v22 : f32
+    v16: f32 = load f32 v15
+    v17: f32 = fmul v16, v16
+    v18: ptr = gep v2, v13 : f32
+    store v17, v18
+    v19: i64 = const.i64 1
+    v20: i64 = add v13, v19
+    br bb4(v20)
+  bb6:
+    ret
+}

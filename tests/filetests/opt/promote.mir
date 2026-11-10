@@ -1,0 +1,69 @@
+; RUN: wukongc --emit=mir --passes=promote,mem2reg %s | filecheck %s
+;
+; `promote` is scalar promotion: a loop-invariant location the loop both reads and writes, with no
+; other access that may alias it, is loaded once before the loop, carried through a fresh slot
+; and stored back on the exit; `mem2reg` turns that slot into a loop-carried value. (The pair runs
+; together as in the standard pipeline: on its own, `promote` would promote its own fresh slot
+; again on every fixpoint sweep.)
+
+; *v0 is a running sum over v1[0..n): one load before the loop (guarded like an invariant load:
+; a zero-trip loop reads a dummy slot), one store after it, none in the body.
+; CHECK-LABEL: fn accumulate(
+; CHECK:       bb0(
+; CHECK:         [[ADDR:v[0-9]+]] = select {{v[0-9]+}}, v0, {{v[0-9]+}}
+; CHECK-NEXT:    [[INIT:v[0-9]+]] = load f32 [[ADDR]]
+; CHECK-NEXT:    br bb1({{v[0-9]+}}, [[INIT]])
+; CHECK:       bb1({{v[0-9]+}} i64, [[SUM:v[0-9]+]] f32):
+; CHECK:       bb2:
+; CHECK-NOT:     load f32 v0
+; CHECK-NOT:     store
+; CHECK:         [[NEXT:v[0-9]+]] = fadd [[SUM]],
+; CHECK-NOT:     store
+; CHECK:         br bb1({{v[0-9]+}}, [[NEXT]])
+; CHECK:       bb3:
+; CHECK-NEXT:    store [[SUM]], [[ADDR]]
+; CHECK-NEXT:    ret
+fn accumulate(v0 ptr noalias, v1 ptr noalias, v2 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 i64):
+    v3: i64 = const.i64 0
+    br bb1(v3)
+  bb1(v4 i64):
+    v5: i1 = cmp.slt v4, v2
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: ptr = gep v1, v4 : f32
+    v7: f32 = load f32 v6
+    v8: f32 = load f32 v0
+    v9: f32 = fadd v8, v7
+    store v9, v0
+    v10: i64 = const.i64 1
+    v11: i64 = add v4, v10
+    br bb1(v11)
+  bb3:
+    ret
+}
+
+; Without `noalias`, v1[i] may be *v0: the sum stays in memory.
+; CHECK-LABEL: fn may_alias(
+; CHECK:       bb2:
+; CHECK:         load f32 v0
+; CHECK:         store {{v[0-9]+}}, v0
+fn may_alias(v0 ptr, v1 ptr, v2 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 i64):
+    v3: i64 = const.i64 0
+    br bb1(v3)
+  bb1(v4 i64):
+    v5: i1 = cmp.slt v4, v2
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: ptr = gep v1, v4 : f32
+    v7: f32 = load f32 v6
+    v8: f32 = load f32 v0
+    v9: f32 = fadd v8, v7
+    store v9, v0
+    v10: i64 = const.i64 1
+    v11: i64 = add v4, v10
+    br bb1(v11)
+  bb3:
+    ret
+}

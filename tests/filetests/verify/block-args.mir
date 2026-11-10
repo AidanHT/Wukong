@@ -1,0 +1,11 @@
+; RUN: not wukongc --emit=mir --verify-each %s 2>&1 | filecheck %s
+;
+; An edge passes exactly one argument per parameter of the block it enters.
+
+; CHECK: internal compiler error (MIR verify): branch to bb1 passes 2 args but the block has 1 parameters
+fn f(v0 i32) -> i32 {
+  bb0(v0 i32):
+    br bb1(v0, v0)
+  bb1(v1 i32):
+    ret v1
+}

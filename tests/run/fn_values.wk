@@ -1,0 +1,162 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 42
+// EXPECT-OUT: 2
+// EXPECT-OUT: 42
+// EXPECT-OUT: 10
+// EXPECT-OUT: 4
+// EXPECT-OUT: 21
+// EXPECT-OUT: 16
+// EXPECT-OUT: 10
+// EXPECT-OUT: -9
+// EXPECT-OUT: 20
+// EXPECT-OUT: 7
+// EXPECT-OUT: 10
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 40
+// EXPECT-OUT: 36
+// EXPECT-OUT: 106
+// EXPECT-OUT: 6
+module tests.run.fn_values
+
+// Function values: a `fn(T) -> R` held in a local, a `let mut` (reassigned), an array element, a
+// struct field, a returned value, a closure's capture, and passed at run time to a function-typed
+// parameter. Each is a code address (`func_addr`), and a call through one is a call through the
+// pointer (`call_indirect`) unless the optimizer sees which function it holds. Expectations by
+// hand:
+//   f = inc: f(41)                                                         = 42
+//   g = inc: g(1) = 2; then g = twice: g(21)                                = 2, 42
+//   ops = [add, sub, mul], every element at (7, 3): 7+3, 7-3, 7*3            = 10, 4, 21
+//   o.apply = mul, called through the field with (o.code = 2, 8)            = 16
+//   pick(false) = inc: inc(9) = 10; pick(true) = |x| 0 - x: -(9)            = 10, -9
+//   apply_twice(g = twice, 5) = twice(twice(5)), a run-time value           = 20
+//   apply_twice(inc, 5) = inc(inc(5)), bound at compile time                = 7
+//   h = compose_apply (the address of a function with function parameters):
+//     h(inc, twice, 4) = twice(inc(4)) = 10; h(twice, inc, 4) = inc(twice(4)) = 9
+//   hf = half: 5.0 / 2.0                                                    = 2.5
+//   pe = is_even, printed as 1/0 through `as i32`: 10 even, 7 odd           = 1, 0
+//   sw = swap, a struct in and out: (1, 2) -> (2, 1)                         = 2, 1
+//   sh = shout (no result): prints 4 * 10                                   = 40
+//   fv = the capture-free closure |x| x * x: fv(6)                         = 36
+//   via = |x| g(x) + k, capturing the function value g (= twice) and k = 100:
+//     twice(3) + 100                                                        = 106
+//   count = run(inc, 5) where run counts how many calls of its argument keep the value
+//     below 11 starting at 5: 5 -> 6 -> ... -> 11 is 6 calls                 = 6
+
+struct Pair {
+    a: i32,
+    b: i32,
+}
+
+struct Op {
+    code: i32,
+    apply: fn(i32, i32) -> i32,
+}
+
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn sub(a: i32, b: i32) -> i32 {
+    return a - b;
+}
+
+fn mul(a: i32, b: i32) -> i32 {
+    return a * b;
+}
+
+fn inc(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn twice(x: i32) -> i32 {
+    return x * 2;
+}
+
+fn half(x: f64) -> f64 {
+    return x / 2.0;
+}
+
+fn swap(p: Pair) -> Pair {
+    return Pair { a: p.b, b: p.a };
+}
+
+fn is_even(n: i64) -> bool {
+    return n % 2 == 0;
+}
+
+fn shout(x: i32) {
+    print(x * 10);
+}
+
+fn pick(neg: bool) -> fn(i32) -> i32 {
+    if neg {
+        return |x| 0 - x;
+    }
+    return inc;
+}
+
+fn apply_twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(f(x));
+}
+
+fn compose_apply(f: fn(i32) -> i32, g: fn(i32) -> i32, x: i32) -> i32 {
+    return g(f(x));
+}
+
+fn run(advance: fn(i32) -> i32, start: i32) -> i32 {
+    let mut v = start;
+    let mut n = 0;
+    while v < 11 {
+        v = advance(v);
+        n = n + 1;
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    let f: fn(i32) -> i32 = inc;
+    print(f(41));
+    let mut g = inc;
+    print(g(1));
+    g = twice;
+    print(g(21));
+    let ops: [fn(i32, i32) -> i32; 3] = [add, sub, mul];
+    for i in 0..3 {
+        print(ops[i](7, 3));
+    }
+    let o = Op { code: 2, apply: mul };
+    print(o.apply(o.code, 8));
+    print(pick(false)(9));
+    print(pick(true)(9));
+    print(apply_twice(g, 5));
+    print(apply_twice(inc, 5));
+    let h: fn(fn(i32) -> i32, fn(i32) -> i32, i32) -> i32 = compose_apply;
+    print(h(inc, twice, 4));
+    print(h(twice, inc, 4));
+    let hf: fn(f64) -> f64 = half;
+    print(hf(5.0));
+    let pe: fn(i64) -> bool = is_even;
+    print(pe(10) as i32);
+    print(pe(7) as i32);
+    let sw: fn(Pair) -> Pair = swap;
+    let q = sw(Pair { a: 1, b: 2 });
+    print(q.a);
+    print(q.b);
+    let sh: fn(i32) = shout;
+    sh(4);
+    let sq = |x: i32| x * x;
+    let fv: fn(i32) -> i32 = sq;
+    print(fv(6));
+    let k = 100;
+    let via = |x: i32| g(x) + k;
+    print(via(3));
+    let next_of = f;
+    print(run(next_of, 5));
+    return 0;
+}

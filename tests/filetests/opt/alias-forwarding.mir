@@ -1,0 +1,63 @@
+; RUN: wukongc --emit=mir --passes=cse,dce %s | filecheck %s
+;
+; Load forwarding past an intervening store is only as good as the alias analysis
+; (`wukong_opt::alias`) that proves the store cannot reach the loaded location. These pairs differ
+; only in what is known about the two addresses: the forwarded load is gone (the function returns
+; the stored value), the unproved one stays.
+
+; Two `noalias` parameters never overlap.
+; CHECK-LABEL: fn noalias_params(
+; CHECK:         store v3, v1
+; CHECK-NOT:     load
+; CHECK:         ret v2
+fn noalias_params(v0 ptr noalias, v1 ptr noalias, v2 f32, v3 f32) -> f32 {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 f32):
+    store v2, v0
+    store v3, v1
+    v4: f32 = load f32 v0
+    ret v4
+}
+
+; The same function without the promise: *v1 may be *v0, so the load must stay.
+; CHECK-LABEL: fn may_alias(
+; CHECK:         store v3, v1
+; CHECK-NEXT:    [[L:v[0-9]+]] = load f32 v0
+; CHECK-NEXT:    ret [[L]]
+fn may_alias(v0 ptr, v1 ptr, v2 f32, v3 f32) -> f32 {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 f32):
+    store v2, v0
+    store v3, v1
+    v4: f32 = load f32 v0
+    ret v4
+}
+
+; One base, two constant element offsets: the elements are distinct.
+; CHECK-LABEL: fn disjoint_offsets(
+; CHECK:         store v2,
+; CHECK-NOT:     load
+; CHECK:         ret v1
+fn disjoint_offsets(v0 ptr, v1 f32, v2 f32) -> f32 {
+  bb0(v0 ptr, v1 f32, v2 f32):
+    v3: i64 = const.i64 0
+    v4: i64 = const.i64 1
+    v5: ptr = gep v0, v3 : f32
+    v6: ptr = gep v0, v4 : f32
+    store v1, v5
+    store v2, v6
+    v7: f32 = load f32 v5
+    ret v7
+}
+
+; A local slot whose address never escapes cannot be what a parameter points at.
+; CHECK-LABEL: fn slot_vs_param(
+; CHECK:         store v2, v0
+; CHECK-NOT:     load
+; CHECK:         ret v1
+fn slot_vs_param(v0 ptr, v1 f32, v2 f32) -> f32 {
+  bb0(v0 ptr, v1 f32, v2 f32):
+    v3: ptr = alloca f32
+    store v1, v3
+    store v2, v0
+    v4: f32 = load f32 v3
+    ret v4
+}

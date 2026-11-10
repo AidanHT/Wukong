@@ -143,9 +143,9 @@ hijack kernel dispatch silently. The restriction applies to function names only 
 
 ### Function-typed parameters ✅
 
-A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`), and every call binds it
-to a function **named at compile time** — a non-generic top-level function, or the caller's own
-function-typed parameter passed along:
+A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`). A call that passes a
+function **named at compile time** — a non-generic top-level function, a closure literal, or the
+caller's own function-typed parameter passed along — binds it statically:
 
 ```wukong
 fn square(x: f32) -> f32 { return x * x; }
@@ -158,22 +158,85 @@ fn main() -> i32 {
 }
 ```
 
-There are no function pointers at run time: the callee is **specialized per bound function** exactly
-like a type-generic function is per type (`apply$square`), the function parameter carries no value,
-and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
+Such a call uses no function pointer: the callee is **specialized per bound function** exactly like a
+type-generic function is per type (`apply$square`), the function parameter carries no value, and a
+call through it is a direct call — inlinable, and visible to every kernel recognizer. A
 type-generic higher-order function binds its type parameters from the function argument too
-(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
-type is only a parameter's type, or the annotation of a `let` that binds a closure
-(`let f: fn(f32) -> f32 = |x| x * k;`, see [Closures](#closures-)) — not another local's, a field's,
-an element's, a return type or an `extern` parameter's; a named function cannot be bound to a `let`
-(a closure can) or passed to a non-function parameter; the argument must name a function, not
-compute one; and a function-typed parameter is neither `mut` nor named after a builtin (`gelu`,
-`print`, …). A wrong signature is the ordinary `E0401` type mismatch. A parameter whose type
+(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). Any other argument of the function type —
+a [function value](#function-values-) held in a local, a field or an element, or returned by a
+call — is passed at run time: the callee gets one more instance that takes the pointer and calls
+through it (`apply$fn1$f32$to$f32`). The rules: a function-typed parameter is neither `mut` nor
+named after a builtin (`gelu`, `print`, …), and an `extern` signature cannot spell a function type
+(`E0411`); a generic function is no value to pass (`E0429`); a wrong signature is the ordinary
+`E0401` type mismatch. A parameter whose type
 names a dimension generic of the callee (`fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])`)
 accepts a function of the extent the call binds: from the function itself (`fn head(t: Tensor[f32, 4])`
 binds `N = 4`) or from another argument, the first binding winning and every other argument checked
 against it (`E0401` at the function, `E0501` at a buffer). `tests/run/fn_params.wk`,
 `tests/run/closure_infer.wk`.
+
+### Function values ✅
+
+A function type is an ordinary **value type**: a local (`let`, `let mut`, reassigned), a struct
+field, an array or tuple element, a return value and a parameter can each hold a `fn(A, B) -> R`,
+and a call through any of them calls the function it holds:
+
+```wukong
+struct Op { code: i32, apply: fn(i32, i32) -> i32 }
+
+fn add(a: i32, b: i32) -> i32 { return a + b; }
+fn mul(a: i32, b: i32) -> i32 { return a * b; }
+fn pick(neg: bool) -> fn(i32) -> i32 {
+    if neg { return |x| 0 - x; }               // a closure that captures nothing
+    return |x| x;
+}
+
+fn main() -> i32 {
+    let ops: [fn(i32, i32) -> i32; 2] = [add, mul];
+    let mut f = ops[0];
+    print(f(2, 3));                            // 5
+    f = mul;
+    print(f(2, 3));                            // 6
+    let o = Op { code: 1, apply: add };
+    print(o.apply(o.code, 4));                 // 5: a field called like a method
+    print(pick(true)(9));                      // -9
+    return 0;
+}
+```
+
+- **What makes one.** A named non-generic function (`add`), a closure literal that captures
+  nothing (`|x| 0 - x`, typed from where it goes: a `let mut`, a `return`, an assignment, a field
+  or an element), or a closure-bound local whose closure captures nothing. A closure that
+  captures is not a value — the value is only a code address, with no room for what the closure
+  captured (`E0427`; such a closure can still be called through its `let` and passed directly to
+  a function-typed parameter). That includes a closure given to a call through a function value
+  (`g(|x| x + k, 3)` with `g` a `let`, or a function-typed parameter bound to a run-time value in
+  the instance that calls it): nothing is specialized for what such a call receives, so the
+  closure is passed as a value. Neither is a generic function, nor one with a tensor parameter of
+  run-time extent (`?`), nor an `extern` one (`E0429`). A function that itself takes
+  function-typed parameters is a value too: its address is the instance that takes each of them
+  at run time. A value is made in a function body: a `const` cannot hold one (`E0411`), because a
+  `const` initializer is evaluated again at each use rather than stored — bind the function with
+  `let` where it is used.
+- **What one does.** Called (`f(x)`, `ops[i](a, b)`, `pick(1)(3)`, `s.apply(x)` for a field that
+  is no method), passed to a function-typed parameter, copied, stored, returned, captured by a
+  closure (copied like a pointer). Comparing two (`==`, `<`) is `E0428`: which functions share an
+  address is the compiler's choice, so keep a tag beside the function and compare that. A value
+  has exactly its type: assigning, returning or storing one of another signature is `E0401`, and
+  so is giving one where a number, pointer or aggregate is expected — inside an aggregate too, so
+  an array literal mixing signatures (`[inc, add]`), or an array, tuple or struct of functions of
+  another signature given for one, is `E0401` as well. A local of function type cannot be named
+  after a builtin (`E0411`). A `let` (or a pattern or `for` binding) that shadows a function-typed
+  parameter is a value of its own, even in the instance specialized for the function the
+  parameter is bound to.
+- **What it costs.** A call through a value is one indirect call (`call_indirect` in
+  `--emit=mir`). Where the optimizer can see which function a value holds — a `let` of a named
+  function, a value passed into a function it inlined — the call becomes a direct call again
+  (`-O1`), which `-O2` inlines like any other. A value that crosses an `extern` boundary,
+  `--backend=gpu-native` (the function is declined, an `UNSUPPORTED` skip) and automatic
+  differentiation of a loss that calls through one (refused by name) are not supported.
+
+`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt,fn_values_shadowing,fn_values_captured}.wk`.
 
 ### Closures ✅
 
@@ -196,14 +259,19 @@ fn main() -> i32 {
 
 - **Where.** As an argument of a function-typed parameter — of a call to a function, a method
   (`v.map(|a| a * k)`, `V::make(|i| ..)`), a function-typed parameter or a closure-bound local — or
-  as the initializer of a `let`. A **closure-bound local** (`let f = |x: f32| x * k;`) can be called
-  (`f(2.0)`) and passed to a function-typed parameter (`apply(f, 3.0)`), and nothing else: copying,
-  returning, storing, printing or computing with it is `E0421`, because it has no run-time value —
-  every use is resolved to the closure at compile time. The binding is one immutable name
-  (`let mut`, a pattern or a reassignment `f = ..` is `E0422`); an annotation, if any, is its
-  function type (`let f: fn(f32) -> f32 = |x| x * k;`). Anywhere else — returned, stored in a field
-  or element, an operand, a `const` initializer, a `where` predicate or a `static_assert` — a
-  closure is `E0411`: there are no run-time function values.
+  as the initializer of a `let`. Given to a call through a function value instead (a `let` of
+  function type, a field, an element, or a function-typed parameter bound to a run-time value), a
+  closure is a function value, so it must capture nothing (`E0427`). A **closure-bound local** (`let f = |x: f32| x * k;`) can be called
+  (`f(2.0)`) and passed to a function-typed parameter (`apply(f, 3.0)`); every use is resolved to
+  the closure at compile time. When the closure captures, that is all: copying, returning, storing,
+  printing or computing with it is `E0421`, because a [function value](#function-values-) has no
+  room for the captured values, and the binding is one immutable name (a pattern, a reassignment
+  `f = ..`, or `let mut` of a capturing closure is `E0422`). A closure that captures nothing is a
+  function value as well. An annotation, if any, is its function type
+  (`let f: fn(f32) -> f32 = |x| x * k;`). Anywhere else in a function body — a `let mut`, returned,
+  assigned, stored in a field or element — a closure is a function value, legal when it captures
+  nothing (`E0427` otherwise); a `const` initializer, a `where` predicate or a `static_assert` cannot
+  hold one (`E0411`).
 - **Parameters and return type.** Each parameter is a name with an optional `: Type` (no patterns,
   no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it.
   When that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, a: T, ..)`), even
@@ -222,7 +290,9 @@ fn main() -> i32 {
   (including `bool` and `char`), an enum, a raw pointer or reference, a fixed-size array, a tuple or
   a struct, the last four copied whole. One it **writes** — `c = ..`, `c += ..`, `&mut c`, an element
   or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method, an aggregate passed
-  to a `mut` parameter (`relu6(x, out)`, which writes `out` in place), or a builtin's output operand
+  to a `mut` parameter (`relu6(x, out)`, which writes `out` in place) or to any parameter of a call
+  through a function value (`f(out)`, `s.op(out)`, `pick()(out)`: a function type does not say
+  which parameters are `mut`, so the function it holds may write `out`), or a builtin's output operand
   (`relu(x, out)`, `argsort_f32(x, idx)`, `sprintf(buf, ..)`), directly or through a tensor view
   of it (`relu(x, out as Tensor[f32, 2, 3])`; a view bound by `let` counts as a write, since it can
   be written through) — is captured **by reference**: the closure and the enclosing function share
@@ -230,11 +300,15 @@ fn main() -> i32 {
   closure), and the variable's own rules apply (`E0304` for an immutable binding, exactly as outside
   the closure). Writing through a captured
   pointer (`*pt = ..`) writes the pointee, and the pointer stays a copy. A local named as a
-  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` (a view
-  of storage its copy would not carry), a tensor or vector, the enclosing function's function-typed
-  parameter, and anything naming one of its generic parameters cannot be captured (`E0418`):
-  capture a pointer instead (`let ps = &s;`, then `(*ps)[i]`), and bind a generic dimension to a
-  local first (`let n = N;`). A `for` counter is captured at the width it is stored at, the wider
+  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` is
+  copied as its fat pointer `(data, len)` — another view of the same elements, as passing it to a
+  parameter makes: an element the closure writes (`xs[i] = ..`) is written in the shared storage,
+  and reassigning the variable afterwards leaves the closure's copy on the old view
+  (`tests/run/closure_capture_views.wk`). A function value is copied like a pointer. A tensor or
+  vector, the enclosing function's function-typed parameter, and anything naming one of its generic
+  parameters cannot be captured (`E0418`): read what you need first (`let w = t[1];`) or capture a
+  pointer (`let pt = &t;`, then `(*pt)[i]`), and bind a generic dimension to a local first
+  (`let n = N;`). A `for` counter is captured at the width it is stored at, the wider
   of its bounds' integer types (`for i in 0..n` with `n: i64` stores `i` in 8 bytes, and the
   closure reads and writes all of them), so a bound of a generic type, whose width each instance
   decides, makes the counter `E0418` too: copy it to a local first (`let k = i;`). A closure-bound
@@ -248,7 +322,8 @@ fn main() -> i32 {
 It costs nothing at run time: the closure is lifted to a function whose leading parameters are its
 captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
 function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
-direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
+direct call — no function pointer, no heap environment, and inlined like any call at `-O2`. Only a
+closure used as a function value is reached through a pointer, like any other function value.
 `tests/run/{closures,closure_let,closure_method,closure_captures,closure_capture_out_params,closure_wide_counter,closure_infer}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅
@@ -3077,7 +3152,8 @@ wukongc --repl [OPTIONS]         an interactive session on standard input (see "
                       runs none. Function passes (run together to a fixpoint): sroa, mem2reg,
                       simplify, jump-thread, simplify-cfg, simplify-phis, dce, tre, cse, dse,
                       loop-canon, loop-delete, fuse, licm, bce, unswitch, promote, vectorize;
-                      program steps (run once where named): inline, unroll, slp, form-switches.
+                      program steps (run once where named): inline, devirt, unroll, slp,
+                      form-switches.
                       An unknown name is a usage error (exit 2) that lists them all
 --print-after=<p>     print the MIR to stderr after each run of pass <p> on a function (a run
                       that changed nothing is one `unchanged` line), or after program step <p>;
@@ -3117,6 +3193,13 @@ wukongc --repl [OPTIONS]         an interactive session on standard input (see "
                       works too; an unknown lint is a usage error (exit 2). See "Warnings (lints)"
 --error-limit=<n>     print at most n errors before suppressing the rest (0 = unlimited; default)
 --explain [CODE]      print an extended explanation for an error code; no code lists every code
+--print=runtime-cache print the --emit=exe runtime cache directory and exit. The first link builds
+                      the program-independent runtime half there (the runtime shim; with a
+                      release-profile runtime, one fat-LTO static library of it) and every later
+                      link reuses it. WUKONG_CACHE_DIR sets the location (empty: no cache), else
+                      %LOCALAPPDATA%\wukong\cache, $XDG_CACHE_HOME/wukong or ~/.cache/wukong;
+                      WUKONG_CACHE_TRACE=1 prints each hit, miss and rebuild on stderr
+--clear-cache         remove every runtime cache entry and exit (the next link rebuilds it)
 --color=<when>        auto | always | never   (default: auto)
                       auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
 --remarks=dispatch    print a note (stderr) at every statement — or function — the compiler replaced
@@ -3144,6 +3227,16 @@ callee's). The machine code is the same with and without `-g`. Locals, types and
 described yet, so a debugger cannot print a variable. For profiling the JIT,
 `WUKONG_PERF_MAP=1 wukongc --run --backend=native prog.wk` writes `perf-<pid>.map`, which Linux
 `perf report` uses to name samples in JIT-compiled functions.
+
+**✅ The AOT runtime cache:** an `--emit=exe` link builds the part that does not depend on the
+program — the generated runtime shim compiled against `wukong_runtime` (with a release-profile
+runtime, one fat-LTO static library of shim, runtime and `std`), or the C runtime on the `cc`
+fallback — once, into a cache, and every later link only links against it. The first release link
+after a runtime rebuild therefore takes its LTO time once (about a minute at most) instead of on
+every link. `wukongc --print=runtime-cache` prints the directory (`WUKONG_CACHE_DIR`, else the
+platform cache directory; an empty `WUKONG_CACHE_DIR` turns the cache off), `wukongc --clear-cache`
+empties it, and `WUKONG_CACHE_TRACE=1` reports every hit, miss and rebuild. A damaged entry is
+detected and rebuilt, and concurrent compiles share the cache safely.
 
 Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and
 a diagnostic may carry a `help:` suggestion (a concrete replacement). A source line prints once

@@ -1,0 +1,24 @@
+// EXPECT-CODE: E0427
+// EXPECT-COUNT: 1
+module tests.fail.closure_param_value_captures
+
+// `keep` stores its function-typed parameter as a run-time value. Called with a closure that
+// captures `k`, the parameter is bound to that closure at compile time (the callee is specialized
+// for it and receives `k` as a hidden argument), but storing it needs a code address alone, which
+// cannot carry `k`. A named function, or a closure that captures nothing, works
+// (tests/run/fn_values_dispatch.wk).
+
+struct Holder {
+    f: fn(i32) -> i32,
+}
+
+fn keep(f: fn(i32) -> i32) -> Holder {
+    return Holder { f: f }; //~ E0427
+}
+
+fn main() -> i32 {
+    let k = 5;
+    let h = keep(|x| x + k);
+    print(h.f(1));
+    return 0;
+}

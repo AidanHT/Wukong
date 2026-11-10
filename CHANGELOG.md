@@ -62,6 +62,38 @@ All notable changes to Wukong are documented here. The format is loosely based o
   beside the region); no AVX2 gather or scatter is emitted (every per-lane access is a scalar load
   or store).
   None of these forms has been timed: each is a rule, not a measured win.
+### The AOT runtime cache: `--emit=exe` stops re-LTOing the runtime on every link (`gap7/aot-link-cache`, N51)
+
+- **The runtime half of a link is built once.** Every `--emit=exe` link used to compile the
+  generated runtime shim against the `wukong_runtime` rlib, and against a release-profile rlib
+  (bitcode members, `lto = "thin"`) that meant a thin LTO of the whole runtime and `std` per link:
+  35-40 s for a one-line program on the development host. That half is now an entry in the AOT
+  runtime cache, built by the first link and reused: the shim compiled once as an rlib against a
+  dev-profile runtime, a **fat-LTO static library** of shim, runtime and `std` (at `opt-level=3`)
+  against a release one, the C runtime compiled once to an object on the `cc` fallback. rustc still
+  drives the final link — it compiles an empty driver crate, so no platform-linker locator is
+  needed — and nothing is LTO'd at link time. Debug-build indication (rustc 1.97.1, not a
+  measurement): a release runtime now costs one ~23-48 s archive build, then ~0.2-0.3 s per link; a
+  dev-profile runtime, which never LTO'd, links in ~0.5 s as before. Executables behave identically
+  (`tests/exe.rs` on the dev profile; by hand, a 122-program corpus slice linked against the fat-LTO
+  archive of a release runtime build matched `--run`, kernels, `@parallel` and `--train` included).
+- **Keyed by everything that changes it.** The toolchain (`rustc -vV`, or `$CC` and its
+  `--version`), the host, the runtime rlib's path, length and modification time, the shim (or C
+  runtime) source and the build recipe. The key material is stored in the entry and compared on
+  every hit, and a manifest of every file's length and content hash is validated too, so a
+  truncated or edited entry is detected and rebuilt. Entries are built in a private directory and
+  published with one `rename`, so concurrent compilers both succeed (the loser adopts the winner's
+  entry); at most 8 entries are kept, least recently used evicted. A hit marks the entry used
+  before validating it and eviction re-checks that mark right before removing an entry, so one
+  compiler's eviction cannot delete the entry another has just validated; if a cached entry still
+  vanishes mid-link, the link rebuilds it and retries once.
+- **Added: `--print=runtime-cache` and `--clear-cache`.** The cache lives in
+  `WUKONG_CACHE_DIR` (empty: no cache, a private build per link), else `%LOCALAPPDATA%\wukong\cache`
+  on Windows and `$XDG_CACHE_HOME/wukong` or `~/.cache/wukong` elsewhere, under `aot-runtime/`;
+  `--print=runtime-cache` prints that directory and `--clear-cache` removes the entries.
+  `WUKONG_CACHE_TRACE=1` prints each hit, miss, rebuild and publish on stderr, and
+  `--time-passes` reports a `runtime-cache` stage before `link`. The test suites link through a
+  cache under the target directory and never touch the user's.
 
 ### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)
 
@@ -316,6 +348,151 @@ All notable changes to Wukong are documented here. The format is loosely based o
   read-before-write, triangular and conditional nests, an `!=` test the variable steps over, a short
   remainder, accumulating, in-place, short and aliased kernels, a promise for a user function's
   name).
+
+### FileCheck-style filetests for the optimizer (`gap7/filetests`, N71)
+
+- **Added: `tests/filetests/`, a lit-style suite that pins what each pass does to the MIR.** Each
+  `.mir` or `.wk` file carries its own `RUN:` lines (`wukongc ... %s | filecheck %s`, `not`,
+  `diff`, `> %t.mir`, `2>&1`, `REQUIRES: vec-kernels`) and `CHECK:` lines, run by
+  `cargo test -p wukongc --test filetests` (`WUKONG_FILETESTS=<substring>` runs a subset). The
+  differential gates prove an optimization changes no output; nothing proved one still *fires*.
+  A filetest does: the invariant load sits in the preheader and not in the loop body, the tail
+  call became a branch, the four stores became one `<4 x f32>` store. `not` demands a *clean*
+  failure: a Rust panic message fails it wherever the `RUN:` line sent stderr (captured, `2>`,
+  or merged by `2>&1`), because `wukongc` exits 1, not 101, when its compile thread panics.
+- **Added: an in-tree FileCheck** (`crates/wukongc/tests/filecheck/`, no new dependency: the
+  workspace locks no `regex` crate, so a small backtracking engine handles the POSIX-ERE subset
+  patterns use). LLVM FileCheck's semantics for `CHECK`, `-NEXT`, `-SAME`, `-NOT` (between the
+  neighbouring matches), `-DAG` (any order, no overlap, `-NOT`s between runs), `-LABEL` (labels
+  found first, partitioning the input), `-EMPTY` and `-COUNT-<n>`; `{{regex}}`, `[[NAME:regex]]`
+  bindings with `[[NAME]]` uses (a backreference within one pattern), `[[@LINE+k]]`, blank-run
+  canonicalization, `--check-prefix(es)`, `--implicit-check-not`. A failure names the directive's
+  `file:line:col`, where the scan started, the input line most like the pattern ("possible
+  intended match"), the variables it used, and the whole input, numbered. A misspelled directive
+  (`CHECK-NXT:`, `CHECK-NEXT` without its colon) and a comment directive for a prefix no `RUN:`
+  line checks are errors, not silently ignored lines; a hyphenated prefix another `RUN:` line
+  checks (`--check-prefixes=CHECK,CHECK-O2` beside `CHECK,CHECK-O0`, LLVM's shared-plus-specific
+  layout) is that line's, not a misspelling. 45 unit tests pin the matcher and the harness,
+  including a wrong `CHECK` that must fail with its location and a stand-in compiler that panics
+  and exits 1, which `not` must reject under every redirection.
+- **Seeded with 37 files.** 24 under `opt/`, each a pass's essential property (most with a
+  hand-written `.mir` input run through that one pass, so the lowering cannot drift under it):
+  constant folding, GVN and load forwarding through joins, alias-based forwarding, LICM (an
+  invariant load through its zero-trip guard), DSE, mem2reg, SROA, DCE, simplify-cfg,
+  simplify-phis, jump threading, loop deletion, switch formation, scalar promotion, both forms of
+  unswitching, loop fusion (and the read-ahead it refuses), the 128-bit vectorizer (with its
+  run-time alias guard), the 256-bit `veckernel` path, SLP, complete and partial unrolling with
+  the wrap guard, unroll-and-jam, bounds-check elimination, inlining and tail-recursion
+  elimination. Disabling each test's pass list fails all 24. Plus `--emit=mir-text` round trips
+  and reproducer laws, `.mir` parse errors, six verifier rejections of invalid `.mir` input, a
+  `--verify-each -O2` run that must equal plain `-O2`, `--print-after` and the pass-list errors.
+
+### First-class function values and indirect calls (`gap7/fn-values`, N27)
+
+- **Added: function values.** A function type `fn(A, B) -> R` is an ordinary value type: a local
+  (`let`, `let mut`, reassigned), a struct field, an array or tuple element, a return value, a
+  closure's capture. A named non-generic function or a closure that captures nothing makes one; a
+  call through any of them (`f(x)`, `ops[i](a, b)`, `pick(1)(x)`, `s.op(x)` for a field that is no
+  method) calls the function it holds. A function-typed parameter given a run-time value gets one
+  more instance that takes the pointer (`apply$fn1$f32$to$f32`), so higher-order functions accept a
+  run-time choice; given a named function or a closure it is still specialized with no pointer.
+  The address of a function with function-typed parameters is that pointer-taking instance.
+  `tests/run/{fn_values,fn_values_dispatch,fn_values_devirt}.wk`, interp == native at `-O0`/`-O2`.
+- **Added: `Op::CallIndirect`**, `call_indirect vF(vA, ..) -> T`: the verifier (a pointer callee;
+  under `verify_program`, a visible `func_addr g` must have exactly `g`'s signature), the printer
+  and the typed MIR text, the interpreter (the `FUNC_TAG` index; anything else is an error), Cranelift
+  `call_indirect` for the JIT and objects (a caller polls the failure status after it, since the
+  callee may fail an assertion), the LLVM text (`call T %f(..)`); `gpu-native` declines it
+  (`UNSUPPORTED`), autodiff refuses a loss that makes one.
+- **Added: devirtualization.** An indirect call whose callee is a visible `func_addr` of a function
+  with its signature becomes a direct call after the per-function pipeline (`-O1`), and the program
+  is optimized again around it (inlined at `-O2`). It is a program step, not a pass: the call-effect
+  table a function's passes see is schedule-dependent for symbols other than its direct callees, so
+  a call created mid-fixpoint could make the MIR depend on the thread count. `--passes` has the new
+  program step `devirt`, in both `-O` lists.
+- **Changed: one effect classification for the optimizer.** `wukong_mir::Effects` (`Op::effects`,
+  exhaustive) says what each op may do — read, write, call out, trap, synchronize, allocate — and
+  every `wukong_opt` pass that kept its own opcode list beside a permissive `_` arm asks it instead
+  (alias, bce, cse, dce, dse, the call summaries, fuse, jump_thread, licm, loop_delete, loop_info,
+  slp, unroll, unroll_jam, unswitch, vec256, vectorize). No behaviour change: the corpus MIR is
+  byte-identical. `wukong_opt::indirect_tests` pins, per pass, what may not happen to an indirect
+  call (two identical calls kept and ordered, a store before one not dropped, none hoisted, a caller
+  of one not summarized pure, no loop around one deleted or vectorized).
+- **New diagnostics:** `E0427` a closure that captures used as a run-time function value (also
+  from lowering, for a function-typed parameter bound to one and used as a value); `E0428` two
+  function values compared; `E0429` a generic, `extern` or run-time-extent function used as a value.
+  `E0411` now covers only an `extern` signature with a function type, a `mut` or builtin-named
+  function-typed parameter or local, and a closure or a function value outside a function body (a
+  `const` cannot hold one); `E0421`/`E0422` apply to closures that capture (a capture-free one is a
+  value, and `let mut` of it a function variable).
+  `tests/fail/{closure_value_captures,closure_param_value_captures,fn_value_compare,fn_value_generic,fn_type_in_extern}.wk`;
+  `tests/fail/{closure_outside_argument,fn_value_binding,lower_function_value}.wk` are gone (each is
+  a legal program now).
+- **Added: a closure captures a slice or a `str`** as its 16-byte fat pointer — another view of
+  the same elements, as passing it to a parameter makes (an element the closure writes is written
+  in the shared storage; reassigning the variable later leaves the closure on the old view). It was
+  `E0418`, which now covers a tensor or vector (`tests/run/closure_capture_views.wk`;
+  `tests/fail/closure_capture_slice.wk` became `closure_capture_tensor.wk`).
+- **Fixed: inlining a call that discards a value-returning callee's result** branched every `ret v`
+  of the copy to a continuation with no parameter (legal MIR the inliner mishandled; a devirtualized
+  result-less indirect call produced it). The continuation now takes the value and drops it.
+- **Fixed: function signatures inside aggregates were never compared.** The layout checks
+  treat a function type as an open leaf, so `[inc, add]` (`fn(i32) -> i32` beside
+  `fn(i32, i32) -> i32`) took the first element's type and `ops[1](5)` called `add` with one
+  argument: native read a register the caller never wrote, the interpreter a stale value, and
+  `-O2` failed the verifier once it saw the callee. `E0401` now compares function types at every
+  position of an array, slice, tuple or pointer — array-literal elements, assignment, `return`,
+  struct fields, `if`/`match`/`break` merges and call arguments — and an aggregate of functions
+  against one of anything else (`ops = [1, 2]` for an array of functions).
+  `tests/fail/fn_value_array_signatures.wk`.
+- **Fixed: a `let` shadowing a function-typed parameter was taken for the parameter.**
+  Passed on to another function-typed parameter in the instance specialized for the parameter's
+  function, `let f = cube;` in `fn outer(f: fn(i32) -> i32)` called `apply_twice` specialized for
+  the *parameter's* function: `outer(sq, 2)` printed 16, not `cube(cube(2))` = 512, on both
+  backends. Sema now publishes which reads of a function-typed local are not parameters
+  (`SemaResult::fn_value_lets`: `let`, pattern and `for` bindings, and captures of them), and
+  lowering and the instance collector never resolve one through the instance's binding. A shadowed
+  callee also no longer registers an instance of the parameter's function, or keeps an argument
+  from being noted as a value (`forward` in `tests/run/fn_values_shadowing.wk` called a function
+  that was never compiled).
+- **Fixed: a closure capturing a function value, passed to a higher-order function, was never
+  compiled.** A function-typed capture makes the lifted closure a function compiled per binding,
+  and a call through the parameter it is bound to passes the captures ahead of its own arguments.
+  The instance collector lined the call's arguments up against the closure's parameters without
+  them, so `apply(|x| k + g(x), 3)` (captures `k`, then `g`) registered no instance and `apply`
+  called a function that was never compiled ("call to unknown function" on the interpreter,
+  `C0001` natively), and a capturing closure with a function-typed parameter of its own
+  (`with(|a, y| a(|x| x + k, y), 5)`) got the instance taking `a` at run time instead of the one
+  specialized for `apply`. The collector now skips the environment, binding a captured function
+  value as the run-time value it always is. `tests/run/fn_values_captured.wk`.
+- **Fixed: a closure that captures, given to a call through a function value, compiled into a
+  jump through stack memory.** Its argument was typed like one of a call to a named function
+  (captures allowed), but an indirect call specializes nothing, and the closure value
+  `(L, captures..)` was lowered as an uninitialized 8-byte buffer whose address was passed as the
+  function: `let g = apply; g(|x| x + k, 3)` crashed natively and failed on the interpreter
+  ("indirect call through a pointer that is not a function address"), and so did the instance of
+  `fn run(g: fn(fn(i32) -> i32, i32) -> i32, k: i32) { g(|x| x + k, 3) }` that receives `g` at run
+  time. Both are `E0427` now — from sema when the callee is a `let`-bound local (a closure-bound
+  local that captures included), from lowering in such an instance; a closure that captures
+  nothing still works. `tests/fail/{closure_indirect_call_captures,closure_dynamic_call_captures}.wk`.
+- **Fixed: a closure lost a write through a call through a function value.** An aggregate a
+  closure captures and passes to a `mut` parameter is captured by reference, but a call through a
+  function value never applied the rule (a function type does not carry `mut`), so
+  `apply(|x| { pick()(arr); x }, 7)` with `pick` returning `fill1(mut a: [i32; 4])` wrote the
+  closure's private copy and `arr` stayed 0, while `fill1(arr)` in the closure, or `pick()(arr)`
+  outside it, wrote `arr` — on both backends. Inside a closure, an aggregate given to any call
+  through a function value (a captured `let`, a field, an element, a call's result, the closure's
+  own function-typed parameter) is now captured by reference, conservatively.
+  `tests/run/closure_capture_indirect_write.wk`.
+- **Changed: a `const` cannot hold a function value (`E0411`).** A `const` initializer is
+  lowered again at each use, so a function named there escaped the whole-program analyses (a
+  recognized GEMM called through `const MM: fn(..) = mm;` ran without its aliasing guard; the
+  address of a higher-order function had no compiled instance) and resolved its name in the scope
+  of each use. `tests/fail/fn_value_const.wk`.
+- The `E0429` explanation (`--explain`) now covers a function with a run-time-extent (`?`) tensor
+  parameter, which it already refused.
+- **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
+  value; a closure that captures still has no run-time value (no heap environment).
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

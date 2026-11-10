@@ -99,9 +99,9 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   methods (`x.m(a)`, `Type::m(a)`, `self`/`&self`/`&mut self`/`mut self`, `Self`, auto-deref through a
   reference) lower to the plain function `Type.method`; `trait` + `impl Trait for Type` are checked
   for conformance (`E0410`), and a bounded type parameter (`<T: Shape>` / `where T: Shape`) calls
-  trait methods through monomorphization; a `fn(A) -> R` parameter is specialized per bound
-  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter
-  or a closure `let`'s annotation).
+  trait methods through monomorphization; a `fn(A) -> R` parameter given a named function or a
+  closure is specialized per bound function (`apply$square`), with no function pointer at run time
+  (a run-time function value gets an instance taking the pointer since `gap7/fn-values`, below).
   Calls such a specialization makes are invisible to the alias analysis, so every function they can
   reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
 - **Closures** (2026-10-12, `gap5/closures`). `|x| x * k`, `|| 0`, `|x: f32| -> f32 { .. }` passed to
@@ -126,6 +126,24 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   typed from the call's other arguments when the expected type names a callee generic, and a
   function-typed parameter over a dimension generic (`fn(Tensor[f32, N]) -> f32`) binds it from the
   function passed (`tests/run/closure_infer.wk`). Interp and native agree at every `-O`.
+- **Function values** (2026-10-14, `gap7/fn-values`). A function type is an ordinary value type:
+  `fn(A) -> R` in a `let`/`let mut` (reassigned), a struct field (`s.op(x)` calls it), an array or
+  tuple element, a return value, a closure's capture, made from a named non-generic function or a
+  closure that captures nothing, and called through the pointer — MIR's `Op::CallIndirect`, in the
+  verifier, the textual MIR, the interpreter, Cranelift (JIT and AOT) and the LLVM text; declined by
+  `gpu-native`, refused by autodiff. A function-typed parameter given a run-time value gets an
+  instance that takes the pointer (`apply$fn1$f32$to$f32`); the address of a function with
+  function-typed parameters is that instance. `E0427` for a capturing closure as a value, `E0428`
+  for comparing two, `E0429` for a generic or `extern` one; `E0411` is now only an `extern`
+  signature, a `mut` or builtin-named function-typed parameter or local, and a closure or function
+  value outside a function body (a `const` cannot hold one). Function types inside aggregates are
+  compared (`[inc, add]` is `E0401`); a `let` shadowing a function-typed parameter is a run-time
+  value of its own (`tests/run/fn_values_shadowing.wk`).
+  Every optimizer pass asks one exhaustive effect classification
+  (`wukong_mir::Effects`) instead of its own opcode list, and a call whose callee is a visible
+  `func_addr` is devirtualized (`-O1`, then inlined at `-O2`) — a program step between pipeline
+  runs, so the call-effect table never depends on the schedule
+  (`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt}.wk`, `wukong_opt::indirect_tests`).
 - **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
   then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
   `--error-format=json`
@@ -1787,16 +1805,33 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   field, a pointee or a multi-index tensor element inside the loop. Reading a location other
   iterations are still adding to is a race, as for a plain store.
 
-- **Closures are resolved at compile time** (2026-10-13). A closure is a call argument or a `let`
-  initializer; there are no run-time function values, so a closure (or a closure-bound local)
-  cannot be returned, stored in a field, element or tuple, or used as an operand, and a function
-  type is not a field, element or return type. A closure argument of a call through a trait bound
-  is not supported (a trait method cannot declare a function-typed parameter). A slice, `str`,
-  tensor or vector cannot be captured (`E0418`; capture a pointer), nor the enclosing function's
-  function-typed parameter, nor a `for` counter whose bound is of a generic type (its storage width
-  is per instance; copy it to a local first). Inference of an unannotated parameter from the call's
-  other arguments never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2, 3)` binds
-  `T = i32` from the literals, whatever the result is assigned to.
+- **A closure that captures has no run-time value** (2026-10-14). Function values exist since
+  `gap7/fn-values`, but a value is only a code address: a closure that captures is still resolved
+  at compile time — called through its `let`, or passed directly to a function-typed parameter —
+  and cannot be returned, stored, reassigned or used as an operand (`E0421`/`E0422`/`E0427`; there
+  is no heap environment). A function-typed parameter bound to such a closure cannot be used as a
+  value inside the callee either (`E0427` from lowering), and such a closure cannot be given to a
+  call through a function value — a `let` of function type, or a function-typed parameter in the
+  instance that receives it at run time (`E0427`, from sema and from lowering respectively), since
+  nothing is specialized for what an indirect call receives. A closure argument of a call through a
+  trait bound is not supported (a trait method cannot declare a function-typed parameter). A
+  tensor or vector cannot be captured (`E0418`; read the element first, or capture a pointer — a
+  slice or `str` is captured as its fat pointer since `gap7/fn-values`), nor the enclosing
+  function's function-typed parameter, nor a `for` counter whose bound is of a generic type (its
+  storage width is per instance; copy it to a local first). Inference of an unannotated parameter
+  from the call's other arguments never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2,
+  3)` binds `T = i32` from the literals, whatever the result is assigned to; nor does an array
+  literal pass its annotation's element type to an unannotated closure element.
+- **Function values do not cross three boundaries** (2026-10-14). An `extern "C"` signature cannot
+  spell a function type (`E0411`), so no C callback; `--backend=gpu-native` declines a function
+  that calls through a value (PTX has no portable function pointers; an `UNSUPPORTED` skip); and a
+  loss that calls through one is refused by `--emit=grad`/`--train`, since the callee has no VJP
+  rule. Comparing two values is `E0428`, by design. A call through a value is opaque to the
+  kernel recognizers and the vectorizer (a loop around one stays scalar) unless the optimizer
+  devirtualizes it. A `const` cannot hold a function value (`E0411`): a `const` initializer is
+  lowered again at every use, in the scope of that use, so supporting one needs a hygienic const
+  lowering first (a local named like something the initializer names captures it today, for
+  every `const`).
 
 - **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
   only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an
@@ -2133,12 +2168,17 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `wukong_runtime` as a dependency; a generated shim supplies the `wukong_rt_*` runtime), which also
   links the string `.rodata` relocations — neither of which the MinGW `cc` path on this host can do.
   It falls back to the C-runtime `cc` link (scalar, no-data, no-kernel programs) when rustc or the
-  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. The generated
-  link inputs (`{stem}_shim.rs` for the rustc path, `{stem}_rt.c` for the `cc` fallback) are written
+  runtime rlib is unavailable, and the exe gate skips cleanly when no toolchain can link. **The runtime
+  half of the link is cached** (N51, `gap7/aot-link-cache`): the shim compiled against the runtime (a
+  fat-LTO static library of shim, runtime and `std` for a release-profile runtime, which used to be
+  re-LTO'd on every link at 35-40 s each), or the C runtime compiled to an object, is built once into
+  the AOT runtime cache (`wukongc --print=runtime-cache`, `--clear-cache`, `WUKONG_CACHE_DIR`,
+  `WUKONG_CACHE_TRACE=1`) and every later link only compiles an empty driver crate and links. The
+  per-link inputs (the object and that driver crate, `{stem}_main.rs`) are written
   into a **pid-keyed temporary scratch directory that is removed when the link finishes**, not into the
   working directory — they used to overwrite and then delete any user file of the same name, and two
   concurrent links on one stem raced on them; the working directory is used only if the temp directory
-  cannot be created. The intermediate `{stem}.o` is still written beside the invocation. The rustc link
+  cannot be created. The rustc link
   passes `-C panic=abort` because the workspace release profile sets `panic = "abort"`, and a strategy
   mismatch is a hard metadata error that rejects the link outright. **The executable's entry
   matches `--run`**: the object's C `main` is synthesized, calls the program's `main` (now the
