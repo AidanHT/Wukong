@@ -170,6 +170,110 @@ fn smooth_activation_vjps() {
     }
 }
 
+/// `erf(z)` in f64 by its Maclaurin series -- an independent reference (not the runtime's
+/// Abramowitz-Stegun polynomial), accurate to f64 rounding for the `|z| < 2` the gates below use.
+fn erf_f64(z: f64) -> f64 {
+    let (mut term, mut sum) = (z, z);
+    for n in 1..80 {
+        let n = n as f64;
+        term *= -z * z / n;
+        sum += term / (2.0 * n + 1.0);
+    }
+    FRAC_2_SQRT_PI * sum
+}
+
+/// The f64 derivative of each natural spelling (`wukong_runtime::vspell`, P12.10), from the
+/// function it spells -- written out here, not borrowed from the rule under test.
+fn spelling_derivative_f64(op: i64, x: f64) -> f64 {
+    let gelu_tanh = |x: f64| {
+        let c0 = (2.0 / PI).sqrt();
+        let c1 = 0.044715;
+        let u = (c0 * (x + c1 * x * x * x)).tanh();
+        0.5 * (1.0 + u) + 0.5 * x * (1.0 - u * u) * c0 * (1.0 + 3.0 * c1 * x * x)
+    };
+    let mish = |x: f64| {
+        let t = x.exp().ln_1p().tanh();
+        t + x * sigmoid(x) * (1.0 - t * t)
+    };
+    match op {
+        36..=40 => gelu_tanh(x),
+        // x*sigmoid(1.702x)
+        41 => {
+            let s = sigmoid(1.702 * x);
+            s + 1.702 * x * s * (1.0 - s)
+        }
+        // x*Phi(x): Phi(x) + x*phi(x)
+        42..=44 => {
+            let cdf = 0.5 * (1.0 + erf_f64(x / std::f64::consts::SQRT_2));
+            cdf + x * (-0.5 * x * x).exp() / (2.0 * PI).sqrt()
+        }
+        45 | 46 => sigmoid(x) * (1.0 + x * (1.0 - sigmoid(x))),
+        47 => sigmoid(x) * (1.0 - sigmoid(x)),
+        48 | 49 => sigmoid(x),
+        50..=52 => mish(x),
+        // relu6(x + 3)/6: 1/6 strictly inside (-3, 3), flat outside.
+        53 | 54 => {
+            if x > -3.0 && x < 3.0 {
+                1.0 / 6.0
+            } else {
+                0.0
+            }
+        }
+        // x*relu6(x + 3)/6
+        55 | 56 => {
+            if x <= -3.0 {
+                0.0
+            } else if x >= 3.0 {
+                1.0
+            } else {
+                (2.0 * x + 3.0) / 6.0
+            }
+        }
+        57 => {
+            if x > 0.0 {
+                1.0
+            } else {
+                x.exp()
+            }
+        }
+        58 => {
+            if x < 0.0 {
+                0.01
+            } else {
+                1.0
+            }
+        }
+        other => panic!("no f64 reference derivative for spelling {other}"),
+    }
+}
+
+/// P12.10: every natural-spelling code (36..=58) is differentiable -- a loss written with
+/// `0.5*x*(1 + tanh(..))` or `x / (1 + exp(-x))` dispatches the spelling's kernel, and its backward
+/// must not decline where the intrinsic's did not. Gated against the f64 closed form and the
+/// finite difference of the spelling's own forward kernel.
+#[test]
+fn spelling_activation_vjps() {
+    let smooth: &[f32] = &[-1.7, -0.6, 0.4, 1.3];
+    let hard: &[f32] = &[-4.0, -1.5, 0.8, 4.0];
+    let kinked: &[f32] = &[2.1, 0.6, -1.7, -0.4];
+    for op in 36..=58i64 {
+        let xs = match op {
+            53..=56 => hard,
+            57 | 58 => kinked,
+            _ => smooth,
+        };
+        let mut it = Interner::default();
+        let n = xs.len();
+        let fwd = build_vmath_dot(&mut it, n, op);
+        let cb = coef_vec(n);
+        let want: Vec<f64> = (0..n)
+            .map(|i| cb[i] as f64 * spelling_derivative_f64(op, xs[i] as f64))
+            .collect();
+        let inputs = vec![xs.to_vec(), cb, vec![0.0]];
+        tape_gate(&fwd, &[0], &inputs, &[want], &mut it);
+    }
+}
+
 /// sigmoid and tanh used to run a synthesized per-element loop on the stored output while the
 /// runtime shipped fused 256-bit backward kernels for exactly them (`VM2_SIGMOID_BWD`,
 /// `VM2_TANH_BWD`). The routing is gate-blind, so pin it.

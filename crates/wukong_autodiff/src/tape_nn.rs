@@ -9,13 +9,18 @@
 //! (`cos` for `sin`, `exp(-x²)` for `erf`, ...); only closed forms in `x` or `y` synthesize a loop.
 
 use crate::tape::{
-    pick, Loop, F32, I64T, INV6, LEAKY_ALPHA, NORM_SOFTMAX, SELU_ALPHA, SELU_LAMBDA, VE_ID,
-    VE_USE_Y, VM2_ATAN2, VM2_ELU_BWD, VM2_GELU_BWD, VM2_GELU_GATE, VM2_HYPOT, VM2_POW,
-    VM2_SIGMOID_BWD, VM2_SIGMOID_GATE, VM2_SILU_BWD, VM2_SILU_GATE, VM2_SOFTPLUS_BWD, VM2_TANH_BWD,
-    VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS, VM_COSH, VM_ELU,
-    VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU, VM_HARDSIGMOID, VM_HARDSWISH,
-    VM_LEAKYRELU, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID, VM_MISH, VM_RELU, VM_SELU,
-    VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_SOFTPLUS, VM_SOFTSIGN, VM_TAN, VM_TANH, VM_TANHSHRINK,
+    pick, Loop, F32, I64T, INV6, LEAKY_ALPHA, NORM_SOFTMAX, QUICK_GELU_SLOPE, SELU_ALPHA,
+    SELU_LAMBDA, VE_ID, VE_USE_Y, VM2_ATAN2, VM2_ELU_BWD, VM2_GELU_BWD, VM2_GELU_GATE, VM2_HYPOT,
+    VM2_POW, VM2_SIGMOID_BWD, VM2_SIGMOID_GATE, VM2_SILU_BWD, VM2_SILU_GATE, VM2_SOFTPLUS_BWD,
+    VM2_TANH_BWD, VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS,
+    VM_COSH, VM_ELU, VM_ELU_EXPM1, VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU,
+    VM_GELU_ERF_CDF, VM_GELU_ERF_DIV, VM_GELU_ERF_MUL, VM_GELU_TANH, VM_GELU_TANH_CDF,
+    VM_GELU_TANH_FAST, VM_GELU_TANH_HF, VM_GELU_TANH_NOFMA, VM_HARDSIGMOID, VM_HARDSIGMOID_CLAMP,
+    VM_HARDSIGMOID_MINMAX, VM_HARDSWISH, VM_HARDSWISH_CLAMP, VM_HARDSWISH_MINMAX, VM_LEAKYRELU,
+    VM_LEAKY_LT, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID, VM_MISH, VM_MISH_LOG1P,
+    VM_MISH_NAIVE, VM_MISH_SOFTPLUS, VM_QUICK_GELU, VM_RELU, VM_SELU, VM_SIGMOID, VM_SIGMOID_RATIO,
+    VM_SILU, VM_SILU_DIV, VM_SILU_SX, VM_SIN, VM_SINH, VM_SOFTPLUS, VM_SOFTPLUS_LOG1P,
+    VM_SOFTPLUS_NAIVE, VM_SOFTSIGN, VM_TAN, VM_TANH, VM_TANHSHRINK,
 };
 use crate::Vjp;
 use wukong_mir::{BinOp, CastKind, CmpOp, MirType, Op, ValueId};
@@ -31,6 +36,28 @@ fn vm2_bwd_code(op: i64) -> Option<i64> {
         VM_SOFTPLUS => VM2_SOFTPLUS_BWD,
         VM_SIGMOID => VM2_SIGMOID_BWD,
         VM_TANH => VM2_TANH_BWD,
+        _ => return None,
+    })
+}
+
+/// The activation a natural spelling (`wukong_runtime::vspell`, P12.10) IS, written another way:
+/// its derivative is that activation's, so it takes that activation's backward rule. The forward
+/// kernels differ in the last bits (that is why they are separate codes); the derivative is of the
+/// function, and every rule this routes to reads only `x` and `dout`, never the forward output
+/// (whose bits are the spelling's). QuickGELU and the erf GELU are functions no other code computes,
+/// so [`Vjp::act_backward`] composes theirs.
+fn spelling_base(op: i64) -> Option<i64> {
+    Some(match op {
+        VM_GELU_TANH | VM_GELU_TANH_HF | VM_GELU_TANH_NOFMA | VM_GELU_TANH_FAST
+        | VM_GELU_TANH_CDF => VM_GELU,
+        VM_SILU_DIV | VM_SILU_SX => VM_SILU,
+        VM_SIGMOID_RATIO => VM_SIGMOID,
+        VM_SOFTPLUS_NAIVE | VM_SOFTPLUS_LOG1P => VM_SOFTPLUS,
+        VM_MISH_NAIVE | VM_MISH_SOFTPLUS | VM_MISH_LOG1P => VM_MISH,
+        VM_HARDSIGMOID_MINMAX | VM_HARDSIGMOID_CLAMP => VM_HARDSIGMOID,
+        VM_HARDSWISH_MINMAX | VM_HARDSWISH_CLAMP => VM_HARDSWISH,
+        VM_ELU_EXPM1 => VM_ELU,
+        VM_LEAKY_LT => VM_LEAKYRELU,
         _ => return None,
     })
 }
@@ -87,11 +114,63 @@ impl<'a> Vjp<'a> {
         dst: ValueId,
         n: ValueId,
     ) -> Result<(), String> {
+        if let Some(base) = spelling_base(op) {
+            return self.act_backward(base, dout, x, y, dst, n);
+        }
         if let Some(bwd) = vm2_bwd_code(op) {
             self.vmath2_call(x, dout, dst, n, bwd);
             return Ok(());
         }
         match op {
+            VM_QUICK_GELU => {
+                // x*s(kx), k = 1.702: s(kx) + k*x*s(kx)*(1 - s(kx)).
+                self.velem_axpc(dst, x, QUICK_GELU_SLOPE, 0.0, n);
+                self.vmath_call(dst, dst, n, VM_SIGMOID);
+                let lp = self.open_loop(n);
+                let i = lp.idx;
+                let s = self.load_at(dst, i);
+                let xi = self.load_at(x, i);
+                let d = self.load_at(dout, i);
+                let one = self.cf32(1.0);
+                let k = self.cf32(QUICK_GELU_SLOPE);
+                let oms = self.b.build(F32, Op::Bin(BinOp::FSub, one, s));
+                let kx = self.fmul(k, xi, &F32);
+                let kxs = self.fmul(kx, s, &F32);
+                let term = self.fmul(kxs, oms, &F32);
+                let fp = self.fadd(s, term, &F32);
+                let v = self.fmul(d, fp, &F32);
+                self.store_at(dst, i, v);
+                self.close_loop(lp);
+                return Ok(());
+            }
+            VM_GELU_ERF_DIV | VM_GELU_ERF_MUL | VM_GELU_ERF_CDF => {
+                // x*Phi(x): Phi(x) + x*phi(x) = 0.5*(1 + erf(x/sqrt 2)) + x*exp(-x^2/2)/sqrt(2 pi).
+                self.velem_axpc(dst, x, std::f64::consts::FRAC_1_SQRT_2, 0.0, n);
+                self.vmath_call(dst, dst, n, VM_ERF);
+                let g = self.scratch(n);
+                self.velem_hadamard(g, x, x, n);
+                self.velem_axpc(g, g, -0.5, 0.0, n);
+                self.vmath_call(g, g, n, VM_EXP);
+                let lp = self.open_loop(n);
+                let i = lp.idx;
+                let e = self.load_at(dst, i);
+                let gi = self.load_at(g, i);
+                let xi = self.load_at(x, i);
+                let d = self.load_at(dout, i);
+                let half = self.cf32(0.5);
+                // 1/sqrt(2 pi) = (2/sqrt(pi)) * (1/sqrt(2)) / 2.
+                let inv_sqrt_2pi = self
+                    .cf32(0.5 * std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2);
+                let he = self.fmul(half, e, &F32);
+                let cdf = self.fadd(half, he, &F32);
+                let xg = self.fmul(xi, gi, &F32);
+                let pdf = self.fmul(xg, inv_sqrt_2pi, &F32);
+                let fp = self.fadd(cdf, pdf, &F32);
+                let v = self.fmul(d, fp, &F32);
+                self.store_at(dst, i, v);
+                self.close_loop(lp);
+                return Ok(());
+            }
             VM_SIN => {
                 self.vmath_call(x, dst, n, VM_COS);
                 self.velem_hadamard(dst, dst, dout, n);
