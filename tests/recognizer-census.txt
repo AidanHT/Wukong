@@ -495,6 +495,12 @@ softmax_early_seed.wk: wukong_norm_f32 wukong_norm_f32*2
 softmax_fused.wk: wukong_norm_f32 wukong_norm_f32*2
 softplus.wk: wukong_vmath_f32
 softsign_logsigmoid.wk: wukong_vmath_f32
+spelling_act_gelu_erf.wk: wukong_rt_fmt_int wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_vmath_f32 wukong_vmath_f32*4
+spelling_act_gelu_tanh.wk: wukong_rt_fmt_int wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_vmath_f32 wukong_vmath_f32*7
+spelling_act_hard.wk: wukong_rt_fmt_int wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_vmath_f32 wukong_vmath_f32*6
+spelling_act_leaky_elu.wk: wukong_rt_fmt_int wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_vmath_f32 wukong_vmath_f32*7
+spelling_act_silu_sigmoid.wk: wukong_rt_fmt_int wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_vmath_f32 wukong_vmath_f32*8
+spelling_act_softplus_mish.wk: wukong_rt_fmt_int wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_vmath_f32 wukong_vmath_f32*8
 spelling_rowouter_colreduce.wk: wukong_colmax_f32 wukong_colmaxabs_f32 wukong_colmin_f32 wukong_colsum_f32 wukong_colsum_f32*2 wukong_colsumsq_f32 wukong_velem_f32
 spelling_softmax_out_of_place.wk: wukong_norm_f32 wukong_norm_f32*3
 spelling_tiled_gemm.wk: wukong_sgemm wukong_sgemm*3

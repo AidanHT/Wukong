@@ -60,6 +60,17 @@ const DECLARED_TOLERANCES: &[(&str, &str)] = &[
     // and keep every lane at |ref| >= 0.01 (no cancellation lanes), so no line is looser than its
     // kernel's own published contract implies at that magnitude.
     (
+        "5e-6",
+        "wukong_runtime/src/vspell.rs `vspell_relative_error_in_each_spellings_well_conditioned_range` \
+         — the natural-activation spelling kernels' relative error against the exact function each \
+         spells (f64, the spelling's own f32 constants), asserted over a 2^-6 grid of each \
+         spelling's well-conditioned range (the tanh/erf GELUs from -1.5, every log(1 + exp(..)) \
+         from -4, the rest from -40, all to 40). Measured worst: 3.8e-6 (QuickGELU near -39), \
+         3.1e-6 (naive softplus near -3.9), 1.1e-6 (erf GELUs), at most 6e-7 elsewhere. Used by the \
+         spelling_act_*.wk fixtures, on lanes inside those ranges whose bits the scalar semantics \
+         do not pin.",
+    ),
+    (
         "1e-5",
         "B = 1e-5, at |ref| >= 1: the row-loss kernels' f64-reference bound — \
          wukong_runtime/src/entropy.rs:262, kldiv.rs:280, kd_loss.rs:390, xent.rs:342 and \

@@ -1,0 +1,239 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000
+// EXPECT-OUT-APPROX: -1.6993417021166355e-16 5e-6
+// EXPECT-OUT-APPROX: -0.009757684668790446 5e-6
+// EXPECT-OUT-APPROX: -0.14227761953270035 5e-6
+// EXPECT-OUT-APPROX: -0.27837517353163604 5e-6
+// EXPECT-OUT-APPROX: -0.1887703343990727 5e-6
+// EXPECT-OUT-APPROX: 0.14054412522144952 5e-6
+// EXPECT-OUT-VALUES: 3f0266fe
+// EXPECT-OUT-APPROX: 1.2263617142904655 5e-6
+// EXPECT-OUT-VALUES: 40483c6a 40ffea06 4147ffd0 ffc54321 41a00000
+// EXPECT-OUT-VALUES: 1111111111111111111 ffc12345 80000000 0 7f800000 ffc00000 42200000
+// EXPECT-OUT-APPROX: -1.6993417021166355e-16 5e-6
+// EXPECT-OUT-APPROX: -0.009757684668790446 5e-6
+// EXPECT-OUT-APPROX: -0.14227761953270035 5e-6
+// EXPECT-OUT-APPROX: -0.27837517353163604 5e-6
+// EXPECT-OUT-APPROX: -0.1887703343990727 5e-6
+// EXPECT-OUT-APPROX: 0.14054412522144952 5e-6
+// EXPECT-OUT-APPROX: 0.5093840243815447 5e-6
+// EXPECT-OUT-APPROX: 1.2263617142904655 5e-6
+// EXPECT-OUT-VALUES: 40483c6a 40ffea06 4147ffd0 7fc54321 41a00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000
+// EXPECT-OUT-APPROX: -1.6993417021166355e-16 5e-6
+// EXPECT-OUT-APPROX: -0.009757684668790446 5e-6
+// EXPECT-OUT-APPROX: -0.14227761953270035 5e-6
+// EXPECT-OUT-APPROX: -0.27837517353163604 5e-6
+// EXPECT-OUT-APPROX: -0.1887703343990727 5e-6
+// EXPECT-OUT-APPROX: 0.14054412522144952 5e-6
+// EXPECT-OUT-APPROX: 0.5093840243815447 5e-6
+// EXPECT-OUT-APPROX: 1.2263617142904655 5e-6
+// EXPECT-OUT-VALUES: 40483c6a 40ffea06 4147ffd0 ffc54321 41a00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000
+// EXPECT-OUT-APPROX: -1.6993417021166355e-16 5e-6
+// EXPECT-OUT-APPROX: -0.009757684668790446 5e-6
+// EXPECT-OUT-APPROX: -0.14227761953270035 5e-6
+// EXPECT-OUT-APPROX: -0.27837517353163604 5e-6
+// EXPECT-OUT-APPROX: -0.1887703343990727 5e-6
+// EXPECT-OUT-APPROX: 0.14054412522144952 5e-6
+// EXPECT-OUT-APPROX: 0.5093840243815447 5e-6
+// EXPECT-OUT-APPROX: 1.2263617142904655 5e-6
+// EXPECT-OUT-VALUES: 40483c6a 40ffea06 4147ffd0 ffc54321 41a00000
+// EXPECT-OUT-VALUES: 1111111111111111111 ffc12345 3f000000 3f000000 3f800000 0 3f800000
+// EXPECT-OUT-APPROX: 4.248354255291589e-18 5e-6
+// EXPECT-OUT-APPROX: 0.0015011822567369917 5e-6
+// EXPECT-OUT-APPROX: 0.04742587317756678 5e-6
+// EXPECT-OUT-APPROX: 0.22270013882530884 5e-6
+// EXPECT-OUT-APPROX: 0.3775406687981454 5e-6
+// EXPECT-OUT-APPROX: 0.5621765008857981 5e-6
+// EXPECT-OUT-APPROX: 0.679178699175393 5e-6
+// EXPECT-OUT-APPROX: 0.8175744761936437 5e-6
+// EXPECT-OUT-VALUES: 3f7671be 3f7fea06 3f7fffc2 7fc54321 3f800000
+// EXPECT-OUT-VALUES: 1111111111111111111 ffc12345 3f000000 3f000000 3f800000 0 3f800000
+// EXPECT-OUT-APPROX: 4.248354255291589e-18 5e-6
+// EXPECT-OUT-APPROX: 0.0015011822567369917 5e-6
+// EXPECT-OUT-APPROX: 0.04742587317756678 5e-6
+// EXPECT-OUT-APPROX: 0.22270013882530884 5e-6
+// EXPECT-OUT-APPROX: 0.3775406687981454 5e-6
+// EXPECT-OUT-APPROX: 0.5621765008857981 5e-6
+// EXPECT-OUT-APPROX: 0.679178699175393 5e-6
+// EXPECT-OUT-APPROX: 0.8175744761936437 5e-6
+// EXPECT-OUT-VALUES: 3f7671be 3f7fea06 3f7fffc2 7fc54321 3f800000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 3f000000 3f000000 ffc00000 0
+// EXPECT-OUT-APPROX: 1.0 5e-6
+// EXPECT-OUT-APPROX: 4.248354255291589e-18 5e-6
+// EXPECT-OUT-APPROX: 0.0015011822567369917 5e-6
+// EXPECT-OUT-APPROX: 0.04742587317756678 5e-6
+// EXPECT-OUT-APPROX: 0.22270013882530884 5e-6
+// EXPECT-OUT-APPROX: 0.3775406687981454 5e-6
+// EXPECT-OUT-APPROX: 0.5621765008857981 5e-6
+// EXPECT-OUT-APPROX: 0.679178699175393 5e-6
+// EXPECT-OUT-APPROX: 0.8175744761936437 5e-6
+// EXPECT-OUT-APPROX: 0.9626731126558706 5e-6
+// EXPECT-OUT-APPROX: 0.9996646498695336 5e-6
+// EXPECT-OUT-APPROX: 0.9999962733607158 5e-6
+// EXPECT-OUT-VALUES: ffc54321
+// EXPECT-OUT-APPROX: 0.9999999979388463 5e-6
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000
+// EXPECT-OUT-APPROX: -1.6993417021166355e-16 5e-6
+// EXPECT-OUT-APPROX: -0.009757684668790446 5e-6
+// EXPECT-OUT-APPROX: -0.14227761953270035 5e-6
+// EXPECT-OUT-APPROX: -0.27837517353163604 5e-6
+// EXPECT-OUT-APPROX: -0.1887703343990727 5e-6
+// EXPECT-OUT-APPROX: 0.14054412522144952 5e-6
+// EXPECT-OUT-VALUES: 3f0266fe
+// EXPECT-OUT-APPROX: 1.2263617142904655 5e-6
+// EXPECT-OUT-VALUES: 40483c6a 40ffea06 4147ffd0 ffc54321 41a00000
+module tests.run.spelling_act_silu_sigmoid
+
+// P12.10, natural activation spellings: SiLU and sigmoid written out: the quotient, both product
+// orders, the reciprocal, the exp ratio. Each spelling below is an elementwise loop `o[i] =
+// <spelling of x[i]>` that the recognizer dispatches to a 256-bit `wukong_vmath_f32` kernel
+// computing THAT spelling's own scalar semantics (wukong_runtime/src/vspell.rs; the matcher is
+// wukong_mir_build/src/spell.rs): `div_one_plus_exp` -> VM_SILU_DIV (45), `sigmoid_times_x` ->
+// VM_SILU_SX (46), `x_times_sigmoid` -> VM_SILU (5), `x_times_reciprocal` -> VM_SILU (5),
+// `sigmoid_reciprocal` -> VM_SIGMOID (3), `sigmoid_reciprocal_exp_first` -> VM_SIGMOID (3),
+// `sigmoid_exp_ratio` -> VM_SIGMOID_RATIO (47). `div_one_plus_exp` runs a second time through a
+// `[]f32` slice helper, where the kernel takes a run-time length.
+//
+// WHAT IS PRINTED. For each spelling, one line of 19 flags -- lane i is 1 when the dispatched lane
+// equals, bit for bit, the same spelling evaluated per element through a plain `fn` the recognizer
+// never sees (`ref_*`), so recognition on and off are compared inside the program on every backend
+// and opt level -- then every lane: its bit pattern in hex where the scalar semantics pin it (the
+// `exact` mask), else its value. 19 lanes are two full 8-lane groups and a 3-lane scalar tail; a
+// NaN sits in each (lane 0 and lane 17). The output buffers are poisoned with -12345.0 before each
+// loop, so a lane the kernel never wrote cannot pass.
+//
+// Inputs, lane by lane: NaN 0x7fc12345, -0, +0, +inf, -inf, 40.0, -40.0, -6.5, -3.0, -1.25, -0.5,
+// 0.25, 0.75, 1.5, 3.25, 8.0, 12.5, NaN 0xffc54321, 20.0.
+//
+// WHERE THE EXPECTED VALUES COME FROM (never a compiler run). The hex lanes follow from IEEE single
+// precision step by step through the operations the spelling lowers to (a `+` with a product
+// operand is one fused multiply-add, `max(a, b)` is `a > b ? a : b`, `clamp` is two ordered
+// selects), with x86's NaN rules: a NaN operand comes back quieted (the first NaN when there are
+// two, which is how `sigmoid(x) * x` returns the sigmoid's sign-flipped NaN), and an invalid
+// operation on non-NaN operands (`inf * 0`, `inf / inf`) is the default NaN ffc00000. The
+// transcendentals enter only through limits their kernels pin exactly: exp(0) = 1, exp(-inf) = +0
+// and exp(+inf) = +inf; tanh(+-0) = +-0 and |tanh| = 1 from |x| >= 10 on; erf = +-1 from |x| >= 9.5
+// on; log(1) = +0; log1p(u) = u and expm1(u) = u when 1 + u rounds to 1; expm1 = -1 where exp
+// underflows to 0; a NaN argument comes back quieted with its sign. A lane is printed in hex only
+// if its bits do not move when every transcendental result in it is moved by up to 3 ULP. Every
+// other lane is an EXPECT-OUT-APPROX against the exact function in f64 (with the spelling's own f32
+// constants), at the declared 5e-6: the relative error
+// `vspell_relative_error_in_each_spellings_well_conditioned_range` asserts for each spelling over a
+// 2^-6 grid of its well-conditioned range, which holds every such lane here.
+//
+// GATE-BLINDNESS. The kernel is called on the interpreter and on native at every -O level, so the
+// differential and invariance gates cannot see whether it fired; tests/recognizer-census.txt pins
+// the dispatch, and `cargo run -q -p wukongc -- --emit=mir -O2` on this file shows one
+// `wukong_vmath_f32` call per spelling with the op codes above.
+
+fn ref_div_one_plus_exp(v: f32) -> f32 {
+    return v / (1.0 + exp(-v));
+}
+
+fn ref_sigmoid_times_x(v: f32) -> f32 {
+    return sigmoid(v) * v;
+}
+
+fn ref_x_times_sigmoid(v: f32) -> f32 {
+    return v * sigmoid(v);
+}
+
+fn ref_x_times_reciprocal(v: f32) -> f32 {
+    return v * (1.0 / (1.0 + exp(-v)));
+}
+
+fn ref_sigmoid_reciprocal(v: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-v));
+}
+
+fn ref_sigmoid_reciprocal_exp_first(v: f32) -> f32 {
+    return 1.0 / (exp(-v) + 1.0);
+}
+
+fn ref_sigmoid_exp_ratio(v: f32) -> f32 {
+    return exp(v) / (1.0 + exp(v));
+}
+
+fn div_one_plus_exp_slice(x: []f32, mut o: []f32, n: i64) {
+    for i in 0..n { o[i] = x[i] / (1.0 + exp(-x[i])); }
+}
+
+// One spelling's report (`while`, so nothing here is a recognizer's business): the 19 flags,
+// then each lane -- in hex where bit i of `exact` is set, else as its value.
+fn show(o: []f32, r: []f32, exact: i64) {
+    let mut i: i64 = 0;
+    while i < 19 {
+        if bits(o[i]) == bits(r[i]) { printf("1"); } else { printf("0"); }
+        i = i + 1;
+    }
+    printf("\n");
+    i = 0;
+    while i < 19 {
+        if ((exact >> i) & 1) == 1 { printf("{:x}\n", bits(o[i])); } else { print(o[i]); }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 19] = [f32_from_bits(0x7fc12345), -0.0, 0.0, f32_from_bits(0x7f800000),
+    f32_from_bits(0xff800000), 40.0, -40.0, -6.5, -3.0, -1.25, -0.5, 0.25, 0.75, 1.5, 3.25, 8.0,
+    12.5, f32_from_bits(0xffc54321), 20.0];
+
+    // div_one_plus_exp -> VM_SILU_DIV (45)
+    let mut o0: [f32; 19] = [-12345.0; 19];
+    let mut r0: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o0[i] = x[i] / (1.0 + exp(-x[i])); }
+    for i in 0..19 { r0[i] = ref_div_one_plus_exp(x[i]); }
+    show(o0, r0, 0x7d03f);
+
+    // sigmoid_times_x -> VM_SILU_SX (46)
+    let mut o1: [f32; 19] = [-12345.0; 19];
+    let mut r1: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o1[i] = sigmoid(x[i]) * x[i]; }
+    for i in 0..19 { r1[i] = ref_sigmoid_times_x(x[i]); }
+    show(o1, r1, 0x7c03f);
+
+    // x_times_sigmoid -> VM_SILU (5)
+    let mut o2: [f32; 19] = [-12345.0; 19];
+    let mut r2: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o2[i] = x[i] * sigmoid(x[i]); }
+    for i in 0..19 { r2[i] = ref_x_times_sigmoid(x[i]); }
+    show(o2, r2, 0x7c03f);
+
+    // x_times_reciprocal -> VM_SILU (5)
+    let mut o3: [f32; 19] = [-12345.0; 19];
+    let mut r3: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o3[i] = x[i] * (1.0 / (1.0 + exp(-x[i]))); }
+    for i in 0..19 { r3[i] = ref_x_times_reciprocal(x[i]); }
+    show(o3, r3, 0x7c03f);
+
+    // sigmoid_reciprocal -> VM_SIGMOID (3)
+    let mut o4: [f32; 19] = [-12345.0; 19];
+    let mut r4: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o4[i] = 1.0 / (1.0 + exp(-x[i])); }
+    for i in 0..19 { r4[i] = ref_sigmoid_reciprocal(x[i]); }
+    show(o4, r4, 0x7c03f);
+
+    // sigmoid_reciprocal_exp_first -> VM_SIGMOID (3)
+    let mut o5: [f32; 19] = [-12345.0; 19];
+    let mut r5: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o5[i] = 1.0 / (exp(-x[i]) + 1.0); }
+    for i in 0..19 { r5[i] = ref_sigmoid_reciprocal_exp_first(x[i]); }
+    show(o5, r5, 0x7c03f);
+
+    // sigmoid_exp_ratio -> VM_SIGMOID_RATIO (47)
+    let mut o6: [f32; 19] = [-12345.0; 19];
+    let mut r6: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o6[i] = exp(x[i]) / (1.0 + exp(x[i])); }
+    for i in 0..19 { r6[i] = ref_sigmoid_exp_ratio(x[i]); }
+    show(o6, r6, 0x2001f);
+
+    // div_one_plus_exp again, through the `[]f32` helper
+    let mut o7: [f32; 19] = [-12345.0; 19];
+    div_one_plus_exp_slice(x, o7, 19);
+    show(o7, r0, 0x7d03f);
+    return 0;
+}
