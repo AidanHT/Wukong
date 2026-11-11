@@ -553,8 +553,8 @@ const LEXER_PARSER_PROBES: &[(&str, &str)] = &[
 ];
 
 /// Every catalogued lexer/parser diagnostic must still be reachable from real source. Without this,
-/// renumbering `"E0205"` to `"E0210"` in the parser leaves the whole suite green while the compiler
-/// starts emitting an uncatalogued code for a malformed turbofish.
+/// renumbering `"E0205"` to an uncatalogued code such as `"E0299"` in the parser leaves the whole
+/// suite green while the compiler starts emitting it for a malformed turbofish.
 #[test]
 fn lexer_and_parser_diagnostics_are_reachable() {
     let dir = std::env::temp_dir()

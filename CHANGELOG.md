@@ -21,7 +21,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   fix for a one-line comment, and none in a file that already has a syntax error
   (`tests/fail/doc_comment_documents_nothing.wk`). An error, not a warning: a doc comment is
   published and run, so one silently dropped is lost documentation. Every `///` already in the
-  corpus documents an item. W0030's catalogue text no longer reserves E0210.
+  corpus documents an item. W0030's catalogue text, the roadmap and the lint table no longer
+  reserve E0210 (the older entry below that reserves it is superseded): a missing-`;` error would
+  need a new code.
 - **Added: `--emit=doc`**, the root file's documentation as Markdown on stdout: the title (`module`
   path or file name), the `//!` docs, then every item in source order with a `##` heading, its
   signature in a `wk` fence — printed by `wukong_fmt`'s own printer, so it reads exactly as

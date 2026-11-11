@@ -1061,9 +1061,10 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   start of a line, which silently continues the expression above (`acc = a[i]` then `(b + c)` is
   a call), is **`W0031 ambiguous_continuation`** (only where a statement could begin; `- y` with a
   space stays silent). The parser hands both out on a separate channel
-  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. `E0210` is
-  reserved for making a missing `;` an error. Not yet: imported files' parser lints (the loader
-  still uses the lint-free entry point), and `defer` statements' terminator.
+  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. Making a
+  missing `;` an error would take a new code: `E0210` is now the doc-comment error (a doc comment
+  that documents nothing). Not yet: imported files' parser lints (the loader still uses the
+  lint-free entry point), and `defer` statements' terminator.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
