@@ -65,3 +65,23 @@ Thumbs.db
 scratch_*.wk
 *.o
 *_rt.c
+
+# Internal planning documents, campaign trackers and agent prompts: kept in local checkouts only,
+# never published.
+/prompts/
+/CAMPAIGN_CHECKPOINT.md
+/next-steps.md
+/GPU_RETARGET_PLAN.md
+/WUKONG_CODE_MAP.md
+/P[0-9]_*_REPORT.md
+/docs/sota-campaign-2026-09/
+/docs/lang/
+/docs/gpu/
+/docs/cpu-evaluation-probes/
+/docs/cpu-*-2026-09*.md
+/docs/RESUME-CPU-EVALUATION-2026-09.md
+/docs/WUKONG_MASTER_PLAN.md
+/docs/LANGUAGE_DIRECTION.md
+
+# Local agent-tool state.
+.superpowers/
