@@ -219,7 +219,7 @@ fn the_examples_doctests_pass() {
     assert_eq!(
         lf(&out),
         "running 1 doctest in examples/saxpy_array.wk\n\
-         doctest examples/saxpy_array.wk:11 (fn main) ... ok\n\
+         doctest examples/saxpy_array.wk:12 (fn saxpy) ... ok\n\
          \n\
          doctest result: ok. 1 passed; 0 failed; 0 ignored\n"
     );

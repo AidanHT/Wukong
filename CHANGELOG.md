@@ -54,9 +54,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   through a golden. The formatter's corpus test also formats `tests/doc/`.
 - **Examples documented and tested:** `examples/relu.wk` documents `relu` with an example that
   asserts every output lane and the file with a `compile_fail,E0501` example (a buffer of the wrong
-  length); `examples/saxpy_array.wk` checks one lane. `crates/wukongc/tests/doc.rs` runs them, the
-  `tests/doc/` fixtures (a hand-written `--emit=doc` page, every passing kind of example on interp
-  and native at `-O0`/`-O2`, every way an example fails) and `--emit=doc` over the whole corpus.
+  length); `examples/saxpy_array.wk` moves its loop into a `saxpy` kernel that `main` calls and
+  documents it with an example that calls it and asserts every output lane (an example only sees
+  the file's items, never its `main`, so one that calls nothing checks nothing).
+  `crates/wukongc/tests/doc.rs` runs them, the `tests/doc/` fixtures (a hand-written `--emit=doc`
+  page, every passing kind of example on interp and native at `-O0`/`-O2`, every way an example
+  fails) and `--emit=doc` over the whole corpus.
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

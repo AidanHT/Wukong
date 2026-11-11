@@ -32,7 +32,8 @@ The `///` and `//!` doc comments are part of the program: `--emit=doc examples/r
 them as Markdown with every item's signature, and `--doctest examples/relu.wk` compiles and runs the
 ```` ```wk ```` examples in them. `relu.wk` documents `relu` with an example that asserts every
 output lane and the file with a `compile_fail` example (a buffer of the wrong length is `E0501`);
-`saxpy_array.wk` checks one lane by hand. `crates/wukongc/tests/doc.rs` runs both.
+`saxpy_array.wk` documents its `saxpy` kernel with an example that calls it and asserts every
+output lane. `crates/wukongc/tests/doc.rs` runs both.
 
 `--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
 them, so the combination is rejected rather than silently discarding half the work.
