@@ -16,7 +16,10 @@
 //! kernel on every spelling (`5f423d1e`), while `gelu` keeps `tanh_exp1` inside; the expansion is
 //! therefore a different function in the last bits on ordinary inputs (6 of 16 lanes of
 //! `tests/run/spelling_value_bindings.wk`), and substituting the kernel would change the answer.
-//! It lowers as written, through the generic vectorizer's inline `tanh`.
+//! Since P12.10 it dispatches the kernel of its OWN expression instead (`VM_GELU_TANH`), as every
+//! natural spelling of an activation does (`spell.rs`): the per-statement `match_vmath_body` probe
+//! reads it as the tree of operations it lowers to, through any leading `let`s, before this view
+//! is ever tried.
 
 use wukong_ast::{Block, Expr};
 use wukong_mir::{MirType, ValueId};

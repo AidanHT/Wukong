@@ -9,13 +9,18 @@
 //! (`cos` for `sin`, `exp(-x²)` for `erf`, ...); only closed forms in `x` or `y` synthesize a loop.
 
 use crate::tape::{
-    pick, Loop, F32, I64T, INV6, LEAKY_ALPHA, NORM_SOFTMAX, SELU_ALPHA, SELU_LAMBDA, VE_ID,
-    VE_USE_Y, VM2_ATAN2, VM2_ELU_BWD, VM2_GELU_BWD, VM2_GELU_GATE, VM2_HYPOT, VM2_POW,
-    VM2_SIGMOID_BWD, VM2_SIGMOID_GATE, VM2_SILU_BWD, VM2_SILU_GATE, VM2_SOFTPLUS_BWD, VM2_TANH_BWD,
-    VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS, VM_COSH, VM_ELU,
-    VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU, VM_HARDSIGMOID, VM_HARDSWISH,
-    VM_LEAKYRELU, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID, VM_MISH, VM_RELU, VM_SELU,
-    VM_SIGMOID, VM_SILU, VM_SIN, VM_SINH, VM_SOFTPLUS, VM_SOFTSIGN, VM_TAN, VM_TANH, VM_TANHSHRINK,
+    pick, Loop, F32, I64T, INV6, LEAKY_ALPHA, NORM_SOFTMAX, QUICK_GELU_SLOPE, SELU_ALPHA,
+    SELU_LAMBDA, VE_ID, VE_USE_Y, VM2_ATAN2, VM2_ELU_BWD, VM2_GELU_BWD, VM2_GELU_GATE, VM2_HYPOT,
+    VM2_POW, VM2_SIGMOID_BWD, VM2_SIGMOID_GATE, VM2_SILU_BWD, VM2_SILU_GATE, VM2_SOFTPLUS_BWD,
+    VM2_TANH_BWD, VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH, VM_CBRT, VM_COS,
+    VM_COSH, VM_ELU, VM_ELU_EXPM1, VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_GELU,
+    VM_GELU_ERF_CDF, VM_GELU_ERF_DIV, VM_GELU_ERF_MUL, VM_GELU_TANH, VM_GELU_TANH_CDF,
+    VM_GELU_TANH_FAST, VM_GELU_TANH_HF, VM_GELU_TANH_NOFMA, VM_HARDSIGMOID, VM_HARDSIGMOID_CLAMP,
+    VM_HARDSIGMOID_MINMAX, VM_HARDSWISH, VM_HARDSWISH_CLAMP, VM_HARDSWISH_MINMAX, VM_LEAKYRELU,
+    VM_LEAKY_GE, VM_LEAKY_LT, VM_LEAKY_MAX, VM_LOG, VM_LOG10, VM_LOG1P, VM_LOG2, VM_LOGSIGMOID,
+    VM_MISH, VM_MISH_LOG1P, VM_MISH_NAIVE, VM_MISH_SOFTPLUS, VM_QUICK_GELU, VM_RELU, VM_SELU,
+    VM_SIGMOID, VM_SIGMOID_RATIO, VM_SILU, VM_SILU_DIV, VM_SILU_SX, VM_SIN, VM_SINH, VM_SOFTPLUS,
+    VM_SOFTPLUS_LOG1P, VM_SOFTPLUS_NAIVE, VM_SOFTSIGN, VM_TAN, VM_TANH, VM_TANHSHRINK,
 };
 use crate::Vjp;
 use wukong_mir::{BinOp, CastKind, CmpOp, MirType, Op, ValueId};
@@ -31,6 +36,37 @@ fn vm2_bwd_code(op: i64) -> Option<i64> {
         VM_SOFTPLUS => VM2_SOFTPLUS_BWD,
         VM_SIGMOID => VM2_SIGMOID_BWD,
         VM_TANH => VM2_TANH_BWD,
+        _ => return None,
+    })
+}
+
+/// The activation a smooth natural spelling (`wukong_runtime::vspell`, P12.10) IS, written another
+/// way: its derivative is that activation's, so it takes that activation's backward rule. The
+/// forward kernels differ in the last bits (that is why they are separate codes); the derivative is
+/// of the function, and every rule this routes to reads only `x` and `dout`, never the forward
+/// output (whose bits are the spelling's). QuickGELU and the erf GELU are functions no other code
+/// computes, so [`Vjp::act_backward`] composes theirs.
+///
+/// The ELU spelling's derivative has no kink (`e^0 = 1` from both sides), so it shares `VM_ELU`'s.
+/// The select-spelled spellings WITH a kink -- the leaky selects and the `clamp` / `min`-`max` hard
+/// activations -- are deliberately absent: at the kink the derivative is a choice, and theirs is
+/// the one their own selects make (the language's `Select` VJP hands the adjoint to the operand
+/// selected), which the intrinsics' rules do not all match. `x < 0 ? 0.01x : x` takes the identity
+/// branch at `x = 0` where `VM_LEAKYRELU`'s `x > 0` takes the slope (and `max(x, 0.01x)` the slope at
+/// `x = +inf`, where `x > 0` takes the identity); `clamp(v, 0, 6)` passes `v` on
+/// the closed `[0, 6]` where `VM_HARDSIGMOID` uses the open `(-3, 3)` in `x`; and even
+/// `min(max(v, 0), 6)` sees `v = x + 3` round to 6 at `x = 3 - 2^-22`, inside that open interval.
+/// Their rules are in [`Vjp::algebraic_derivative`], each its spelling's selects over the rounded
+/// `v`.
+fn spelling_base(op: i64) -> Option<i64> {
+    Some(match op {
+        VM_GELU_TANH | VM_GELU_TANH_HF | VM_GELU_TANH_NOFMA | VM_GELU_TANH_FAST
+        | VM_GELU_TANH_CDF => VM_GELU,
+        VM_SILU_DIV | VM_SILU_SX => VM_SILU,
+        VM_SIGMOID_RATIO => VM_SIGMOID,
+        VM_SOFTPLUS_NAIVE | VM_SOFTPLUS_LOG1P => VM_SOFTPLUS,
+        VM_MISH_NAIVE | VM_MISH_SOFTPLUS | VM_MISH_LOG1P => VM_MISH,
+        VM_ELU_EXPM1 => VM_ELU,
         _ => return None,
     })
 }
@@ -64,13 +100,21 @@ fn is_algebraic(op: i64) -> bool {
             | VM_ACOS
             | VM_SINH
             | VM_CBRT
+            | VM_HARDSIGMOID_MINMAX
+            | VM_HARDSIGMOID_CLAMP
+            | VM_HARDSWISH_MINMAX
+            | VM_HARDSWISH_CLAMP
+            | VM_LEAKY_LT
+            | VM_LEAKY_GE
+            | VM_LEAKY_MAX
     )
 }
 
 impl<'a> Vjp<'a> {
     /// `dst = dout (.) act'(x)` over `n` elements, for the forward activation `y = act(x)` (`x` the
     /// pre-activation buffer, `y` the output buffer, both in the new value space). `dst` must not
-    /// alias `dout`, `x` or `y`; it is fully overwritten. All 36 `wukong_runtime::vmath` codes:
+    /// alias `dout`, `x` or `y`; it is fully overwritten. All 36 `wukong_runtime::vmath` codes, and
+    /// the natural-spelling codes after them (`wukong_runtime::vspell`; see [`spelling_base`]):
     ///
     /// - **fused backward kernel** (silu, gelu, elu, softplus, sigmoid, tanh) — one
     ///   `wukong_vmath2_f32(x, dout, dst, n, *_BWD)`;
@@ -87,11 +131,63 @@ impl<'a> Vjp<'a> {
         dst: ValueId,
         n: ValueId,
     ) -> Result<(), String> {
+        if let Some(base) = spelling_base(op) {
+            return self.act_backward(base, dout, x, y, dst, n);
+        }
         if let Some(bwd) = vm2_bwd_code(op) {
             self.vmath2_call(x, dout, dst, n, bwd);
             return Ok(());
         }
         match op {
+            VM_QUICK_GELU => {
+                // x*s(kx), k = 1.702: s(kx) + k*x*s(kx)*(1 - s(kx)).
+                self.velem_axpc(dst, x, QUICK_GELU_SLOPE, 0.0, n);
+                self.vmath_call(dst, dst, n, VM_SIGMOID);
+                let lp = self.open_loop(n);
+                let i = lp.idx;
+                let s = self.load_at(dst, i);
+                let xi = self.load_at(x, i);
+                let d = self.load_at(dout, i);
+                let one = self.cf32(1.0);
+                let k = self.cf32(QUICK_GELU_SLOPE);
+                let oms = self.b.build(F32, Op::Bin(BinOp::FSub, one, s));
+                let kx = self.fmul(k, xi, &F32);
+                let kxs = self.fmul(kx, s, &F32);
+                let term = self.fmul(kxs, oms, &F32);
+                let fp = self.fadd(s, term, &F32);
+                let v = self.fmul(d, fp, &F32);
+                self.store_at(dst, i, v);
+                self.close_loop(lp);
+                return Ok(());
+            }
+            VM_GELU_ERF_DIV | VM_GELU_ERF_MUL | VM_GELU_ERF_CDF => {
+                // x*Phi(x): Phi(x) + x*phi(x) = 0.5*(1 + erf(x/sqrt 2)) + x*exp(-x^2/2)/sqrt(2 pi).
+                self.velem_axpc(dst, x, std::f64::consts::FRAC_1_SQRT_2, 0.0, n);
+                self.vmath_call(dst, dst, n, VM_ERF);
+                let g = self.scratch(n);
+                self.velem_hadamard(g, x, x, n);
+                self.velem_axpc(g, g, -0.5, 0.0, n);
+                self.vmath_call(g, g, n, VM_EXP);
+                let lp = self.open_loop(n);
+                let i = lp.idx;
+                let e = self.load_at(dst, i);
+                let gi = self.load_at(g, i);
+                let xi = self.load_at(x, i);
+                let d = self.load_at(dout, i);
+                let half = self.cf32(0.5);
+                // 1/sqrt(2 pi) = (2/sqrt(pi)) * (1/sqrt(2)) / 2.
+                let inv_sqrt_2pi = self
+                    .cf32(0.5 * std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2);
+                let he = self.fmul(half, e, &F32);
+                let cdf = self.fadd(half, he, &F32);
+                let xg = self.fmul(xi, gi, &F32);
+                let pdf = self.fmul(xg, inv_sqrt_2pi, &F32);
+                let fp = self.fadd(cdf, pdf, &F32);
+                let v = self.fmul(d, fp, &F32);
+                self.store_at(dst, i, v);
+                self.close_loop(lp);
+                return Ok(());
+            }
             VM_SIN => {
                 self.vmath_call(x, dst, n, VM_COS);
                 self.velem_hadamard(dst, dst, dout, n);
@@ -236,6 +332,83 @@ impl<'a> Vjp<'a> {
                 let inb = self.b.build(F32, Op::Select(below, inv6, zero));
                 let above = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, nthree));
                 self.b.build(F32, Op::Select(above, inb, zero))
+            }
+            // The kinked spellings: each derivative is the spelling's own selects, so the adjoint
+            // goes where the select sent the value (see [`spelling_base`]).
+            VM_LEAKY_LT => {
+                // `x < 0 ? 0.01x : x`, i.e. `0 > x ? .. : ..`: 0.01 strictly below zero, 1 at +-0.
+                let xi = self.load_at(x, i);
+                let zero = self.cf32(0.0);
+                let one = self.cf32(1.0);
+                let al = self.cf32(LEAKY_ALPHA);
+                let neg = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, zero, xi));
+                self.b.build(F32, Op::Select(neg, al, one))
+            }
+            VM_LEAKY_GE => {
+                // `x >= 0 ? x : 0.01x`: 1 at +-0 and above, 0.01 below.
+                let xi = self.load_at(x, i);
+                let zero = self.cf32(0.0);
+                let one = self.cf32(1.0);
+                let al = self.cf32(LEAKY_ALPHA);
+                let nonneg = self.b.build(MirType::I1, Op::Cmp(CmpOp::Foge, xi, zero));
+                self.b.build(F32, Op::Select(nonneg, one, al))
+            }
+            VM_LEAKY_MAX => {
+                // `max(x, 0.01x)` is `x > 0.01x ? x : 0.01x`, over the forward's rounded product:
+                // 1 where the identity wins, 0.01 at +-0, +inf and below zero.
+                let xi = self.load_at(x, i);
+                let one = self.cf32(1.0);
+                let al = self.cf32(LEAKY_ALPHA);
+                let scaled = self.fmul(al, xi, &F32);
+                let wins = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, scaled));
+                self.b.build(F32, Op::Select(wins, one, al))
+            }
+            VM_HARDSIGMOID_MINMAX
+            | VM_HARDSIGMOID_CLAMP
+            | VM_HARDSWISH_MINMAX
+            | VM_HARDSWISH_CLAMP => {
+                // `relu6(v)` with `v = x + 3` (the forward's rounded add). `h` is the value the
+                // spelling's selects produce, and the adjoint of `v` is passed only where both of
+                // them handed `v` itself through:
+                //   min(max(v, 0), 6): m = v > 0 ? v : 0, h = 6 > m ? m : 6 -- passed iff
+                //                      v > 0 and 6 > m;
+                //   clamp(v, 0, 6):    h = 0 > v ? 0 : (v > 6 ? 6 : v) -- passed iff neither
+                //                      0 > v nor v > 6.
+                // hardsigmoid = h/6, so its derivative is passed/6; hardswish = (x*h)/6, so its
+                // derivative is (h + passed*x)/6, the product rule through the same selects.
+                let xi = self.load_at(x, i);
+                let zero = self.cf32(0.0);
+                let three = self.cf32(3.0);
+                let six = self.cf32(6.0);
+                let v = self.fadd(three, xi, &F32);
+                let minmax = matches!(op, VM_HARDSIGMOID_MINMAX | VM_HARDSWISH_MINMAX);
+                let hardswish = matches!(op, VM_HARDSWISH_MINMAX | VM_HARDSWISH_CLAMP);
+                // What a passed adjoint carries: `x` for hardswish's product, else 1.
+                let carried = if hardswish { xi } else { self.cf32(1.0) };
+                let (h, passed) = if minmax {
+                    let pos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, v, zero));
+                    let m = self.b.build(F32, Op::Select(pos, v, zero));
+                    let under = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, six, m));
+                    let h = self.b.build(F32, Op::Select(under, m, six));
+                    let inner = self.b.build(F32, Op::Select(under, carried, zero));
+                    (h, self.b.build(F32, Op::Select(pos, inner, zero)))
+                } else {
+                    // The select arms are swapped rather than the compares negated: a negated
+                    // ordered compare answers a NaN `v` the other way.
+                    let below = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, zero, v));
+                    let above = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, v, six));
+                    let capped = self.b.build(F32, Op::Select(above, six, v));
+                    let h = self.b.build(F32, Op::Select(below, zero, capped));
+                    let inner = self.b.build(F32, Op::Select(above, zero, carried));
+                    (h, self.b.build(F32, Op::Select(below, zero, inner)))
+                };
+                let num = if hardswish {
+                    self.fadd(h, passed, &F32)
+                } else {
+                    passed
+                };
+                let inv6 = self.cf32(INV6);
+                self.fmul(num, inv6, &F32)
             }
             VM_HARDSWISH => {
                 // x·hardsigmoid(x)  ->  0 below -3, 1 above 3, (2x + 3)/6 in between.

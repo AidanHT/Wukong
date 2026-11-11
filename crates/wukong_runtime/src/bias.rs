@@ -462,14 +462,16 @@ mod tests {
     /// the lanes must still reproduce the scalar NaN bits.
     #[test]
     fn every_activation_instantiation_matches_the_scalar_twin() {
-        use crate::vmath::VM_CBRT;
+        use crate::vspell::VM_SPELL_LAST;
         let (rows, cols) = (5usize, 45usize);
         let n = rows * cols;
         let x: Vec<f32> = (0..n)
             .map(|i| (i as f32 - (n / 2) as f32) * 0.027)
             .collect();
         let b: Vec<f32> = (0..cols).map(|j| (j % 9) as f32 * 0.11 - 0.4).collect();
-        let ops: Vec<i64> = (0..=VM_CBRT).chain([BIAS_ACT_NONE, VM_CBRT + 1]).collect();
+        let ops: Vec<i64> = (0..=VM_SPELL_LAST)
+            .chain([BIAS_ACT_NONE, VM_SPELL_LAST + 1])
+            .collect();
         for &op in &ops {
             let mut got = vec![0.0f32; n];
             let mut want = vec![0.0f32; n];

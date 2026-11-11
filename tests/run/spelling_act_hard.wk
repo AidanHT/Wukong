@@ -1,0 +1,138 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 1111111111111111111 0 3f000000 3f000000 3f800000 0 3f800000 0 0 0 3e000000 3eaaaaab 3ed55555 3f0aaaab 3f2aaaab 3f755555 3f800000 3f800000 0 3f800000
+// EXPECT-OUT-VALUES: 1111111111111111111 0 3f000000 3f000000 3f800000 0 3f800000 0 0 0 3e000000 3eaaaaab 3ed55555 3f0aaaab 3f2aaaab 3f755555 3f800000 3f800000 0 3f800000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 3f000000 3f000000 3f800000 0 3f800000 0 0 0 3e000000 3eaaaaab 3ed55555 3f0aaaab 3f2aaaab 3f755555 3f800000 3f800000 ffc54321 3f800000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000 80000000 80000000 be900000 beaaaaab be555555 3e0aaaab 3f2aaaab 4028aaab 40400000 40600000 ffc54321 40a00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000 80000000 80000000 be900000 beaaaaab be555555 3e0aaaab 3f2aaaab 4028aaab 40400000 40600000 ffc54321 40a00000
+// EXPECT-OUT-VALUES: 1111111111111111111 0 3f000000 3f000000 3f800000 0 3f800000 0 0 0 3e000000 3eaaaaab 3ed55555 3f0aaaab 3f2aaaab 3f755555 3f800000 3f800000 0 3f800000
+module tests.run.spelling_act_hard
+
+// P12.10, natural activation spellings: hardsigmoid and hardswish as relu6(x + 3) / 6, over
+// min/max, fmin/fmax and clamp. Each spelling below is an elementwise loop `o[i] = <spelling of
+// x[i]>` that the recognizer dispatches to a 256-bit `wukong_vmath_f32` kernel computing THAT
+// spelling's own scalar semantics (wukong_runtime/src/vspell.rs; the matcher is
+// wukong_mir_build/src/spell.rs): `hardsigmoid_min_max` -> VM_HARDSIGMOID_MINMAX (53),
+// `hardsigmoid_fmin_fmax` -> VM_HARDSIGMOID_MINMAX (53), `hardsigmoid_clamp` ->
+// VM_HARDSIGMOID_CLAMP (54), `hardswish_min_max` -> VM_HARDSWISH_MINMAX (55), `hardswish_clamp` ->
+// VM_HARDSWISH_CLAMP (56). `hardsigmoid_min_max` runs a second time through a `[]f32` slice helper,
+// where the kernel takes a run-time length.
+//
+// WHAT IS PRINTED. For each spelling, one line of 19 flags -- lane i is 1 when the dispatched lane
+// equals, bit for bit, the same spelling evaluated per element through a plain `fn` the recognizer
+// never sees (`ref_*`), so recognition on and off are compared inside the program on every backend
+// and opt level -- then every lane: its bit pattern in hex where the scalar semantics pin it (the
+// `exact` mask), else its value. 19 lanes are two full 8-lane groups and a 3-lane scalar tail; a
+// NaN sits in each (lane 0 and lane 17). The output buffers are poisoned with -12345.0 before each
+// loop, so a lane the kernel never wrote cannot pass.
+//
+// Inputs, lane by lane: NaN 0x7fc12345, -0, +0, +inf, -inf, 40.0, -40.0, -3.5, -3.0, -2.25, -1.0,
+// -0.5, 0.25, 1.0, 2.75, 3.0, 3.5, NaN 0xffc54321, 5.0.
+//
+// WHERE THE EXPECTED VALUES COME FROM (never a compiler run). The hex lanes follow from IEEE single
+// precision step by step through the operations the spelling lowers to (a `+` with a product
+// operand is one fused multiply-add, `max(a, b)` is `a > b ? a : b`, `clamp` is two ordered
+// selects), with x86's NaN rules: a NaN operand comes back quieted (the first NaN when there are
+// two, which is how `sigmoid(x) * x` returns the sigmoid's sign-flipped NaN), and an invalid
+// operation on non-NaN operands (`inf * 0`, `inf / inf`) is the default NaN ffc00000. The
+// transcendentals enter only through limits their kernels pin exactly: exp(0) = 1, exp(-inf) = +0
+// and exp(+inf) = +inf; tanh(+-0) = +-0 and |tanh| = 1 from |x| >= 10 on; erf = +-1 from |x| >= 9.5
+// on; log(1) = +0; log1p(u) = u and expm1(u) = u when 1 + u rounds to 1; expm1 = -1 where exp
+// underflows to 0; a NaN argument comes back quieted with its sign. A lane is printed in hex only
+// if its bits do not move when every transcendental result in it is moved by up to 3 ULP. Every
+// other lane is an EXPECT-OUT-APPROX against the exact function in f64 (with the spelling's own f32
+// constants), at the declared 5e-6: the relative error
+// `vspell_relative_error_in_each_spellings_well_conditioned_range` asserts for each spelling over a
+// 2^-6 grid of its well-conditioned range, which holds every such lane here.
+//
+// GATE-BLINDNESS. The kernel is called on the interpreter and on native at every -O level, so the
+// differential and invariance gates cannot see whether it fired; tests/recognizer-census.txt pins
+// the dispatch, and `cargo run -q -p wukongc -- --emit=mir -O2` on this file shows one
+// `wukong_vmath_f32` call per spelling with the op codes above.
+
+fn ref_hardsigmoid_min_max(v: f32) -> f32 {
+    return min(max(v + 3.0, 0.0), 6.0) / 6.0;
+}
+
+fn ref_hardsigmoid_fmin_fmax(v: f32) -> f32 {
+    return fmin(fmax(v + 3.0, 0.0), 6.0) / 6.0;
+}
+
+fn ref_hardsigmoid_clamp(v: f32) -> f32 {
+    return clamp(v + 3.0, 0.0, 6.0) / 6.0;
+}
+
+fn ref_hardswish_min_max(v: f32) -> f32 {
+    return v * min(max(v + 3.0, 0.0), 6.0) / 6.0;
+}
+
+fn ref_hardswish_clamp(v: f32) -> f32 {
+    return v * clamp(v + 3.0, 0.0, 6.0) / 6.0;
+}
+
+fn hardsigmoid_min_max_slice(x: []f32, mut o: []f32, n: i64) {
+    for i in 0..n { o[i] = min(max(x[i] + 3.0, 0.0), 6.0) / 6.0; }
+}
+
+// One spelling's report (`while`, so nothing here is a recognizer's business): the 19 flags,
+// then each lane -- in hex where bit i of `exact` is set, else as its value.
+fn show(o: []f32, r: []f32, exact: i64) {
+    let mut i: i64 = 0;
+    while i < 19 {
+        if bits(o[i]) == bits(r[i]) { printf("1"); } else { printf("0"); }
+        i = i + 1;
+    }
+    printf("\n");
+    i = 0;
+    while i < 19 {
+        if ((exact >> i) & 1) == 1 { printf("{:x}\n", bits(o[i])); } else { print(o[i]); }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 19] = [f32_from_bits(0x7fc12345), -0.0, 0.0, f32_from_bits(0x7f800000),
+    f32_from_bits(0xff800000), 40.0, -40.0, -3.5, -3.0, -2.25, -1.0, -0.5, 0.25, 1.0, 2.75, 3.0,
+    3.5, f32_from_bits(0xffc54321), 5.0];
+
+    // hardsigmoid_min_max -> VM_HARDSIGMOID_MINMAX (53)
+    let mut o0: [f32; 19] = [-12345.0; 19];
+    let mut r0: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o0[i] = min(max(x[i] + 3.0, 0.0), 6.0) / 6.0; }
+    for i in 0..19 { r0[i] = ref_hardsigmoid_min_max(x[i]); }
+    show(o0, r0, 0x7ffff);
+
+    // hardsigmoid_fmin_fmax -> VM_HARDSIGMOID_MINMAX (53)
+    let mut o1: [f32; 19] = [-12345.0; 19];
+    let mut r1: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o1[i] = fmin(fmax(x[i] + 3.0, 0.0), 6.0) / 6.0; }
+    for i in 0..19 { r1[i] = ref_hardsigmoid_fmin_fmax(x[i]); }
+    show(o1, r1, 0x7ffff);
+
+    // hardsigmoid_clamp -> VM_HARDSIGMOID_CLAMP (54)
+    let mut o2: [f32; 19] = [-12345.0; 19];
+    let mut r2: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o2[i] = clamp(x[i] + 3.0, 0.0, 6.0) / 6.0; }
+    for i in 0..19 { r2[i] = ref_hardsigmoid_clamp(x[i]); }
+    show(o2, r2, 0x7ffff);
+
+    // hardswish_min_max -> VM_HARDSWISH_MINMAX (55)
+    let mut o3: [f32; 19] = [-12345.0; 19];
+    let mut r3: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o3[i] = x[i] * min(max(x[i] + 3.0, 0.0), 6.0) / 6.0; }
+    for i in 0..19 { r3[i] = ref_hardswish_min_max(x[i]); }
+    show(o3, r3, 0x7ffff);
+
+    // hardswish_clamp -> VM_HARDSWISH_CLAMP (56)
+    let mut o4: [f32; 19] = [-12345.0; 19];
+    let mut r4: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o4[i] = x[i] * clamp(x[i] + 3.0, 0.0, 6.0) / 6.0; }
+    for i in 0..19 { r4[i] = ref_hardswish_clamp(x[i]); }
+    show(o4, r4, 0x7ffff);
+
+    // hardsigmoid_min_max again, through the `[]f32` helper
+    let mut o5: [f32; 19] = [-12345.0; 19];
+    hardsigmoid_min_max_slice(x, o5, 19);
+    show(o5, r0, 0x7ffff);
+    return 0;
+}

@@ -1,0 +1,230 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000
+// EXPECT-OUT-APPROX: -0.10042841678594144 5e-6
+// EXPECT-OUT-APPROX: -0.14677520375753178 5e-6
+// EXPECT-OUT-APPROX: -0.1700394403874564 5e-6
+// EXPECT-OUT-APPROX: -0.1326922316526675 5e-6
+// EXPECT-OUT-VALUES: 3d066100
+// EXPECT-OUT-APPROX: 0.345714012237697 5e-6
+// EXPECT-OUT-APPROX: 0.7079526858606876 5e-6
+// EXPECT-OUT-APPROX: 1.1177142095720591 5e-6
+// EXPECT-OUT-APPROX: 1.954597697955308 5e-6
+// EXPECT-OUT-APPROX: 3.248431373062614 5e-6
+// EXPECT-OUT-VALUES: ffc54321 40b00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000
+// EXPECT-OUT-APPROX: -0.10042841678594144 5e-6
+// EXPECT-OUT-APPROX: -0.14677520375753178 5e-6
+// EXPECT-OUT-APPROX: -0.1700394403874564 5e-6
+// EXPECT-OUT-APPROX: -0.1326922316526675 5e-6
+// EXPECT-OUT-VALUES: 3d066100
+// EXPECT-OUT-APPROX: 0.345714012237697 5e-6
+// EXPECT-OUT-APPROX: 0.7079526858606876 5e-6
+// EXPECT-OUT-APPROX: 1.1177142095720591 5e-6
+// EXPECT-OUT-APPROX: 1.954597697955308 5e-6
+// EXPECT-OUT-APPROX: 3.248431373062614 5e-6
+// EXPECT-OUT-VALUES: ffc54321 40b00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000
+// EXPECT-OUT-APPROX: -0.10042841678594144 5e-6
+// EXPECT-OUT-APPROX: -0.14677520375753178 5e-6
+// EXPECT-OUT-APPROX: -0.1700394403874564 5e-6
+// EXPECT-OUT-APPROX: -0.1326922316526675 5e-6
+// EXPECT-OUT-VALUES: 3d066100
+// EXPECT-OUT-APPROX: 0.345714012237697 5e-6
+// EXPECT-OUT-APPROX: 0.7079526858606876 5e-6
+// EXPECT-OUT-APPROX: 1.1177142095720591 5e-6
+// EXPECT-OUT-APPROX: 1.954597697955308 5e-6
+// EXPECT-OUT-APPROX: 3.248431373062614 5e-6
+// EXPECT-OUT-VALUES: ffc54321 40b00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000
+// EXPECT-OUT-APPROX: -0.10042841678594144 5e-6
+// EXPECT-OUT-APPROX: -0.14677520375753178 5e-6
+// EXPECT-OUT-APPROX: -0.1700394403874564 5e-6
+// EXPECT-OUT-APPROX: -0.1326922316526675 5e-6
+// EXPECT-OUT-VALUES: 3d066100
+// EXPECT-OUT-APPROX: 0.345714012237697 5e-6
+// EXPECT-OUT-APPROX: 0.7079526858606876 5e-6
+// EXPECT-OUT-APPROX: 1.1177142095720591 5e-6
+// EXPECT-OUT-APPROX: 1.954597697955308 5e-6
+// EXPECT-OUT-APPROX: 3.248431373062614 5e-6
+// EXPECT-OUT-VALUES: ffc54321 40b00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000
+// EXPECT-OUT-APPROX: -0.10042841678594144 5e-6
+// EXPECT-OUT-APPROX: -0.14677520375753178 5e-6
+// EXPECT-OUT-APPROX: -0.1700394403874564 5e-6
+// EXPECT-OUT-APPROX: -0.1326922316526675 5e-6
+// EXPECT-OUT-VALUES: 3d066100
+// EXPECT-OUT-APPROX: 0.345714012237697 5e-6
+// EXPECT-OUT-APPROX: 0.7079526858606876 5e-6
+// EXPECT-OUT-APPROX: 1.1177142095720591 5e-6
+// EXPECT-OUT-APPROX: 1.954597697955308 5e-6
+// EXPECT-OUT-APPROX: 3.248431373062614 5e-6
+// EXPECT-OUT-VALUES: ffc54321 40b00000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000
+// EXPECT-OUT-APPROX: -1.084654150160752e-28 5e-6
+// EXPECT-OUT-APPROX: -0.10833779824586577 5e-6
+// EXPECT-OUT-APPROX: -0.14450417034650284 5e-6
+// EXPECT-OUT-APPROX: -0.16360994036098195 5e-6
+// EXPECT-OUT-APPROX: -0.12961583793211792 5e-6
+// EXPECT-OUT-APPROX: 0.03291054384848987 5e-6
+// EXPECT-OUT-APPROX: 0.3503884377562345 5e-6
+// EXPECT-OUT-APPROX: 0.7139699681462421 5e-6
+// EXPECT-OUT-VALUES: 3f8ef7b4 3ff7c3a9 404f2df8 ffc54321 40affc1f
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ffc00000 42200000 80000000
+// EXPECT-OUT-APPROX: -0.10042841678594144 5e-6
+// EXPECT-OUT-APPROX: -0.14677520375753178 5e-6
+// EXPECT-OUT-APPROX: -0.1700394403874564 5e-6
+// EXPECT-OUT-APPROX: -0.1326922316526675 5e-6
+// EXPECT-OUT-VALUES: 3d066100
+// EXPECT-OUT-APPROX: 0.345714012237697 5e-6
+// EXPECT-OUT-APPROX: 0.7079526858606876 5e-6
+// EXPECT-OUT-APPROX: 1.1177142095720591 5e-6
+// EXPECT-OUT-APPROX: 1.954597697955308 5e-6
+// EXPECT-OUT-APPROX: 3.248431373062614 5e-6
+// EXPECT-OUT-VALUES: ffc54321 40b00000
+module tests.run.spelling_act_gelu_tanh
+
+// P12.10, natural activation spellings: the tanh-approximation GELU as PyTorch, HuggingFace, llm.c
+// and JAX write it, and QuickGELU. Each spelling below is an elementwise loop `o[i] = <spelling of
+// x[i]>` that the recognizer dispatches to a 256-bit `wukong_vmath_f32` kernel computing THAT
+// spelling's own scalar semantics (wukong_runtime/src/vspell.rs; the matcher is
+// wukong_mir_build/src/spell.rs): `torch_cube_grouped` -> VM_GELU_TANH (36), `hf_new_gelu` ->
+// VM_GELU_TANH_HF (37), `llmc_cube_binding` -> VM_GELU_TANH_NOFMA (38), `hf_fast_gelu` ->
+// VM_GELU_TANH_FAST (39), `jax_cdf` -> VM_GELU_TANH_CDF (40), `hf_quick_gelu` -> VM_QUICK_GELU
+// (41). `torch_cube_grouped` runs a second time through a `[]f32` slice helper, where the kernel
+// takes a run-time length.
+//
+// WHAT IS PRINTED. For each spelling, one line of 19 flags -- lane i is 1 when the dispatched lane
+// equals, bit for bit, the same spelling evaluated per element through a plain `fn` the recognizer
+// never sees (`ref_*`), so recognition on and off are compared inside the program on every backend
+// and opt level -- then every lane: its bit pattern in hex where the scalar semantics pin it (the
+// `exact` mask), else its value. 19 lanes are two full 8-lane groups and a 3-lane scalar tail; a
+// NaN sits in each (lane 0 and lane 17). The output buffers are poisoned with -12345.0 before each
+// loop, so a lane the kernel never wrote cannot pass.
+//
+// Inputs, lane by lane: NaN 0x7fc12345, -0, +0, +inf, -inf, 40.0, -40.0, -1.5, -1.125, -0.75,
+// -0.375, 0.0625, 0.5, 0.875, 1.25, 2.0, 3.25, NaN 0xffc54321, 5.5.
+//
+// WHERE THE EXPECTED VALUES COME FROM (never a compiler run). The hex lanes follow from IEEE single
+// precision step by step through the operations the spelling lowers to (a `+` with a product
+// operand is one fused multiply-add, `max(a, b)` is `a > b ? a : b`, `clamp` is two ordered
+// selects), with x86's NaN rules: a NaN operand comes back quieted (the first NaN when there are
+// two, which is how `sigmoid(x) * x` returns the sigmoid's sign-flipped NaN), and an invalid
+// operation on non-NaN operands (`inf * 0`, `inf / inf`) is the default NaN ffc00000. The
+// transcendentals enter only through limits their kernels pin exactly: exp(0) = 1, exp(-inf) = +0
+// and exp(+inf) = +inf; tanh(+-0) = +-0 and |tanh| = 1 from |x| >= 10 on; erf = +-1 from |x| >= 9.5
+// on; log(1) = +0; log1p(u) = u and expm1(u) = u when 1 + u rounds to 1; expm1 = -1 where exp
+// underflows to 0; a NaN argument comes back quieted with its sign. A lane is printed in hex only
+// if its bits do not move when every transcendental result in it is moved by up to 3 ULP. Every
+// other lane is an EXPECT-OUT-APPROX against the exact function in f64 (with the spelling's own f32
+// constants), at the declared 5e-6: the relative error
+// `vspell_relative_error_in_each_spellings_well_conditioned_range` asserts for each spelling over a
+// 2^-6 grid of its well-conditioned range, which holds every such lane here.
+//
+// GATE-BLINDNESS. The kernel is called on the interpreter and on native at every -O level, so the
+// differential and invariance gates cannot see whether it fired; tests/recognizer-census.txt pins
+// the dispatch, and `cargo run -q -p wukongc -- --emit=mir -O2` on this file shows one
+// `wukong_vmath_f32` call per spelling with the op codes above.
+
+fn ref_torch_cube_grouped(v: f32) -> f32 {
+    return 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v * v * v))));
+}
+
+fn ref_hf_new_gelu(v: f32) -> f32 {
+    return 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * v * v * v)));
+}
+
+fn ref_llmc_cube_binding(v: f32) -> f32 {
+    let cube: f32 = 0.044715 * v * v * v; return 0.5 * v * (1.0 + tanh(0.7978845608 * (v + cube)));
+}
+
+fn ref_hf_fast_gelu(v: f32) -> f32 {
+    return 0.5 * v * (1.0 + tanh(v * 0.7978845608 * (1.0 + 0.044715 * v * v)));
+}
+
+fn ref_jax_cdf(v: f32) -> f32 {
+    return v * (0.5 * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v * v * v)))));
+}
+
+fn ref_hf_quick_gelu(v: f32) -> f32 {
+    return v * sigmoid(1.702 * v);
+}
+
+fn torch_cube_grouped_slice(x: []f32, mut o: []f32, n: i64) {
+    for i in 0..n { o[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * (x[i] * x[i] * x[i])))); }
+}
+
+// One spelling's report (`while`, so nothing here is a recognizer's business): the 19 flags,
+// then each lane -- in hex where bit i of `exact` is set, else as its value.
+fn show(o: []f32, r: []f32, exact: i64) {
+    let mut i: i64 = 0;
+    while i < 19 {
+        if bits(o[i]) == bits(r[i]) { printf("1"); } else { printf("0"); }
+        i = i + 1;
+    }
+    printf("\n");
+    i = 0;
+    while i < 19 {
+        if ((exact >> i) & 1) == 1 { printf("{:x}\n", bits(o[i])); } else { print(o[i]); }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 19] = [f32_from_bits(0x7fc12345), -0.0, 0.0, f32_from_bits(0x7f800000),
+    f32_from_bits(0xff800000), 40.0, -40.0, -1.5, -1.125, -0.75, -0.375, 0.0625, 0.5, 0.875, 1.25,
+    2.0, 3.25, f32_from_bits(0xffc54321), 5.5];
+
+    // torch_cube_grouped -> VM_GELU_TANH (36)
+    let mut o0: [f32; 19] = [-12345.0; 19];
+    let mut r0: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o0[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * (x[i] * x[i]
+    * x[i])))); }
+    for i in 0..19 { r0[i] = ref_torch_cube_grouped(x[i]); }
+    show(o0, r0, 0x6087f);
+
+    // hf_new_gelu -> VM_GELU_TANH_HF (37)
+    let mut o1: [f32; 19] = [-12345.0; 19];
+    let mut r1: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o1[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * x[i] * x[i]
+    * x[i]))); }
+    for i in 0..19 { r1[i] = ref_hf_new_gelu(x[i]); }
+    show(o1, r1, 0x6087f);
+
+    // llmc_cube_binding -> VM_GELU_TANH_NOFMA (38)
+    let mut o2: [f32; 19] = [-12345.0; 19];
+    let mut r2: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { let cube: f32 = 0.044715 * x[i] * x[i] * x[i]; o2[i] = 0.5 * x[i] * (1.0 +
+    tanh(0.7978845608 * (x[i] + cube))); }
+    for i in 0..19 { r2[i] = ref_llmc_cube_binding(x[i]); }
+    show(o2, r2, 0x6087f);
+
+    // hf_fast_gelu -> VM_GELU_TANH_FAST (39)
+    let mut o3: [f32; 19] = [-12345.0; 19];
+    let mut r3: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o3[i] = 0.5 * x[i] * (1.0 + tanh(x[i] * 0.7978845608 * (1.0 + 0.044715 * x[i] *
+    x[i]))); }
+    for i in 0..19 { r3[i] = ref_hf_fast_gelu(x[i]); }
+    show(o3, r3, 0x6087f);
+
+    // jax_cdf -> VM_GELU_TANH_CDF (40)
+    let mut o4: [f32; 19] = [-12345.0; 19];
+    let mut r4: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o4[i] = x[i] * (0.5 * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * (x[i] *
+    x[i] * x[i]))))); }
+    for i in 0..19 { r4[i] = ref_jax_cdf(x[i]); }
+    show(o4, r4, 0x6087f);
+
+    // hf_quick_gelu -> VM_QUICK_GELU (41)
+    let mut o5: [f32; 19] = [-12345.0; 19];
+    let mut r5: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o5[i] = x[i] * sigmoid(1.702 * x[i]); }
+    for i in 0..19 { r5[i] = ref_hf_quick_gelu(x[i]); }
+    show(o5, r5, 0x7c03f);
+
+    // torch_cube_grouped again, through the `[]f32` helper
+    let mut o6: [f32; 19] = [-12345.0; 19];
+    torch_cube_grouped_slice(x, o6, 19);
+    show(o6, r0, 0x6087f);
+    return 0;
+}

@@ -96,6 +96,69 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `--time-passes` reports a `runtime-cache` stage before `link`. The test suites link through a
   cache under the target directory and never touch the user's.
 
+### Recognizers: natural spellings of the activations dispatch, each to its own kernel (`gap7/recognizer-spellings`, P12.10)
+
+- **A hand-written activation runs a 256-bit kernel that computes exactly what it says.** An
+  elementwise `for` loop over `f32` arrays, `[]f32` slices or `Tensor[f32, N]` whose body writes an
+  activation out — HuggingFace's tanh GELU (`0.044715 * x * x * x`), `FastGELU` and `QuickGELU`,
+  PyTorch's and llm.c's tanh GELUs, JAX's CDF-first GELU, the erf GELU over `x / sqrt(2.0)`,
+  `x * 0.7071067811865476` or `(erf(..) + 1.0) / 2.0`, `x / (1.0 + exp(-x))`, `sigmoid(x) * x`,
+  `exp(x) / (1.0 + exp(x))`, `log(1.0 + exp(x))`, `log1p(exp(x))`, mish over each softplus form,
+  `relu6(x + 3) / 6` hard sigmoid / hard swish through `min`/`max`, `fmin`/`fmax` or `clamp`, the
+  leaky-ReLU and ELU selects — used to run the 128-bit generic loop (`sigmoid(x) * x` the wrong
+  kernel, below). It now dispatches to
+  `wukong_vmath_f32`: to an existing kernel where the spelling IS that kernel's operations
+  (`1.0 / (1.0 + exp(-x))` is `sigmoid`, `x * (1.0 / (1.0 + exp(-x)))` is `silu`, the stable
+  softplus, `exp(x) - 1.0` ELU, the `x > 0.0` leaky select), else to one of 25 new op codes,
+  36..=60 (`wukong_runtime::vspell`), each the kernel of one spelling: its scalar twin
+  is the spelling's operations in source order with the lowering's FMA contractions, its AVX2 body is
+  generated from the same definition, and the NaN a NaN input yields is pinned to the spelling's.
+  The matcher (`wukong_mir_build::spell`) reads the store value — through any leading `let`s — as
+  the tree of operations it lowers to and dispatches only on an exact match, commuting only a
+  constant operand; `@parallel` functions and batched `[R, C]` nests dispatch too.
+- **Hit rate.** The new census (`wukong_mir_build::spelling_census_tests`: 41 spellings, each over an
+  array, a slice and a tensor with the element inline and `let`-bound) went from **15 of 246 loops,
+  2 of 41 spellings in every form**, to **231 of 246, 38 of 41**. The three that stay the generic
+  loop must: the cube as `pow(x, 3.0)` is not GELU (NaN below zero), `0.5 * (x * (1 + tanh(..)))`
+  rounds differently from every kernel, and the `let`-bound ReLU select is velem's shape.
+- **Fixed: `sigmoid(x) * x` changed its NaN when recognized.** Both product orders dispatched
+  `VM_SILU`, whose NaN for a NaN input is the input's; `sigmoid(x) * x` returns the sigmoid's
+  sign-flipped NaN, so recognition on and off disagreed on that lane. It now has its own kernel
+  (`VM_SILU_SX`).
+- **The tanh GELU expansion of `tests/run/spelling_value_bindings.wk` dispatches again** — to
+  `VM_GELU_TANH`, never to `gelu()`'s kernel, which it differs from in the last bits
+  (`tests/recognizer-census.txt`: `wukong_vmath_f32*2` -> `*3`). No corpus program lost a dispatch.
+- **Autodiff.** Every new code is differentiable. A smooth spelling routes to the backward rule of
+  the activation it spells (`tape_nn::spelling_base`; every such rule reads the input, never the
+  forward output), and QuickGELU's and the erf GELU's derivatives are composed
+  (`spelling_activation_vjps` gates all 25 against the f64 closed form and the finite difference of
+  the spelling's own kernel). A select-spelled spelling with a kink has a rule of its own that hands
+  the adjoint to the branch its own selects take, as the language's `Select` VJP does: routed to the
+  intrinsics' rules, `x < 0 ? 0.01x : x` and `x >= 0 ? x : 0.01x` took the slope at `x = +-0`
+  (`dx = 0.01*dout` instead of `dout`), `max(x, 0.01x)` the identity at `+inf`,
+  `clamp(x + 3, 0, 6)` hardsigmoid/hardswish read 0 (and 1 instead of 1.5) at `x = +-3` and
+  `3 + 2^-22`, and the `min`/`max` forms read the ramp at `3 - 2^-22`, where `x + 3` already rounds
+  to 6. That is also why `x >= 0 ? x : 0.01*x` and `max(x, 0.01x)` have codes of their own
+  (`VM_LEAKY_GE`, 59; `VM_LEAKY_MAX`, 60) though their forward bits are the leaky kernel's on every
+  input: the code is how the tape tells the tie-breaks apart. The autodiff test
+  `spelling_vjps_break_ties_at_the_kink_like_their_own_selects` and the driver's
+  `spelled_activation_gradients_break_ties_like_their_own_selects` (which also differentiates the
+  same activations written out straight-line through the generic `Select` rule, wherever the tape
+  can) pin every kink, the infinities and NaN.
+- **GPU.** The PTX `vmath` tables cover codes 0..=35: `--backend=gpu` keeps a spelling on the CPU
+  kernel, and `--backend=gpu-native` is built without the spelling-only codes
+  (`LowerOptions::spell_kernels`, cleared by `wukong_driver` for the GPU-lowering backend and by the
+  gpu-native corpus sweeps), so such a loop lowers as written there, exactly as before this change;
+  a spelling that IS an existing kernel still dispatches it. A dispatched code would have declined
+  the whole program as `UNSUPPORTED` (`spelling_value_bindings.wk` among the corpus).
+- **Tests.** `tests/run/spelling_act_{gelu_tanh,gelu_erf,silu_sigmoid,softplus_mish,hard,leaky_elu}.wk`
+  print every lane over NaNs of both signs, +-0, +-inf and large |x| (hex where the scalar semantics
+  pin the bits, else within the declared `5e-6` the runtime's
+  `vspell_relative_error_in_each_spellings_well_conditioned_range` asserts), plus one flag per lane
+  comparing it bit for bit with the same expression in a plain `fn` no recognizer sees. The runtime
+  pins every code's lanes to its twin (`vspell_lanes_equal_the_scalar_twin_bit_for_bit`), the twins
+  to an f64 reference, and the constants to the literals they stand for.
+
 ### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)
 
 - **Each labelled source line prints once.** The human renderer drew one frame per label, so two

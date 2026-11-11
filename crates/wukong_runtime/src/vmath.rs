@@ -4,7 +4,8 @@
 //! `elu`, `leaky_relu`, `softplus`, `mish`, `selu`, `tanhshrink`, `hardsigmoid`, `hardswish` — plus the
 //! general single-argument math the same machinery carries (trig/inverse-trig, hyperbolics, `erf`,
 //! the `exp2`/`exp10`/`expm1` and `log2`/`log10`/`log1p` families, `softsign`, `logsigmoid`, `cbrt`):
-//! **36 codes in all, `VM_EXP == 0` through `VM_CBRT == 35`.** The
+//! **36 codes, `VM_EXP == 0` through `VM_CBRT == 35`** -- and, from `VM_SPELL_FIRST == 36` to
+//! `VM_SPELL_LAST`, the natural *spellings* of the activations (`vspell.rs`, P12.10). The
 //! transcendental ones are *compute*-bound (a ~20-flop minimax polynomial per element, more for the
 //! composed ones), so doubling the SIMD width nearly doubles throughput. The transcendental
 //! activations all build on the shared `exp`/`log` polynomials (e.g. `silu = x·sigmoid`,
@@ -27,7 +28,7 @@
 //! *backward* derivatives, and the SwiGLU/GeGLU/GLU gates).
 //!
 //! INVARIANT — **an unknown op code is identity, never a no-write.** [`apply1`] and [`vmath8_for`] are
-//! mirrored total tables over `0..=VM_CBRT` and both fall through to "return the input" outside it, so
+//! mirrored total tables over `0..=VM_SPELL_LAST` and both fall through to "return the input" outside it, so
 //! `out[i] == x[i]` for an unrecognized code on the f32, vmath2, bf16 and f16 paths alike (the AVX2
 //! dispatcher used to return early and leave `out` untouched — invisible garbage). Adding a `VM_*` to
 //! one table only is a test failure, not a silent scalar fallback:
@@ -58,6 +59,23 @@
 //! (`emit_exp_f32` / `emit_log_f32`) — same Cephes constants, same FMA structure — so a dispatched
 //! `exp(x)` agrees with a composed/scalar `exp(x)`. The scalar tail and the no-AVX2 fallback use the
 //! scalar twins (`exp1`/`log1`), which share the constants, so every lane of every path agrees.
+
+// The natural-spelling codes and their eight-lane bodies, listed in `with_vmath8_table` below.
+#[cfg(target_arch = "x86_64")]
+use crate::vspell::{
+    elu_expm1_8, gelu_erf_cdf8, gelu_erf_div8, gelu_erf_mul8, gelu_tanh8, gelu_tanh_cdf8,
+    gelu_tanh_fast8, gelu_tanh_hf8, gelu_tanh_nofma8, hardsigmoid_clamp8, hardsigmoid_minmax8,
+    hardswish_clamp8, hardswish_minmax8, leaky_ge8, leaky_lt8, leaky_max8, mish_log1p8,
+    mish_naive8, mish_softplus8, quick_gelu8, sigmoid_ratio8, silu_div8, silu_sx8, softplus_log1p8,
+    softplus_naive8,
+};
+pub(crate) use crate::vspell::{
+    VM_ELU_EXPM1, VM_GELU_ERF_CDF, VM_GELU_ERF_DIV, VM_GELU_ERF_MUL, VM_GELU_TANH,
+    VM_GELU_TANH_CDF, VM_GELU_TANH_FAST, VM_GELU_TANH_HF, VM_GELU_TANH_NOFMA, VM_HARDSIGMOID_CLAMP,
+    VM_HARDSIGMOID_MINMAX, VM_HARDSWISH_CLAMP, VM_HARDSWISH_MINMAX, VM_LEAKY_GE, VM_LEAKY_LT,
+    VM_LEAKY_MAX, VM_MISH_LOG1P, VM_MISH_NAIVE, VM_MISH_SOFTPLUS, VM_QUICK_GELU, VM_SIGMOID_RATIO,
+    VM_SILU_DIV, VM_SILU_SX, VM_SOFTPLUS_LOG1P, VM_SOFTPLUS_NAIVE,
+};
 
 // --- op codes (shared with the recognizer in wukong_mir_build) ------------------------------------
 pub const VM_EXP: i64 = 0;
@@ -494,7 +512,7 @@ const TANH_EXP_Q4: f32 = 1.0 / 24.0;
 /// index is its `vpermps` (bits 2..0), the shifts are its `psrad`/`pslld` — so lane == scalar
 /// bit-for-bit on every input, NaN and ±0 included. Both sides are always evaluated, as in the lanes.
 #[inline]
-fn tanh1(x: f32) -> f32 {
+pub(crate) fn tanh1(x: f32) -> f32 {
     let sgn = x.to_bits() & 0x8000_0000;
     let ax = f32::from_bits(x.to_bits() & 0x7FFF_FFFF);
     // |x| ≤ TANH_XC: x + (x·t)·P(t).
@@ -537,7 +555,7 @@ fn tanh1(x: f32) -> f32 {
 
 /// `sigmoid(x) = 1/(1 + e^{-x})`.
 #[inline]
-fn sigmoid1(x: f32) -> f32 {
+pub(crate) fn sigmoid1(x: f32) -> f32 {
     1.0 / (1.0 + exp1(-x))
 }
 
@@ -595,7 +613,7 @@ fn leakyrelu1(x: f32) -> f32 {
 /// a `-0` there could only be absorbed), but a twin whose bits rest on an unspecified choice is not
 /// a twin. `vmath_relu_softplus_signed_zero_and_nan` pins `±0` and NaN on every path.
 #[inline]
-fn softplus1(x: f32) -> f32 {
+pub(crate) fn softplus1(x: f32) -> f32 {
     let relu = if x > 0.0 { x } else { 0.0 };
     relu + log1(1.0 + exp1(-x.abs()))
 }
@@ -762,7 +780,7 @@ pub extern "C" fn wukong_rt_trig_f32(x: f32, op: i64) -> f32 {
 // payloads (crate invariant #1). Same rule in `sincos1`/`sinh1`/`cosh1`.
 #[allow(clippy::neg_multiply)]
 #[inline]
-fn erf1(x: f32) -> f32 {
+pub(crate) fn erf1(x: f32) -> f32 {
     let negx = x * -1.0;
     let ax = if x > negx { x } else { negx };
     let t = 1.0 / ERF_P.mul_add(ax, 1.0);
@@ -928,7 +946,7 @@ fn cbrt1(x: f32) -> f32 {
 /// (else the `0·∞` would be `NaN`). Reuses [`exp1`]/[`log1`], so the scalar twin, AVX2 [`expm1_8`], and
 /// inlined MIR agree. Computed branchlessly (mirrors the AVX2 blend) for the tail-match.
 #[inline]
-fn expm1_1(x: f32) -> f32 {
+pub(crate) fn expm1_1(x: f32) -> f32 {
     let u = exp1(x);
     // Kahan's correction is undefined at u=0 and u=+infinity; use its limiting value.
     if u == 0.0 {
@@ -951,7 +969,7 @@ fn expm1_1(x: f32) -> f32 {
 /// when `u` rounds to 1. Reuses [`log1`]; agrees bit-for-bit across the scalar twin, AVX2 [`log1p_8`],
 /// and inlined MIR.
 #[inline]
-fn log1p_1(x: f32) -> f32 {
+pub(crate) fn log1p_1(x: f32) -> f32 {
     if x == f32::INFINITY {
         return x;
     }
@@ -1015,7 +1033,8 @@ pub(crate) fn apply1(op: i64, x: f32) -> f32 {
         VM_ASIN => asin1(x),
         VM_ACOS => acos1(x),
         VM_CBRT => cbrt1(x),
-        _ => x,
+        // The natural spellings (`vspell.rs`, P12.10), or the identity for an unknown code.
+        _ => crate::vspell::apply_spell(op, x).unwrap_or(x),
     }
 }
 
@@ -1160,6 +1179,33 @@ macro_rules! with_vmath8_table {
             (VM_ASIN, asin8),
             (VM_ACOS, acos8),
             (VM_CBRT, cbrt8),
+            // The natural spellings (`vspell.rs`, P12.10). `vspell_codes_are_total_in_both_tables`
+            // keeps this list equal to `vspell::apply_spell`'s.
+            (VM_GELU_TANH, gelu_tanh8),
+            (VM_GELU_TANH_HF, gelu_tanh_hf8),
+            (VM_GELU_TANH_NOFMA, gelu_tanh_nofma8),
+            (VM_GELU_TANH_FAST, gelu_tanh_fast8),
+            (VM_GELU_TANH_CDF, gelu_tanh_cdf8),
+            (VM_QUICK_GELU, quick_gelu8),
+            (VM_GELU_ERF_DIV, gelu_erf_div8),
+            (VM_GELU_ERF_MUL, gelu_erf_mul8),
+            (VM_GELU_ERF_CDF, gelu_erf_cdf8),
+            (VM_SILU_DIV, silu_div8),
+            (VM_SILU_SX, silu_sx8),
+            (VM_SIGMOID_RATIO, sigmoid_ratio8),
+            (VM_SOFTPLUS_NAIVE, softplus_naive8),
+            (VM_SOFTPLUS_LOG1P, softplus_log1p8),
+            (VM_MISH_NAIVE, mish_naive8),
+            (VM_MISH_SOFTPLUS, mish_softplus8),
+            (VM_MISH_LOG1P, mish_log1p8),
+            (VM_HARDSIGMOID_MINMAX, hardsigmoid_minmax8),
+            (VM_HARDSIGMOID_CLAMP, hardsigmoid_clamp8),
+            (VM_HARDSWISH_MINMAX, hardswish_minmax8),
+            (VM_HARDSWISH_CLAMP, hardswish_clamp8),
+            (VM_ELU_EXPM1, elu_expm1_8),
+            (VM_LEAKY_LT, leaky_lt8),
+            (VM_LEAKY_GE, leaky_ge8),
+            (VM_LEAKY_MAX, leaky_max8),
         }
     };
 }
@@ -2441,7 +2487,7 @@ unsafe fn tanh_exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 /// payload, and the sign is split off first and xor'd back last so ±0 and the NaN sign survive.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let sign_mask = _mm256_set1_ps(-0.0);
     let sgn = _mm256_and_ps(x, sign_mask);
@@ -2485,7 +2531,7 @@ unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn sigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn sigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // 1/(1+exp(-x))
     // Unary negation flips the sign bit even for NaNs; 0-x does not.
@@ -2564,7 +2610,7 @@ unsafe fn leakyrelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn softplus8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn softplus8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // max(x,0) + log(1 + exp(-|x|)) — the stable softplus, mirroring softplus1. `|x|` clears the sign
     // bit (== f32::abs), matching the scalar twin bit-for-bit.
@@ -2737,7 +2783,7 @@ pub(crate) unsafe fn cos8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
 /// twin and `emit_erf_f32` bit-for-bit.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn erf8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn erf8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let one = _mm256_set1_ps(1.0);
     let neg1 = _mm256_set1_ps(-1.0);
@@ -2931,7 +2977,7 @@ unsafe fn cbrt8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 /// 8-lane `expm1(x) = (u−1)·x/log(u)`, `u = eˣ`, guard `u==1 → x` — mirrors [`expm1_1`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn expm1_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn expm1_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let one = _mm256_set1_ps(1.0);
     let u = exp8(x);
@@ -2948,7 +2994,7 @@ unsafe fn expm1_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 /// 8-lane `log1p(x) = log(u)·x/(u−1)`, `u = 1+x`, guard `u==1 → x` — mirrors [`log1p_1`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn log1p_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub(crate) unsafe fn log1p_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let one = _mm256_set1_ps(1.0);
     let u = _mm256_add_ps(one, x);
@@ -4922,13 +4968,14 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn vmath_op_tables_cover_the_declared_code_space() {
-        for op in 0..=VM_CBRT {
+        use crate::vspell::VM_SPELL_LAST;
+        for op in 0..=VM_SPELL_LAST {
             assert!(
                 vmath8_for(op).is_some(),
                 "vmath8_for missing VM_* code {op}"
             );
         }
-        for op in [-1i64, VM_CBRT + 1, 9999] {
+        for op in [-1i64, VM_SPELL_LAST + 1, 9999] {
             assert!(
                 vmath8_for(op).is_none(),
                 "vmath8_for claims unknown code {op}"

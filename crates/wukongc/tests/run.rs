@@ -37,7 +37,9 @@ mod common;
 /// the floor had again been left behind, at 517 under 570).
 /// 614: the measured count once `assert_message.wk` and `match_no_arm_trap.wk` joined
 /// (gap7/diag-locations).
-const MIN_FIXTURES: usize = 614;
+/// 632: the measured count once the six `spelling_act_*.wk` natural-activation fixtures joined
+/// (gap7/recognizer-spellings; the floor had been left at 614 under 626).
+const MIN_FIXTURES: usize = 632;
 
 /// Monotonic counter handing every spawned `wukongc` a distinct scratch directory.
 static WORK_SEQ: AtomicU64 = AtomicU64::new(0);

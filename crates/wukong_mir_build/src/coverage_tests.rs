@@ -12,18 +12,26 @@ use wukong_mir::verify::verify_function;
 use wukong_mir::{BinOp, CmpOp, Function, Op, Program, ValueId};
 use wukong_span::{Interner, SourceId};
 
+use crate::spell::{
+    VMATH_ELU_EXPM1, VMATH_GELU_ERF_MUL, VMATH_GELU_TANH, VMATH_GELU_TANH_HF, VMATH_SILU_DIV,
+    VMATH_SILU_SX,
+};
 use crate::{
-    lower_program, lower_program_reporting_dispatch, LowerOptions, NORM_LOGSOFTMAX, NORM_SOFTMAX,
-    VMATH_GELU, VMATH_SILU,
+    lower_program_reporting_dispatch, lower_program_with, LowerOptions, NORM_LOGSOFTMAX,
+    NORM_SOFTMAX, VMATH_GELU, VMATH_SIGMOID, VMATH_SILU,
 };
 
 fn lower_src(src: &str) -> (Program, Vec<Diagnostic>, Interner) {
+    lower_src_with(src, LowerOptions::default())
+}
+
+fn lower_src_with(src: &str, opts: LowerOptions) -> (Program, Vec<Diagnostic>, Interner) {
     let mut interner = Interner::new();
     let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
     assert!(pdiags.is_empty(), "parse: {pdiags:?}");
     let (sema, sdiags) = wukong_sema::check(&module, &interner);
     assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
-    let (prog, diags) = lower_program(&module, &sema, &mut interner);
+    let (prog, diags) = lower_program_with(&module, &sema, &mut interner, opts);
     assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
     for f in &prog.funcs {
         assert!(
@@ -234,11 +242,22 @@ fn hoisted_form(x: [f32; 64], mut o: [f32; 64]) {
     }
 }
 
-/// HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently from the kernel
-/// (`((C1*v)*v)*v` contracted into the FMA vs the kernel's `fma(C1, (v*v)*v, v)`), and the erf form
-/// is a different function. Neither may be substituted.
+/// The single `wukong_vmath_f32` op code `name` dispatches, if it dispatches exactly one call.
+fn vmath_code(prog: &Program, interner: &Interner, name: &str) -> Option<i128> {
+    let f = func(prog, interner, name);
+    match call_args(f, interner, "wukong_vmath_f32").as_slice() {
+        [args] => const_int(f, args[3]),
+        _ => None,
+    }
+}
+
+/// HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently from the GELU
+/// kernel (`((C1*v)*v)*v` contracted into the FMA vs the kernel's `fma(C1, (v*v)*v, v)`), and the
+/// erf form is a different function: neither may be substituted by `VMATH_GELU`. Each dispatches
+/// the kernel of ITS OWN expression (P12.10, `spell.rs`) -- and a regrouping no kernel computes
+/// (`0.5 * (x * (1 + tanh(..)))`) dispatches nothing.
 #[test]
-fn gelu_spellings_that_are_not_the_kernel_do_not_dispatch() {
+fn gelu_spellings_dispatch_their_own_kernels_never_the_gelu_kernel() {
     let src = "module m
 fn hf_literal(x: [f32; 64], mut o: [f32; 64]) {
     for i in 0..64 {
@@ -258,12 +277,138 @@ fn regrouped(x: [f32; 64], mut o: [f32; 64]) {
 }
 ";
     let (prog, _, interner) = lower_src(src);
-    for name in ["hf_literal", "erf_form", "regrouped"] {
-        assert!(
-            kernels(func(&prog, &interner, name), &interner).is_empty(),
-            "{name} must not dispatch"
-        );
+    assert_eq!(
+        vmath_code(&prog, &interner, "hf_literal"),
+        Some(VMATH_GELU_TANH_HF as i128)
+    );
+    assert_eq!(
+        vmath_code(&prog, &interner, "erf_form"),
+        Some(VMATH_GELU_ERF_MUL as i128)
+    );
+    assert!(
+        kernels(func(&prog, &interner, "regrouped"), &interner).is_empty(),
+        "regrouped must not dispatch"
+    );
+}
+
+/// The two operand orders of the gated SiLU product are different functions on a NaN input
+/// (`x * sigmoid(x)` returns the input NaN, `sigmoid(x) * x` the sigmoid's sign-flipped one), so
+/// only the first is `VMATH_SILU`; the second has its own kernel. Both used to dispatch `VMATH_SILU`.
+#[test]
+fn the_two_silu_product_orders_dispatch_different_kernels() {
+    let src = "module m
+fn xs(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = x[i] * sigmoid(x[i]);
     }
+}
+fn sx(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = sigmoid(x[i]) * x[i];
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    assert_eq!(vmath_code(&prog, &interner, "xs"), Some(VMATH_SILU as i128));
+    assert_eq!(
+        vmath_code(&prog, &interner, "sx"),
+        Some(VMATH_SILU_SX as i128)
+    );
+}
+
+/// A spelling inside a `@parallel` function dispatches per chunk of the outlined region, and a
+/// batched `[R, C]` nest one flat call -- the spelling matcher sits under every `match_vmath_body`
+/// caller.
+#[test]
+fn a_spelling_dispatches_on_the_parallel_and_batched_paths_too() {
+    let src = "module m
+@parallel
+fn par(x: [f32; 4096], mut o: [f32; 4096]) {
+    for i in 0..4096 {
+        o[i] = x[i] / (1.0 + exp(-x[i]));
+    }
+}
+fn batched(x: [f32; 256], mut o: [f32; 256]) {
+    for r in 0..16 {
+        for c in 0..16 {
+            o[r * 16 + c] = if x[r * 16 + c] > 0.0 { x[r * 16 + c] } else { expm1(x[r * 16 + c]) };
+        }
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    let mut codes: Vec<Option<i128>> = Vec::new();
+    for f in &prog.funcs {
+        if !interner.resolve(f.name).starts_with("par") {
+            continue;
+        }
+        for k in ["wukong_vmath_f32", "wukong_vmath_f32_parallel"] {
+            for args in call_args(f, &interner, k) {
+                codes.push(const_int(f, args[3]));
+            }
+        }
+    }
+    assert!(
+        !codes.is_empty() && codes.iter().all(|c| *c == Some(VMATH_SILU_DIV as i128)),
+        "par: {codes:?}"
+    );
+    assert_eq!(
+        vmath_code(&prog, &interner, "batched"),
+        Some(VMATH_ELU_EXPM1 as i128)
+    );
+}
+
+/// `LowerOptions::spell_kernels` cleared (what `--backend=gpu-native` gets, whose PTX implements
+/// only the codes below `VM_SPELL_FIRST`): a spelling that only a spelling-only code computes lowers
+/// as written -- no kernel call at all -- while a spelling that IS an existing kernel keeps it. The
+/// default dispatches all three, or the clear proves nothing.
+#[test]
+fn clearing_spell_kernels_keeps_only_the_existing_kernels_a_spelling_is() {
+    let src = "module m
+fn gelu_spelled(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * (x[i] * x[i] * x[i]))));
+    }
+}
+fn swish(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = x[i] * sigmoid(x[i]);
+    }
+}
+fn bound(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        let v: f32 = x[i];
+        let e: f32 = exp(-v);
+        o[i] = 1.0 / (1.0 + e);
+    }
+}
+";
+    let (on, _, on_it) = lower_src(src);
+    assert_eq!(
+        vmath_code(&on, &on_it, "gelu_spelled"),
+        Some(VMATH_GELU_TANH as i128)
+    );
+    assert_eq!(vmath_code(&on, &on_it, "swish"), Some(VMATH_SILU as i128));
+    assert_eq!(
+        vmath_code(&on, &on_it, "bound"),
+        Some(VMATH_SIGMOID as i128)
+    );
+    let (off, _, off_it) = lower_src_with(
+        src,
+        LowerOptions {
+            spell_kernels: false,
+            ..LowerOptions::default()
+        },
+    );
+    assert!(
+        kernels(func(&off, &off_it, "gelu_spelled"), &off_it).is_empty(),
+        "a spelling-only code must not be emitted when the consumer cannot run it"
+    );
+    assert_eq!(vmath_code(&off, &off_it, "swish"), Some(VMATH_SILU as i128));
+    assert_eq!(
+        vmath_code(&off, &off_it, "bound"),
+        Some(VMATH_SIGMOID as i128)
+    );
 }
 
 // ---- P12.6: unsigned 64-bit counters -----------------------------------------------------------

@@ -1,0 +1,162 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ff800000 42200000 becccccc bd851eb8 bca3d70a bc23d70a bba3d70a bb23d70a 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ff800000 42200000 becccccc bd851eb8 bca3d70a bc23d70a bba3d70a bb23d70a 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ff800000 42200000 becccccc bd851eb8 bca3d70a bc23d70a bba3d70a bb23d70a 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ff800000 42200000 becccccc bd851eb8 bca3d70a bc23d70a bba3d70a bb23d70a 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 0 0 7f800000 bf800000 42200000 bf800000 bf7f9d78
+// EXPECT-OUT-APPROX: -0.8646647167633873 5e-6
+// EXPECT-OUT-APPROX: -0.6321205588285577 5e-6
+// EXPECT-OUT-APPROX: -0.39346934028736663 5e-6
+// EXPECT-OUT-APPROX: -0.22119921692859512 5e-6
+// EXPECT-OUT-VALUES: 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 bf800000 42200000
+// EXPECT-OUT-APPROX: -1.0 5e-6
+// EXPECT-OUT-APPROX: -0.9984965608070224 5e-6
+// EXPECT-OUT-APPROX: -0.8646647167633873 5e-6
+// EXPECT-OUT-APPROX: -0.6321205588285577 5e-6
+// EXPECT-OUT-APPROX: -0.39346934028736663 5e-6
+// EXPECT-OUT-APPROX: -0.22119921692859512 5e-6
+// EXPECT-OUT-VALUES: 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+// EXPECT-OUT-VALUES: 1111111111111111111 7fc12345 80000000 0 7f800000 ff800000 42200000 becccccc bd851eb8 bca3d70a bc23d70a bba3d70a bb23d70a 3e800000 3f400000 3fc00000 40400000 40e00000 ffc54321 41400000
+module tests.run.spelling_act_leaky_elu
+
+// P12.10, natural activation spellings: the leaky ReLU and the ELU written as selects. Each
+// spelling below is an elementwise loop `o[i] = <spelling of x[i]>` that the recognizer dispatches
+// to a 256-bit `wukong_vmath_f32` kernel computing THAT spelling's own scalar semantics
+// (wukong_runtime/src/vspell.rs; the matcher is wukong_mir_build/src/spell.rs): `leaky_select_gt`
+// -> VM_LEAKYRELU (8), `leaky_select_ge` -> VM_LEAKY_GE (59, the leaky kernel's bits under a code
+// of its own, for its derivative at zero), `leaky_max_scaled` -> VM_LEAKY_MAX (60, likewise, for
+// its derivative at +inf), `leaky_select_lt` -> VM_LEAKY_LT (58), `elu_select_exp_minus_one` ->
+// VM_ELU (7), `elu_select_expm1` -> VM_ELU_EXPM1 (57). `leaky_select_gt` runs a second time
+// through a `[]f32` slice helper, where the kernel takes a run-time length.
+//
+// WHAT IS PRINTED. For each spelling, one line of 19 flags -- lane i is 1 when the dispatched lane
+// equals, bit for bit, the same spelling evaluated per element through a plain `fn` the recognizer
+// never sees (`ref_*`), so recognition on and off are compared inside the program on every backend
+// and opt level -- then every lane: its bit pattern in hex where the scalar semantics pin it (the
+// `exact` mask), else its value. 19 lanes are two full 8-lane groups and a 3-lane scalar tail; a
+// NaN sits in each (lane 0 and lane 17). The output buffers are poisoned with -12345.0 before each
+// loop, so a lane the kernel never wrote cannot pass.
+//
+// Inputs, lane by lane: NaN 0x7fc12345, -0, +0, +inf, -inf, 40.0, -40.0, -6.5, -2.0, -1.0, -0.5,
+// -0.25, 0.25, 0.75, 1.5, 3.0, 7.0, NaN 0xffc54321, 12.0.
+//
+// WHERE THE EXPECTED VALUES COME FROM (never a compiler run). The hex lanes follow from IEEE single
+// precision step by step through the operations the spelling lowers to (a `+` with a product
+// operand is one fused multiply-add, `max(a, b)` is `a > b ? a : b`, `clamp` is two ordered
+// selects), with x86's NaN rules: a NaN operand comes back quieted (the first NaN when there are
+// two, which is how `sigmoid(x) * x` returns the sigmoid's sign-flipped NaN), and an invalid
+// operation on non-NaN operands (`inf * 0`, `inf / inf`) is the default NaN ffc00000. The
+// transcendentals enter only through limits their kernels pin exactly: exp(0) = 1, exp(-inf) = +0
+// and exp(+inf) = +inf; tanh(+-0) = +-0 and |tanh| = 1 from |x| >= 10 on; erf = +-1 from |x| >= 9.5
+// on; log(1) = +0; log1p(u) = u and expm1(u) = u when 1 + u rounds to 1; expm1 = -1 where exp
+// underflows to 0; a NaN argument comes back quieted with its sign. A lane is printed in hex only
+// if its bits do not move when every transcendental result in it is moved by up to 3 ULP. Every
+// other lane is an EXPECT-OUT-APPROX against the exact function in f64 (with the spelling's own f32
+// constants), at the declared 5e-6: the relative error
+// `vspell_relative_error_in_each_spellings_well_conditioned_range` asserts for each spelling over a
+// 2^-6 grid of its well-conditioned range, which holds every such lane here.
+//
+// GATE-BLINDNESS. The kernel is called on the interpreter and on native at every -O level, so the
+// differential and invariance gates cannot see whether it fired; tests/recognizer-census.txt pins
+// the dispatch, and `cargo run -q -p wukongc -- --emit=mir -O2` on this file shows one
+// `wukong_vmath_f32` call per spelling with the op codes above.
+
+fn ref_leaky_select_gt(v: f32) -> f32 {
+    return if v > 0.0 { v } else { 0.01 * v };
+}
+
+fn ref_leaky_select_ge(v: f32) -> f32 {
+    return if v >= 0.0 { v } else { v * 0.01 };
+}
+
+fn ref_leaky_max_scaled(v: f32) -> f32 {
+    return max(v, 0.01 * v);
+}
+
+fn ref_leaky_select_lt(v: f32) -> f32 {
+    return if v < 0.0 { 0.01 * v } else { v };
+}
+
+fn ref_elu_select_exp_minus_one(v: f32) -> f32 {
+    return if v > 0.0 { v } else { exp(v) - 1.0 };
+}
+
+fn ref_elu_select_expm1(v: f32) -> f32 {
+    return if v > 0.0 { v } else { expm1(v) };
+}
+
+fn leaky_select_gt_slice(x: []f32, mut o: []f32, n: i64) {
+    for i in 0..n { o[i] = if x[i] > 0.0 { x[i] } else { 0.01 * x[i] }; }
+}
+
+// One spelling's report (`while`, so nothing here is a recognizer's business): the 19 flags,
+// then each lane -- in hex where bit i of `exact` is set, else as its value.
+fn show(o: []f32, r: []f32, exact: i64) {
+    let mut i: i64 = 0;
+    while i < 19 {
+        if bits(o[i]) == bits(r[i]) { printf("1"); } else { printf("0"); }
+        i = i + 1;
+    }
+    printf("\n");
+    i = 0;
+    while i < 19 {
+        if ((exact >> i) & 1) == 1 { printf("{:x}\n", bits(o[i])); } else { print(o[i]); }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 19] = [f32_from_bits(0x7fc12345), -0.0, 0.0, f32_from_bits(0x7f800000),
+    f32_from_bits(0xff800000), 40.0, -40.0, -6.5, -2.0, -1.0, -0.5, -0.25, 0.25, 0.75, 1.5, 3.0,
+    7.0, f32_from_bits(0xffc54321), 12.0];
+
+    // leaky_select_gt -> VM_LEAKYRELU (8)
+    let mut o0: [f32; 19] = [-12345.0; 19];
+    let mut r0: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o0[i] = if x[i] > 0.0 { x[i] } else { 0.01 * x[i] }; }
+    for i in 0..19 { r0[i] = ref_leaky_select_gt(x[i]); }
+    show(o0, r0, 0x7ffff);
+
+    // leaky_select_ge -> VM_LEAKY_GE (59)
+    let mut o1: [f32; 19] = [-12345.0; 19];
+    let mut r1: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o1[i] = if x[i] >= 0.0 { x[i] } else { x[i] * 0.01 }; }
+    for i in 0..19 { r1[i] = ref_leaky_select_ge(x[i]); }
+    show(o1, r1, 0x7ffff);
+
+    // leaky_max_scaled -> VM_LEAKY_MAX (60)
+    let mut o2: [f32; 19] = [-12345.0; 19];
+    let mut r2: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o2[i] = max(x[i], 0.01 * x[i]); }
+    for i in 0..19 { r2[i] = ref_leaky_max_scaled(x[i]); }
+    show(o2, r2, 0x7ffff);
+
+    // leaky_select_lt -> VM_LEAKY_LT (58)
+    let mut o3: [f32; 19] = [-12345.0; 19];
+    let mut r3: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o3[i] = if x[i] < 0.0 { 0.01 * x[i] } else { x[i] }; }
+    for i in 0..19 { r3[i] = ref_leaky_select_lt(x[i]); }
+    show(o3, r3, 0x7ffff);
+
+    // elu_select_exp_minus_one -> VM_ELU (7)
+    let mut o4: [f32; 19] = [-12345.0; 19];
+    let mut r4: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o4[i] = if x[i] > 0.0 { x[i] } else { exp(x[i]) - 1.0 }; }
+    for i in 0..19 { r4[i] = ref_elu_select_exp_minus_one(x[i]); }
+    show(o4, r4, 0x7f0ff);
+
+    // elu_select_expm1 -> VM_ELU_EXPM1 (57)
+    let mut o5: [f32; 19] = [-12345.0; 19];
+    let mut r5: [f32; 19] = [-12345.0; 19];
+    for i in 0..19 { o5[i] = if x[i] > 0.0 { x[i] } else { expm1(x[i]) }; }
+    for i in 0..19 { r5[i] = ref_elu_select_expm1(x[i]); }
+    show(o5, r5, 0x7f03f);
+
+    // leaky_select_gt again, through the `[]f32` helper
+    let mut o6: [f32; 19] = [-12345.0; 19];
+    leaky_select_gt_slice(x, o6, 19);
+    show(o6, r0, 0x7ffff);
+    return 0;
+}

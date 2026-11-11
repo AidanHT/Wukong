@@ -2258,10 +2258,10 @@ mod tests {
         // Mixed-sign input crosses the domain edges of log/acosh/atanh/asin/...; a NaN result is
         // compared as NaN-ness (the narrowing of a NaN payload is the shims' business, pinned
         // elsewhere), every other result bit-for-bit.
-        use crate::vmath::VM_CBRT;
+        use crate::vspell::VM_SPELL_LAST;
         let n = 45usize;
         let xs: Vec<f32> = (0..n).map(|i| (i as f32 - 22.0) * 0.21).collect();
-        let ops: Vec<i64> = (0..=VM_CBRT).chain([-1, VM_CBRT + 1]).collect();
+        let ops: Vec<i64> = (0..=VM_SPELL_LAST).chain([-1, VM_SPELL_LAST + 1]).collect();
         for &op in &ops {
             for (kind, conv) in [
                 (Half::Bf16, bf16_bits as fn(f32) -> u16),

@@ -5466,7 +5466,16 @@ pub(crate) mod hostvec {
         if sd.iter().any(|d| d.is_error()) {
             return None;
         }
-        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        // Without the spelling-only `wukong_vmath_f32` codes, as `wukong_driver` builds for
+        // `--backend=gpu-native` (`LowerOptions::spell_kernels`): `mrt_vmath` implements the codes
+        // below them only, so with them every written-out activation the CPU dispatches to one
+        // (`spelling_value_bindings.wk`'s GELU) would read as a decline this backend never sees.
+        let lower = wukong_mir_build::LowerOptions {
+            spell_kernels: false,
+            ..wukong_mir_build::LowerOptions::default()
+        };
+        let (mut program, md) =
+            wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower);
         if md.iter().any(|d| d.is_error()) {
             return None;
         }

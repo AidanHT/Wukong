@@ -434,3 +434,164 @@ fn assert_sdpa_loss_matches_fd(src: &str, tail: &[Vec<f32>], s: usize, d: usize,
         }
     }
 }
+
+/// Does `program` call `wukong_vmath_f32` (or its `_parallel` twin) anywhere?
+fn calls_vmath(program: &Program, it: &Interner) -> bool {
+    program
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .any(|i| {
+            matches!(&i.op, wukong_mir::Op::Call { func, .. }
+                if it.resolve(*func).starts_with("wukong_vmath_f32"))
+        })
+}
+
+/// P12.10: a natural activation spelling dispatched to its own `wukong_vmath_f32` kernel must
+/// differentiate the way its own selects do -- **at its kinks too**. Off a kink every rule is the
+/// same derivative; on one, the language's `Select` VJP hands the adjoint to the operand the select
+/// chose, and a backward rule that broke the tie another way made `--emit=grad` / `--train` give one
+/// gradient for the loop and another for the same activations written out: the leaky ReLU's
+/// `x > 0 ? 1 : 0.01` for `x < 0 ? 0.01x : x` and `x >= 0 ? x : 0.01x` at `x = +-0` and for
+/// `max(x, 0.01x)` at `+inf`, the hardsigmoid's open interval in `x` for `clamp(x + 3, 0, 6)` at
+/// `x = +-3` and `3 + 2^-22`, and for `min(max(x + 3, 0), 6)` at `3 - 2^-22`, where `x + 3`
+/// already rounds to 6.
+///
+/// Each spelling's loss is `L = Σ c[i]·act(x[i])` over lanes at every kink: `+-0`, `+-3`, the two
+/// neighbours of 3 whose `x + 3` rounds to exactly 6 (`3 - 2^-22` and `3 + 2^-22`, ties to even),
+/// a point inside and one outside the ramp, and both infinities. The expected `act'(x[i])` is read
+/// off the spelling's selects by hand (`max(a, b)` is `a > b ? a : b`, `min(a, b)` is
+/// `b > a ? a : b`, `clamp(v, lo, hi)` is `lo > v ? lo : (v > hi ? hi : v)`, `if` is its compare,
+/// each passing its adjoint to the operand it selected), with `v = x + 3` and `0.01x` rounded to
+/// f32. Where the spelling is select-only (`max`/`min`/`clamp`), the same activations written out
+/// straight-line -- no loop for a recognizer to see, and `@generic` besides -- are differentiated
+/// by the generic `Select` rule and must give the same gradient. (An `if` written out is a branch,
+/// which the tape does not differentiate; its expected column is the same select reading.)
+#[test]
+fn spelled_activation_gradients_break_ties_like_their_own_selects() {
+    const N: usize = 10;
+    // 3 - 2^-22 and 3 + 2^-22: `x + 3` is a tie between two f32 neighbours and rounds to 6.0.
+    let below3 = f32::from_bits(0x403f_ffff);
+    let above3 = f32::from_bits(0x4040_0001);
+    let inf = f32::INFINITY;
+    let xs: Vec<f32> = vec![0.0, -0.0, -3.0, 3.0, below3, above3, -1.5, 4.5, inf, -inf];
+    let c: Vec<f32> = (0..N).map(|i| 0.75 + 0.5 * i as f32).collect();
+    let (b, a) = (below3 as f64, above3 as f64);
+    let s6 = 1.0 / 6.0;
+    // (the activation of `{x}`, act'(x) per lane, written-out generic oracle available)
+    let rows: [(&str, [f64; N], bool); 8] = [
+        // `0 > x ? 0.01 : 1` -- both zeros take the `x` branch.
+        (
+            "if {x} < 0.0 { 0.01 * {x} } else { {x} }",
+            [1.0, 1.0, 0.01, 1.0, 1.0, 1.0, 0.01, 1.0, 1.0, 0.01],
+            false,
+        ),
+        // `x >= 0 ? 1 : 0.01` -- `-0 >= 0` holds.
+        (
+            "if {x} >= 0.0 { {x} } else { {x} * 0.01 }",
+            [1.0, 1.0, 0.01, 1.0, 1.0, 1.0, 0.01, 1.0, 1.0, 0.01],
+            false,
+        ),
+        // `x > 0 ? 1 : 0.01` -- both zeros take the slope.
+        (
+            "if {x} > 0.0 { {x} } else { 0.01 * {x} }",
+            [0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 0.01, 1.0, 1.0, 0.01],
+            false,
+        ),
+        // `x > 0.01x ? 1 : 0.01` -- at +inf the product is +inf too, and takes the adjoint.
+        (
+            "max({x}, 0.01 * {x})",
+            [0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 0.01, 1.0, 0.01, 0.01],
+            true,
+        ),
+        // `clamp` passes `v` on [0, 6] inclusive: at x = -3, 3 and both neighbours of 3.
+        (
+            "clamp({x} + 3.0, 0.0, 6.0) / 6.0",
+            [s6, s6, s6, s6, s6, s6, s6, 0.0, 0.0, 0.0],
+            true,
+        ),
+        // `max(v, 0)` passes `v` only for v > 0, `min(m, 6)` only for m < 6: the open interval,
+        // in `v` -- so not at `3 - 2^-22` either.
+        (
+            "min(max({x} + 3.0, 0.0), 6.0) / 6.0",
+            [s6, s6, 0.0, 0.0, 0.0, 0.0, s6, 0.0, 0.0, 0.0],
+            true,
+        ),
+        // `(x*h)/6`: `(h + [v passed]*x) / 6`, with h = clamp(v, 0, 6).
+        (
+            "{x} * clamp({x} + 3.0, 0.0, 6.0) / 6.0",
+            [
+                0.5,
+                0.5,
+                -0.5,
+                1.5,
+                (6.0 + b) / 6.0,
+                (6.0 + a) / 6.0,
+                0.0,
+                1.0,
+                1.0,
+                0.0,
+            ],
+            true,
+        ),
+        // h = min(max(v, 0), 6).
+        (
+            "{x} * min(max({x} + 3.0, 0.0), 6.0) / 6.0",
+            [0.5, 0.5, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (value, dact, oracle) in rows {
+        let looped = format!(
+            "@parallel fn loss(x: [f32; {N}], c: [f32; {N}], mut out: [f32; 1]) -> f32 {{\n\
+             let mut o: [f32; {N}] = [0.0; {N}];\n\
+             for i in 0..{N} {{ o[i] = {}; }}\n\
+             let mut l: f32 = 0.0;\n\
+             for i in 0..{N} {{ l = l + c[i] * o[i]; }}\n\
+             out[0] = l; return l; }}",
+            value.replace("{x}", "x[i]")
+        );
+        let lets: String = (0..N)
+            .map(|k| {
+                format!(
+                    "let o{k}: f32 = {};\n",
+                    value.replace("{x}", &format!("x[{k}]"))
+                )
+            })
+            .collect();
+        let sum: Vec<String> = (0..N).map(|k| format!("c[{k}] * o{k}")).collect();
+        let straight = format!(
+            "@generic fn loss(x: [f32; {N}], c: [f32; {N}], mut out: [f32; 1]) -> f32 {{\n\
+             {lets}let l: f32 = {};\n\
+             out[0] = l; return l; }}",
+            sum.join(" + ")
+        );
+        let want: Vec<f64> = (0..N).map(|i| c[i] as f64 * dact[i]).collect();
+        let mut forms = vec![("loop", looped, true)];
+        if oracle {
+            forms.push(("written out", straight, false));
+        }
+        for (form, src, recognized) in forms {
+            let (program, mut it) = compile_at(&src, 2, "loss");
+            assert_eq!(
+                calls_vmath(&program, &it),
+                recognized,
+                "`{value}` ({form}): only the loop may dispatch a kernel"
+            );
+            let (prog, _f, g) = grad_program(&program, &mut it, "loss", &[0]);
+            let inputs = vec![xs.clone(), c.clone(), vec![0.0]];
+            let grads = analytic(&prog, g, &inputs, &[0], &it);
+            for (j, (&got, &w)) in grads[0].iter().zip(&want).enumerate() {
+                if (got as f64 - w).abs() > 1e-6 + 1e-6 * w.abs() {
+                    wrong.push(format!(
+                        "`{value}` ({form}) dx[{j}] at x = {:e}: got {got}, want {w}",
+                        xs[j]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

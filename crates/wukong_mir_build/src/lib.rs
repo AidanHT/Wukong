@@ -139,6 +139,11 @@ mod par_reduce;
 #[cfg(test)]
 mod par_reduce_tests;
 
+// The natural spellings of the elementwise activations and their kernels (P12.10).
+mod spell;
+#[cfg(test)]
+mod spelling_census_tests;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -1301,6 +1306,23 @@ pub struct LowerOptions {
     /// rather than the environment.
     pub vec_kernels: bool,
 
+    /// Dispatch a natural activation spelling to one of the spelling-only `wukong_vmath_f32` codes
+    /// (`wukong_runtime::vspell`, `VM_SPELL_FIRST..=VM_SPELL_LAST`, P12.10) -- `true`, the default.
+    /// When `false`, a spelling whose tree only such a code computes lowers as written instead,
+    /// exactly as it did before those codes existed; a spelling that IS an existing kernel
+    /// (`x * sigmoid(x)` is `VMATH_SILU`, `1 / (1 + exp(-x))` is `VMATH_SIGMOID`) still dispatches
+    /// it.
+    ///
+    /// This exists for the reason [`Self::vec_kernels`] does: the MIR is built once for whichever
+    /// backend was asked for, and `--backend=gpu-native`'s PTX `mrt_vmath` implements codes
+    /// `0..=35` only. A spelling code there is an `UNSUPPORTED` decline of the WHOLE program, so
+    /// dispatching it would turn a loop the PTX backend lowers fine (a GELU written out,
+    /// `tests/run/spelling_value_bindings.wk`) into a program it cannot run. The loop as written
+    /// computes the same bits as the kernel (that is what dispatching a spelling requires), so
+    /// nothing but the CPU kernel is given up. `wukong_driver` clears it for the GPU-lowering
+    /// backend only, and the gpu-native corpus coverage sweeps build with it cleared too.
+    pub spell_kernels: bool,
+
     /// Strict floating-point mode for the WHOLE program (`--fp=strict`; `false`, the default, is
     /// `--fp=fast`). It is the program-wide spelling of the `@strict_fp` function attribute and
     /// means exactly what that attribute means for every function: no FMA contraction of a source
@@ -1328,6 +1350,7 @@ impl Default for LowerOptions {
             unroll_for_autodiff: true,
             recognize: true,
             vec_kernels: true,
+            spell_kernels: true,
             strict_fp: false,
             implicit_grain: false,
         }
@@ -1535,6 +1558,7 @@ fn lower_program_pooled(
     let gemm = GemmSyms {
         recognize: opts.recognize,
         vec_kernels: opts.vec_kernels,
+        spell_kernels: opts.spell_kernels,
         // Program-wide `--fp=strict`. Applied per function by `strict_fp_gemm` below, beside the
         // `@strict_fp` attribute it is the global spelling of.
         strict_fp: opts.strict_fp,
@@ -3883,6 +3907,10 @@ struct GemmSyms {
     /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
     /// backend can lower.
     vec_kernels: bool,
+    /// The spelling-only `wukong_vmath_f32` codes switch ([`LowerOptions::spell_kernels`]). Rides
+    /// here because this struct reaches `spell.rs`'s matcher on every path that calls it (the
+    /// per-statement probe, the `let`-reading one, `@parallel` regions and batched nests alike).
+    spell_kernels: bool,
     /// Strict floating-point mode for the function being lowered (`@strict_fp`, or the program-wide
     /// [`LowerOptions::strict_fp`]). Rides here for the reason `recognize` does: this struct is
     /// copied into every lowerer, recipe builder and outlined `@parallel` region, so the mode cannot
@@ -16870,36 +16898,23 @@ impl FnLowerer<'_> {
             return None;
         };
         let out_sym = self.index_off(target, j, batch)?;
-        // Gated SiLU / swish written as a product — `out[j] = x[j] * sigmoid(x[j])` — the textbook
-        // definition a programmer writes before reaching for the `silu()` intrinsic (and the value==gate
-        // case of a SwiGLU gate). Dispatch to the existing 256-bit `VMATH_SILU` kernel, which *is*
-        // `x·sigmoid(x)` (`vmath::silu1`), so it is bit-identical to the inlined `emit_silu` the generic
-        // 128-bit vectorizer would otherwise lower it to. `tests/run/activations.wk` writes this form.
-        if let ExprKind::Binary {
-            op: ast::BinOp::Mul,
-            lhs,
-            rhs,
-        } = &value.kind
-        {
-            if self.expr_mir(value) == MirType::F32 {
-                if let Some(x_sym) = self
-                    .match_gated_silu(lhs, rhs, j, batch)
-                    .or_else(|| self.match_gated_silu(rhs, lhs, j, batch))
-                {
-                    return Some((out_sym, x_sym, VMATH_SILU, MirType::F32));
-                }
-            }
-        }
-        // The tanh-approximation GELU written out by hand is deliberately NOT folded into
-        // `VMATH_GELU`: the language's `tanh` is not the kernel's internal `tanh_exp1`, so the
-        // expansion is a different function in the last bits (see `elementwise.rs`).
+        // An activation written out by hand -- `x[j] * sigmoid(x[j])`, HuggingFace's tanh GELU,
+        // `x[j] / (1.0 + exp(-x[j]))`, ... -- dispatches to the kernel of ITS OWN expression, never
+        // to an intrinsic's kernel it merely approximates (`spell.rs`). Tried only when the value
+        // is not a direct intrinsic call over the element, which keeps every existing dispatch.
+        let spelled = || {
+            self.match_spelling_stmt(stmt, j, batch)
+                .map(|(out, x, code)| (out, x, code, MirType::F32))
+        };
         let ExprKind::Call { callee, args, .. } = &value.kind else {
-            return None;
+            return spelled();
         };
         if args.len() != 1 {
-            return None;
+            return spelled();
         }
-        let opcode = self.vmath_opcode_of(callee)?;
+        let Some(opcode) = self.vmath_opcode_of(callee) else {
+            return spelled();
+        };
         // The kernel computes (and writes) f32, so the activation's result must be f32.
         if self.expr_mir(value) != MirType::F32 {
             return None;
@@ -16926,38 +16941,12 @@ impl FnLowerer<'_> {
         if self.expr_mir(arg) != MirType::F32 {
             return None;
         }
-        let x_sym = self.index_off(arg, j, batch)?;
-        Some((out_sym, x_sym, opcode, MirType::F32))
-    }
-
-    /// One ordering of the gated-SiLU product `out[j] = x[j] * sigmoid(x[j])`: `val` must be the
-    /// unit-stride f32 read `x[j]` and `gate` the call `sigmoid(x[j])` over the *same* array. Returns
-    /// that array's symbol, or `None`. Pure — used by [`match_vmath_stmt`] to fold the product form
-    /// into the `VMATH_SILU` dispatch (`silu(x) == x·sigmoid(x)`, bit-identical to the inlined form).
-    fn match_gated_silu(
-        &self,
-        val: &Expr,
-        gate: &Expr,
-        j: Symbol,
-        batch: Option<(Symbol, &Expr)>,
-    ) -> Option<Symbol> {
-        let xs = self.index_off(val, j, batch)?;
-        if self.expr_mir(val) != MirType::F32 {
-            return None;
-        }
-        let ExprKind::Call { callee, args, .. } = &gate.kind else {
-            return None;
+        // `f(<expression of x[j]>)` (`log1p(exp(x[j]))`, `tanh(log(1.0 + exp(x[j])))`, ...) is a
+        // spelling.
+        let Some(x_sym) = self.index_off(arg, j, batch) else {
+            return spelled();
         };
-        if args.len() != 1
-            || !matches!(
-                self.vectorizable_intrinsic(callee),
-                Some(MathIntrinsic::Sigmoid)
-            )
-        {
-            return None;
-        }
-        let xs2 = self.index_off(&args[0], j, batch)?;
-        (xs == xs2).then_some(xs)
+        Some((out_sym, x_sym, opcode, MirType::F32))
     }
 
     /// Match a transcendental-activation loop body: every statement must be an independent
@@ -16973,16 +16962,27 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
-        let mut calls = Vec::with_capacity(body.stmts.len());
-        for stmt in &body.stmts {
-            let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j, batch)?;
-            // Keep the operand *symbols* (validated in scope); the base pointer is resolved at emit
-            // time via `kernel_base_ptr`, which loads it out of a `Tensor[..]`/pointer param's slot.
+        let per_statement = || {
+            let mut calls = Vec::with_capacity(body.stmts.len());
+            for stmt in &body.stmts {
+                let (out_sym, x_sym, opcode, in_elem) = self.match_vmath_stmt(stmt, j, batch)?;
+                // Keep the operand *symbols* (validated in scope); the base pointer is resolved at
+                // emit time via `kernel_base_ptr`, which loads it out of a `Tensor[..]`/pointer
+                // param's slot.
+                self.lookup(out_sym)?;
+                self.lookup(x_sym)?;
+                calls.push((out_sym, x_sym, opcode, in_elem));
+            }
+            Some(calls)
+        };
+        // A spelling whose intermediate values are bound first (`let v = x[j]; let x3 = v*v*v;
+        // ...; out[j] = 0.5*v*(1.0 + tanh(..))`) is one store read through its bindings (`spell.rs`).
+        per_statement().or_else(|| {
+            let (out_sym, x_sym, code) = self.match_spelling_with_lets(j, body, batch)?;
             self.lookup(out_sym)?;
             self.lookup(x_sym)?;
-            calls.push((out_sym, x_sym, opcode, in_elem));
-        }
-        Some(calls)
+            Some(vec![(out_sym, x_sym, code, MirType::F32)])
+        })
     }
 
     /// Emit one `wukong_vmath_f32(x+s, out+s, e-s, op)` call per resolved statement over the i64
