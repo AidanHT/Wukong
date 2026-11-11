@@ -1,6 +1,6 @@
 # `bench/lang/` — the language ruler
 
-`WUKONG_MASTER_PLAN` Task 0.4: the honest gpu-native baseline of a `@generic` kernel. It was skipped
+The master plan's Task 0.4: the honest gpu-native baseline of a `@generic` kernel. It was skipped
 when Phase 0 was executed, so Phases 1 and 3 shipped speed features with **zero** measurement and
 Phase 4's own criterion ("improves vs Phase 3") had no baseline. These fixtures plus
 `crates/wukong_driver/src/lang_bench.rs` are that baseline.

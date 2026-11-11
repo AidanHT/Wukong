@@ -4,12 +4,8 @@
 (`tools/cloud/modal_app.py`, strong-peer bars for flash/conv/serving/GEMM). The language product
 surface is user-written `.wk` in [`examples/`](../../examples/) and [`tests/run/`](../../tests/run/).
 
-Required by `GPU_RETARGET_PLAN.md` §6.5: *"Tune caches and raw round logs committed under
-`bench/gpu/<device>/` as artifacts."* Every number that appears in a doc must be traceable to a file
-here.
-
-The operational checklist that produces these files is
-[`docs/gpu/phase1-runbook.md`](../../docs/gpu/phase1-runbook.md).
+Tune caches and raw round logs are committed under `bench/gpu/<device>/` as artifacts. Every
+number that appears in a doc must be traceable to a file here.
 
 ## Layout
 
@@ -27,7 +23,7 @@ round is superseded by a *later* file plus a sentence in the session summary say
 
 ## Rules
 
-1. **Every log opens with the §6.1 provenance block** (template in the runbook §2.2): local time,
+1. **Every log opens with the provenance block**: local time,
    operator, checkout path, git branch, **git HEAD**, **git dirty state**, provider + SKU, image tag,
    the exact command, cargo profile, device identity (name / CC / SM count / opt-in SMEM / L2 / VRAM),
    driver + runtime, MIG state, the provenance-gate verdict, clock-lock status, wall time, exit code,
@@ -38,7 +34,7 @@ round is superseded by a *later* file plus a sentence in the session summary say
    verdict, driver, provider/SKU, clock-lock status, clocks/temp/power **before and after**, drift,
    wall time and cost. A block printed by the code that took the measurements cannot be forgotten by
    whoever ran it; the shell-side items above (HEAD, dirty state, image tag) still come from the
-   runbook. See [`docs/gpu/README.md`](../../docs/gpu/README.md) for the full contract.
+   operator.
 
    **A round whose device does not verify against the spec table cannot open**, so it publishes
    nothing by construction rather than by discipline — but the refusing round still formats a
@@ -47,17 +43,16 @@ round is superseded by a *later* file plus a sentence in the session summary say
    **working tree, not a commit**, and excludes `.git` — so nothing on the remote side can identify
    the source. **A dirty tree on a metered run is a provenance violation:** its numbers cannot be
    reproduced and must not be published.
-3. **A round whose device does not match spec publishes nothing** (plan §6.1). Keep the log — a
+3. **A round whose device does not match spec publishes nothing.** Keep the log — a
    MISMATCH is itself a finding — and say plainly in the summary that nothing from it is quotable.
-4. **Container rounds are iteration data; VM rounds are publication data** (plan §6.3). Modal cannot
+4. **Container rounds are iteration data; VM rounds are publication data.** Modal cannot
    lock clocks, so nothing measured there belongs in `BENCHMARKS.md`, `docs/metrics.md` or
    `docs/compile-floor.md`. Label every log with its clock-lock status.
 5. **Wall times are first-class.** Suite and bench wall time is what sizes later metered phases
-   (plan §6.6) — record it even when the run is "just" a correctness gate.
-6. **Cost is recorded per round** (plan §6.6): the estimate *and* the provider dashboard's actual,
+   — record it even when the run is "just" a correctness gate.
+6. **Cost is recorded per round**: the estimate *and* the provider dashboard's actual,
    with the discrepancy noted rather than reconciled away.
-7. Strip ANSI escapes before committing (the image sets `CARGO_TERM_COLOR=always`); see the runbook
-   §2.4 for the one-liner.
+7. Strip ANSI escapes before committing (the image sets `CARGO_TERM_COLOR=always`).
 8. Logs are **append-only records**. Never edit one to look better. A correction is a new commit that
    states what was wrong — this project has published four such retractions and each one made the
    instrument stronger.

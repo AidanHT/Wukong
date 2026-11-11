@@ -3,465 +3,89 @@
 **A programming language for ML/DL tensor kernels with compile-time shape safety.**
 
 Wukong (`.wk`) is for writing performance-critical tensor code — fused elementwise loops, tiled
-matmuls, reductions, norms, custom ops — in a small explicit language rather than hand-rolling
-CUDA/CUTLASS or stitching intrinsics in C/C++/Rust. Tensor dimensions live in the type system: a
-`Tensor[f32, M, K]` at a call site must match the callee's contract, so shape mistakes are compile
-errors (`E0501`/`E0502`), not silent wrong results at runtime.
+matmuls, reductions, norms, custom ops — in a small explicit language instead of hand-rolled
+CUDA or intrinsics in C/C++/Rust. Tensor dimensions live in the type system, so a shape mismatch at
+a call site is a compile error (`E0501`/`E0502`), not a wrong result at run time.
 
-The product is a **user-written `.wk` program through `wukongc`**. Backends — interpreter,
-native [Cranelift](https://cranelift.dev) JIT/AOT, and optional GPU paths — are how that program
-runs. Silent pattern recognizers that swap loop nests for tuned microkernels, and hand-written PTX in
-the GPU stack, are current implementation, not the thesis.
+No garbage collector, no hidden allocation, no hidden control flow. `wukongc`, its compiler, is pure
+Rust and needs no external toolchain: it runs programs on a reference interpreter, a native
+[Cranelift](https://cranelift.dev) JIT/AOT backend, or (with `--features gpu`) NVIDIA GPUs via PTX.
 
-It is **not** a high-level framework. There is no garbage collector, no hidden allocation, and no
-hidden control flow. Every parallel loop has a schedule you chose (`@parallel` and `@tile` today),
-and a schedule the compiler cannot apply is a diagnostic (`E0309`) rather than a silent no-op.
-
-## What you write
-
-Ordinary loops over `Tensor[f32, M, K, …]` with shape-generic parameters (`M`, `N`, `?`), plus
-`@parallel` for multicore execution. There is no whole-tensor `*` operator — matmul is an indexed
-loop nest the compiler may recognize and lower. On CPU that means tuned `wukong_runtime`
-microkernels behind the scenes; on GPU, `--backend=gpu` offloads five recognized kernel hooks
-(`sgemm_nt`, `vmath`, `norm`, `sreduce`, `sgemm_nt_epi` on `wukong_interp::Accelerator` /
-`GpuAccel` in `wukong_driver`), while `--backend=gpu-native` lowers MIR→PTX for a growing subset of
-programs using naive helpers without tensor cores. GPU corpus coverage must be established by a
-fresh device run; the CPU closeout does not validate it. Flash attention,
-conv, and serving benchmarks in the tree are Rust launchers, not `.wk` programs.
-
-```sh
-wukongc --run examples/saxpy_array.wk              # interpreter (default)
-wukongc --run --backend=native tests/run/tensor_matmul.wk
-wukongc --emit=mir -O2 tests/run/transcendental_kernel.wk   # inspect lowered MIR
-wukongc --emit=mir -O2 --print-after=licm tests/run/saxpy.wk  # MIR after each LICM run
-wukongc --emit=mir --passes=mem2reg,simplify,dce examples/fib.wk  # a chosen pass list
-wukongc --emit=mir-text --target-cpu=x86-64-v2 examples/fib.wk > fib.mir  # MIR that reads back
-wukongc --emit=mir -O2 fib.mir                       # optimize a MIR dump, no front end
-wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
-wukongc --emit=exe -g examples/fib.wk               # DWARF: a debugger breaks, steps, backtraces
-wukongc --emit=mir,llvm-ir,obj -O2 -o fib examples/fib.wk  # fib.mir-low, fib.ll, fib.o
-wukongc --repl                                       # interactive session (`:help` inside)
-wukongc --emit=doc examples/relu.wk > relu.md        # the file's documentation, as Markdown
-wukongc --doctest examples/relu.wk                   # run the ```wk examples in its doc comments
-```
-
-`--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
-require building with `--features gpu` and a CUDA device. See `wukongc --help` for `--emit`,
-`-O0`…`-O3`, `--grad-of` / `--train`, and the rest of the CLI; `--time-passes` shows where a
-compile's time went, and `--depfile=<f>` writes a Make dependency rule over the imported files.
-`--passes=<list>` runs a chosen optimizer pass list instead of the `-O` level's, and
-`--print-after=<pass>` prints the MIR to stderr after each run of a named pass (`docs/internals.md`,
-"Running a chosen pass list"). `--emit=mir-text` prints MIR with every type spelled out, and
-`wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
-(`docs/internals.md`, "Typed textual MIR"); what each pass does is pinned the same way, by
-FileCheck-style `.mir` filetests under `tests/filetests/` (`cargo test -p wukongc --test
-filetests`; `CONTRIBUTING.md`, "Writing a filetest"). `-g` puts DWARF in an `--emit=obj|exe` artifact — a
-line table from every function's machine code to `file:line:column`, a subprogram per function and
-call-frame information, with the machine code unchanged — so gdb or lldb can break, step and
-backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `perf-<pid>.map` for
-`perf` (`docs/internals.md`, "Debug info and the JIT perf map"). `--emit=<stage>,<stage>,...` writes
-several artifacts from one compile — on stdout under `==> <stage> <==` headers, or each at
-`<stem>.<ext>` with `-o <stem>` (language guide, "Several artifacts at once"); `wukongc --repl` is an
-interactive session: items are kept, statements run, an expression prints its value, and
-`:type <expr>` asks sema (language guide, "The REPL"). `--emit=exe` builds the program-independent
-runtime half of the link once — the generated runtime shim and, against a release-profile runtime,
-one fat-LTO static library of it (formerly a whole-runtime LTO on every link) — into the AOT runtime
-cache and reuses it on every later link: `wukongc --print=runtime-cache` prints where it is
-(`WUKONG_CACHE_DIR`, else `%LOCALAPPDATA%\wukong\cache` or `~/.cache/wukong`), `wukongc
---clear-cache` empties it, and `WUKONG_CACHE_TRACE=1` traces each hit, miss and rebuild
-(`docs/internals.md`, "The AOT runtime cache"). `///` and `//!` doc comments are part of the AST:
-`--emit=doc` prints a file's documentation as Markdown (each item's signature as `wukongc fmt`
-writes it, then its docs), and `wukongc --doctest <file>` compiles and runs every ```` ```wk ````
-example in them against the file's own items, rustdoc-style (language guide, "Comments and doc
-comments" and "Documentation and doc tests").
-
-## Why Wukong
-
-Wukong compiles through a **from-scratch Cranelift backend — no LLVM, no external toolchain** on the
-default path. Cross-language CPU measurements and honest GPU notes live in
-**[BENCHMARKS.md](BENCHMARKS.md)** — read that file before quoting any number; this README does
-not duplicate them. In summary, Wukong:
-
-- **checks tensor shapes at compile time** (`wukong_sema`) — real semantic analysis, not a kernel
-  compiler pretending to be a language;
-- **lowers loop nests you write** to MIR, then optionally recognizes matmul, elementwise, reduction,
-  and norm patterns for tuned CPU microkernels (`wukong_runtime`) or the five GPU offload hooks;
-- **compiles fast** and runs competitive CPU kernels on recognized patterns — see
-  [BENCHMARKS.md](BENCHMARKS.md) for methodology, standing index, and per-family numbers;
-- **offers optional GPU backends** (`--features gpu`): recognizer offload (`--backend=gpu`) and
-  whole-program MIR→PTX (`--backend=gpu-native`). Rust-side flash/conv/serving benches are launchers,
-  not `.wk` programs.
-
-## Language features
-
-- **Compile-time shape safety.** Tensor shapes live in the type system: a `Tensor[f32, M, K]`
-  parameter carries its dims — and its layout — into the callee contract, so handing a
-  `Tensor[f32, 512, 512]` to a `Tensor[f32, 513, 512]` parameter, or returning the wrong shape, is a *type
-  error* (E0501/E0502), not a segfault at 3 a.m. There is no whole-tensor `*` operator:
-  whole-tensor arithmetic is rejected outright (E0433, "operate on elements in a loop"), and a
-  matmul is written as an indexed loop nest — which the compiler then recognizes and dispatches
-  (below). A dimension may be a run-time value (`rowsum::<m, n>(a, out)`): the call reads `n` once,
-  and the shapes it returns keep that value whatever later happens to `n`
-  (`tests/run/turbofish_runtime_snapshot.wk`). C/C++ cannot express this; Rust cannot express it
-  ergonomically.
-- **The knobs kernels need, as language constructs.** SIMD vector types (`vec[f32, 8]`), tensor data
-  layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
-  parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
-  `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
-  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic`, `@tile`,
-  `@unchecked`, `@strict_fp` and the parameter attribute `@noalias` (a checked `restrict` promise,
-  `E0316` on a provably aliased call) have consumers today, and a `@tile` the compiler cannot apply —
-  an unsupported loop form, a width that is not a positive integer literal — is `E0309` rather than a
-  silent drop, while `@parallel(grain = G)` sets the per-worker iteration run (any other `@parallel`
-  argument is `E0306`; without it the CPU backends size a grain from a straight-line loop body, so a
-  short loop runs as one chunk with no fork), `@align(N)` on a `let` aligns that local's stack slot,
-  while `@simd`/`@extern`/`@export` parse and are inert — layout is
-  enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
-  lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
-  `.tiled(…)` still reject indexing (`C0001`). Runtime-sized memory is `alloc_<T>`/`free` (64-byte
-  aligned, zeroed) plus a per-thread LIFO scratch arena (`scratch_<T>(n)` / `scratch_mark()` /
-  `scratch_release(m)`); there is no uninitialized or user-selectable allocator yet.
-  `atomic_add(place, v)` is an integer read-modify-write for combining across `@parallel`
-  iterations (histograms, counters): integer addition commutes, so the native run prints the
-  interpreter's serial answer bit for bit (`tests/run/atomic_add_histogram.wk`; integer-only, no
-  fetch-add, not lowered by `gpu-native`).
-- **Checked slices.** Every `s[i]` on a `[]T` slice is checked against the length in its fat pointer
-  on every backend (`index out of bounds: the len is N but the index is I at file:line:col`, exit 1);
-  `-O2` removes the checks from counted loops by versioning them on one preheader guard, and
-  `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
-  constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
-  A pointer used as a condition (`if p`) is a null test. A failed `assert(cond)` names its site the
-  same way (`assertion failed at file:line:col`, or `assertion failed: msg at …` for
-  `assert(cond, "msg")`), on the interpreter, the JIT and a linked executable alike.
-- **128-bit integers.** `i128` and `u128` are first-class: literals up to `u128::MAX` (range-checked
-  at every width), wrapping arithmetic, division and shifts with the same zero-divisor, `MIN / -1`
-  and modulo-width rules as every other integer, once-rounded float conversions, struct fields,
-  arrays, `match`, `printf` and the integer builtins (`widening_mul` of two `u64` is a `u128`).
-  Native code keeps one in a register pair and calls the runtime only for division and float
-  conversion (`tests/run/i128_*.wk`).
-- **8-bit floats.** `f8e4m3` and `f8e5m2` — the OCP E4M3FN and E5M2 formats FP8 checkpoints ship in —
-  are first-class one-byte types: `f32` compute with every result rounded to nearest-even onto its
-  grid (E4M3FN saturating at ±448, E5M2 overflowing to ±∞), literals with a suffix, `as` to and from
-  every numeric type in one rounding, arrays, structs, slices and printing; the codec is inline
-  integer code on every backend, and all 256 codes of each format round-trip
-  (`tests/run/f8_*.wk`). int4 weights pack two to a byte (`pack_i4`/`unpack_u4`, …) and expand with
-  per-group scales and zero points in one call (`dequant_i4`/`dequant_u4`; `tests/run/int4_*.wk`).
-- **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
-  functions; traits with bounds (`<T: Shape>`, `where`), function-typed parameters
-  (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read
-  capture is copied, a written one shared by reference) are dispatched statically — every generic and higher-order function is specialized per
-  instantiation (and per closure), so no vtable or function pointer exists at run time
-  (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Where a program does
-  want one, a **function value** is an ordinary value: `fn(T) -> R` in a `let mut`, a field, an
-  array element or a return value, made from a named function or a closure that captures nothing,
-  and called through the pointer — a dispatch table `ops[op](a, b)`, a higher-order function given
-  a run-time choice — and the optimizer turns a call whose function it can see back into a direct
-  call (`tests/run/fn_values*.wk`). Every concrete instantiation
-  is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,
-  with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype, and its `T = f32`
-  instance reaches the kernel builtins (`E0415`/`E0416` for any other binding); and
-  `where K % 16 == 0` predicates and `static_assert` over a function's dimensions are checked at
-  each call (`tests/run/{dtype_generic_tensor,where_constraints}.wk`).
-- **Kernels callable by name.** `matmul`, `linear`, `softmax`, `layernorm`, `rmsnorm`, `transpose`, the
-  buffer activations (`gelu(x, out)`, …), `sum`/`dot` and `sdpa` reach the tuned runtime kernels
-  directly, with real shape signatures (`E0409` when a dimension cannot be inferred) — the explicit
-  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`). A statically safe `sdpa` is one
-  bare kernel call, so a loss calling it differentiates and trains (`tests/run/sdpa_loss_train.wk`).
-  The decode builtins `sdpa_kv`
-  (KV-cache / grouped-query attention), `kv_append`, `gemv_bf16`/`gemv_f16` and the llama.cpp
-  `Q8_0`/`Q4_0` packers and GEMVs check their geometry against their operands at run time
-  (`tests/run/decode_*.wk`); `sdpa_kv_batch` attends a padded batch of sequences with a compile-time
-  shape signature and per-sequence key-length masks.
-- **Checkpoints in, shape-checked at load time.** `st_read_<T>` (safetensors), `npy_read_<T>`
-  (`.npy`) and `gguf_read_<T>` (llama.cpp GGUF) compare the stored dtype and every dimension with the
-  destination `Tensor[…]` as they load; a GGUF tensor in ggml's `Q4_0`…`Q8_0` or K-quant blocks
-  dequantizes into `f32`, or loads its raw blocks for the quantized GEMVs. `map_<T>` /
-  `st_map_<T>` / `npy_map_<T>` / `gguf_map_<T>` instead map a file or one tensor copy-on-write, so
-  only the pages a run touches are ever read (`tests/run/io_{safetensors,npy,gguf,map}.wk`).
-- **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
-- **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
-  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or
-  hand-tiled — ragged `min`-clamped tiles included) and may lower it to a tuned
-  **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
-  elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
-  `x + y*z` to a **fused multiply-add** (a documented, deterministic floating-point contract;
-  `@strict_fp` / `--fp=strict` evaluate in source order instead), **fuses** adjacent elementwise loops, and
-  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, SROA,
-  mem2reg, const-fold, CSE, DSE, DCE, loop deletion, LICM, scalar promotion, loop unrolling,
-  straight-line SLP packing) runs at
-  `-O1` and above. Op-graph fusion across
-  tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
-  `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
-  recognizers are invisible to the user — you still write the loop nest in `.wk` — unless you ask:
-  `--remarks=dispatch` notes each loop that became a kernel call, and `@generic` on a `fn` or a loop
-  keeps it as written.
-- **Interop.** Calling C runs today: an `extern "C" { fn ldexp(x: f64, e: i32) -> f64; }` block
-  is imported by the native backend (JIT-bound from the host process, or left to the linker for
-  `--emit=exe`), and the interpreter calls the same host symbol for scalar signatures, so the two
-  stay bit-exact (`tests/run/extern_c_libm.wk`). Exporting Wukong kernels under a stable C name
-  (`@export`) and the `@extern("C")` attribute spelling remain planned; attribute names are
-  validated against the closed language set (unknown names report `E0306`).
-- **Warnings for kernels that compile but compute nothing.** A program that checks clean is linted
-  (`W0001`–`W0008`, `W0030`/`W0031`): an unused variable or an accumulator that is never read, a
-  `mut` output buffer that is never written, `out[i] == a[i] + b[i];` written for `=`, unreachable
-  code, an unreachable function, an import nothing uses, a missing `;`, and a `(`/`[`/`-` at the
-  start of a line that silently continues the expression above — in every file of the program.
-  Levels come from `-A/-W/-D <lint>` (`-D warnings`) and `@allow/@warn/@deny(<lint>)`; mechanical
-  fixes (`;`, `mut `, deleting an import, a did-you-mean) are emitted as machine-readable
-  suggestions; see `docs/language-guide.md`. A Unicode lookalike of ASCII
-  punctuation (`−` U+2212 for `-`) is `E0105`, naming the character it imitates.
-- **Documentation that is checked.** `///` comments attach to the item, field, variant or method
-  after them and `//!` to the file; one that documents nothing is `E0210`. `--emit=doc` renders them
-  as Markdown and `--doctest` runs their ```` ```wk ```` examples (`no_run`, `compile_fail[,E0501]`
-  and `ignore` tags included), so an example that stops compiling, or whose `assert` stops holding,
-  fails the run (`tests/doc/`, `examples/relu.wk`).
-
-## Runs the real GPT-2 124M end-to-end
-
-Wukong compiles and runs **GPT-2 124M inference end-to-end as an ordinary `.wk` program**
-([`examples/gpt2_infer.wk`](examples/gpt2_infer.wk)) on the native Cranelift-JIT backend. It loads the
-**real pretrained OpenAI GPT-2 weights** — all **124,439,808** parameters — **by name** from a
-safetensors file on disk (exported from HuggingFace `transformers` by
-[`tools/export_gpt2.py`](tools/export_gpt2.py)): each tensor goes through `st_read_f32`, which checks
-its name, dtype and element count as it loads, with the prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong source: token +
-learned positional embedding, 12 pre-LayerNorm decoder blocks (biased QKV, 12-head causal attention,
-tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits `[5, 50257]`.
-
-**Numerical verification is per run.** [`tools/verify_gpt2.py`](tools/verify_gpt2.py) compares all
-logits with the exported HuggingFace reference and reports `max|Δ| / max|ref|`. Its existing gate
-requires relative error at most `1e-3` and both last-position argmaxes to equal **1757 (" John")**
-for *"Hello, my name is"*. Earlier documentation quoted conflicting relative errors without a
-shared run receipt; those figures are withdrawn. One fresh receipt (2026-10-12,
-`gap6/tensor-io-gguf`, `--backend=native` at `-O2` and `-O0`, weights loaded by name from the
-safetensors file): `verify_gpt2.py` reports relative error `1.46e-6` and argmax 1757, and the logits
-are bit-identical to the same program's flat-blob load.
-
-Reproduce it — one export, one run, one check — from the repo root:
-
-```sh
-python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/ (.safetensors, .bin, reference logits)
-wukongc --run --backend=native examples/gpt2_infer.wk   # runs the model, writes logits to disk
-python tools/verify_gpt2.py                             # reports this run's error and argmax; exits nonzero on failure
-```
-
-The export directory is resolved as `$GPT2_DATA_DIR`, then an explicit directory argument, then
-`data/gpt2` — [`tools/verify_gpt2.py`](tools/verify_gpt2.py) uses the same order, so both tools agree
-on any checkout. The exporter also regenerates the committed
-[`examples/gpt2_config.wk`](examples/gpt2_config.wk) offset table (the single source of truth for
-every weight offset) and writes a `MANIFEST.md` beside the blobs. The verifier treats the logits
-artifact's **age** as part of its verdict (`--max-age-seconds`, default 3600) so a check cannot
-re-assert a result for a run that never happened; pass `--no-age-check` to re-verify an archived
-artifact.
-
-**Scope.** This workflow checks **numerical correctness and capability**; **no
-throughput comparison against PyTorch was measured**, and none is made here. It is **inference, not
-training**. **Tokenization is external**: the `.wk` program consumes integer token ids produced by the
-HuggingFace tokenizer; it does not tokenize text itself. The full 124M run is **native-only** — the
-interpreter's slot memory cannot hold 124M parameters — so a reduced-config twin
-([`examples/gpt2_infer_small.wk`](examples/gpt2_infer_small.wk)) runs the *same* forward pass
-**bit-identically on both the interpreter and the native backend**, the CI differential +
-opt-invariance gate that keeps the full model honest. (This is a new capability, orthogonal to the
-performance results above.)
-
-## The four signature features
+## Example
 
 ```wukong
-// (1) shape-typed tensors  (2) SIMD vectors  (3) explicit memory/layout  (4) parallelism
 fn saxpy<N>(a: f32, x: Tensor[f32, N], y: Tensor[f32, N], mut out: Tensor[f32, N]) {
-    @parallel @simd
+    @parallel
     for i in 0..N {
         out[i] = a * x[i] + y[i];   // fused multiply-add, vectorized, parallelized
     }
 }
 ```
 
-That tensor/`@parallel` form **runs today**, on both backends — the constant-shape spelling and the
-symbolic-generic `<N>` spelling alike (`tests/run/tensor_matmul.wk`, `tests/run/generic_shape.wk`,
-`tests/run/generic_shape_parallel.wk`),
-with a fixed-size array decaying to the rank-1 tensor view at the call. (`@simd` is accepted but
-inert: loop auto-vectorization is unconditional and needs no attribute.) The same kernel written over
-fixed-size arrays runs too:
-
-```wukong
-fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
-    let mut i: i32 = 0;
-    while i < 4 {
-        out[i] = a * x[i] + y[i];   // arrays pass by reference; `out` is mutated in place
-        i = i + 1;
-    }
-}
-```
+## Quick start
 
 ```sh
-wukongc --run examples/saxpy_array.wk   # -> 12, 24, 36, 48 (one value per line)
-wukongc --run examples/dot.wk           # 120
+cargo build
+cargo run -p wukongc -- --run examples/saxpy_array.wk                        # interpreter
+cargo run -p wukongc -- --run --backend=native -O2 tests/run/tensor_matmul.wk  # Cranelift JIT
+cargo run -p wukongc -- --emit=exe -O2 examples/fib.wk                         # AOT executable
+cargo run -p wukongc -- --emit=mir -O2 tests/run/transcendental_kernel.wk      # inspect MIR
+cargo run -p wukongc -- --repl                                                 # interactive session
+cargo run -p wukongc -- --help                                                 # full CLI
 ```
 
-`--run` defaults to the interpreter; add `--backend=native` for the same output through the Cranelift
-JIT — the examples are gated to agree. The program's stdout streams as it runs; everything after
-`--` is passed to the program (`wukongc --run prog.wk -- data.bin 64`, read with `arg(i)` /
-`arg_i64(i, default)`), `wukongc -` reads the program from standard input and `wukongc -e <source>`
-takes it inline. Output is `print` (every scalar at its own type, an aggregate structurally),
-`printf("step {} loss {:.4}\n", i, l)` with a compile-time-checked format string, `sprintf` into a
-`u8` buffer, and `exit(code)` (see the language guide, *Formatted output*).
+## Features
+
+- **Compile-time shape safety** — `Tensor[f32, M, K]` carries its dimensions and layout into every
+  call; dimensions may be generic (`fn f<M, N>`) or run-time values.
+- **Kernel knobs as language constructs** — `@parallel`, `@tile`, `@noalias`, `@strict_fp`, tensor
+  layouts (`.col_major`), checked slices `[]T`, and an explicit allocator and scratch arena.
+- **A full systems language** — structs, enums with data, `match` with exhaustiveness checking,
+  traits and generics (statically dispatched), closures and function values, `str`, `i128`/`u128`,
+  `bf16`/`f16`/`f8` and int4, modules and imports, `extern "C"` interop.
+- **Optimizing compiler** — SSA optimizer (inlining, SROA, mem2reg, CSE, DSE, LICM, unrolling,
+  SLP), loop auto-vectorization to AVX2, FMA contraction, loop fusion, and multicore `@parallel`.
+- **Tuned kernels** — matmul, GEMV, softmax, LayerNorm/RMSNorm, attention, reductions, scans and
+  activations dispatch to hand-tuned AVX2/FMA microkernels, either recognized from the loops you
+  write or called by name (`matmul`, `softmax`, `sdpa`, …).
+- **Autodiff and training** — reverse-mode gradients (`--emit=grad`) and a built-in SGD/AdamW
+  training loop (`--train`), on the interpreter, the JIT, or as a standalone executable.
+- **Model I/O** — safetensors, `.npy` and GGUF loaders that shape-check every tensor as it loads.
+- **Real models** — runs GPT-2 124M inference end-to-end as an ordinary `.wk` program
+  ([`examples/gpt2_infer.wk`](examples/gpt2_infer.wk)), matching HuggingFace's logits.
+- **Tooling** — source formatter (`wukongc fmt`), REPL, doc comments with Markdown output
+  (`--emit=doc`) and runnable doc tests (`--doctest`), DWARF debug info (`-g`), JSON diagnostics,
+  and `wukongc --explain <CODE>` for every error code.
 
 ## Architecture
 
 ```
 source.wk
-   │  lexer → parser → AST
-   │  sema  (name resolution, type inference, COMPILE-TIME SHAPE CHECKING)
-   │  mir_build  (lowering + matmul→GEMM dispatch + SIMD auto-vectorization:
-   │              elementwise, reductions, FMA, fusion)
+   │  lexer → parser → AST → sema (types + compile-time shape checking)
+   │  mir_build (lowering, kernel recognition, vectorization)
    ▼
-Wukong IR (MIR)         one block-parameter SSA IR; mir_build emits it scalar-and-low directly —
-   │                    there is no second level (`--emit=mir-high` means MIR *before* the
-   │                    optimizer, not a different IR level)
-   │  optimization passes (SROA + mem2reg → SSA, const-fold, CSE, DSE, DCE, loop deletion,
-   │                       LICM, scalar promotion, simplify-cfg;
-   │                       inlining; partial loop unrolling (-O2, never reassociating); op-graph fusion across tensor ops is planned on the CPU path;
-   │                       the GPU backend has it — see below)
-   ▼
-MIR
-   ├──────────────► interpreter      (always available, no toolchain; the reference oracle)
-   ├──────────────► Cranelift backend (native JIT + object/exe; NO LLVM — the fast path)
-   ├──────────────► GPU backend      (PTX + cudarc driver-JIT; --backend=gpu offload + --backend=gpu-native MIR→PTX)   [feature = "gpu"]
-   └──────────────► LLVM backend     (textual IR for external clang/llc — always available, no feature flag)
+MIR (block-parameter SSA) → optimizer → autodiff
+   ├──► interpreter        reference oracle, no toolchain
+   ├──► Cranelift backend  native JIT + object / executable
+   ├──► GPU backend        PTX via the CUDA driver   [--features gpu]
+   └──► LLVM backend       textual LLVM IR
 ```
 
-The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cranelift native
-backend** build and test with plain `cargo test` — no LLVM, no toolchain — on the platforms in
-*Platform support* below. The native
-backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
-interpreter on the covered programs. Both backends share `wukong_runtime` microkernels, so kernel
-correctness also requires independent references or recognition-on/off checks; aliasing and
-interpreter marshalling coverage remain incomplete. One platform caveat, and it is a *performance*
-one only: the raw 256-bit AVX2 vec-kernel emitter hardcodes the Win64 argument registers and VEX.256
-AVX2+FMA encodings, so it requires an **x86-64 Windows host with AVX2 + FMA**
-(`wukong_mir::host_supports_vec_kernels`, which `avx2::host_supports_kernels` delegates to). On any
-other host both vectorizers — `mir_build`'s and the optimizer's MIR loop vectorizer, which builds the
-same recipe for loops the front end leaves scalar — consult that same predicate and never build a
-256-bit recipe in the first place, so those loops stay on the portable 128-bit CLIF path — the identical lowering
-`WUKONG_P4_NO_256=1` forces, and result-identical by construction: elementwise lanes carry no
-reassociation, and a vectorized reduction computes the same canonical summation tree in both forms
-(`docs/internals.md`, "The canonical reduction tree"). Everything still compiles and runs; only the
-widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
-behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
-
-## Platform support
-
-| Tier | Platform | What CI runs |
-|---|---|---|
-| 1 | x86-64 Windows (MSVC) and x86-64 Linux, AVX2 + FMA | every gate: fmt, clippy `-D warnings`, the workspace tests, the runtime's release bit-exactness tests, the AOT exe gate, the `-O0`/`-O3` bench gate, and the corpus again with `WUKONG_MAX_ISA=scalar` |
-| 2 | aarch64 macOS (Apple Silicon) and aarch64 Linux, scalar runtime | fmt, clippy, the workspace tests, the runtime release tests, the smoke runs and the AOT exe gate, non-blocking |
-| 2 | aarch64 Windows (MSVC) | `cargo check --workspace`, non-blocking |
-
-Tier 1 is gated: a red lane blocks a merge. Tier 2 is built and tested in CI but does not block,
-so a regression there is a reported gap. On every host without AVX2 + FMA (all of Tier 2) each
-runtime kernel takes its bit-exact scalar twin, and `WUKONG_MAX_ISA=scalar|avx2|avx2_vnni|avx512`
-caps the runtime's dispatch on an x86 host the same way (in the manner of oneDNN's
-`ONEDNN_MAX_CPU_ISA`), which is how the Tier 1 lanes exercise those scalar arms. The cap also
-narrows the instruction set Cranelift generates for the default `native` target (`scalar` is the
-x86-64 baseline), so no code Wukong generates or dispatches to (Cranelift's output, the raw-AVX2
-loop kernels, the runtime kernels) uses an extension above it. The C library is outside the cap:
-it picks its own paths from the real CPU, including for the `fmaf`/`floorf`/`nearbyintf` calls
-Cranelift makes for `fma` and rounding below FMA/SSE4.1. The 256-bit
-vec-kernel emitter remains x86-64 Windows only, as described above.
-
-## Status
-
-Early development — built incrementally and openly. The full front-end, optimizer, interpreter, and
-**native Cranelift backend** work today, including **matmul → tuned AVX2/FMA GEMM dispatch** (serial
-and `@parallel`, incl. `nn.Linear` `A·Bᵀ`), SIMD auto-vectorization (elementwise + reductions), FMA
-contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array and `[]T` slice
-loops (a slice region is versioned on a run-time overlap test). An
-**optional GPU backend** (`--features gpu`; recognizer offload via `--backend=gpu`, MIR→PTX via
-`--backend=gpu-native`) runs a growing subset of `.wk` programs on NVIDIA hardware. **Reverse-mode
-autodiff**
-(`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
-pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop on the interpreter or native Cranelift JIT.
-Every recognized tensor kernel has a VJP (riding the runtime's tuned backward kernels) or a named
-refusal, losses may call helper functions, a loss that runs a `@parallel` loop region gets a
-parallel backward whose gradient is bit-identical at every thread count, `--emit=obj
---grad-of=<fn>` exports the gradient ahead of time, and scalar-path losses have Hessian-vector
-products. Training accepts concrete f32 arrays
-and dense tensors, loads weights and streams data batches from raw f32 files (`--train-init`,
-`--train-data`), writes the trained weights (`--train-save`), and clips and schedules the update
-(`--train-clip`, `--train-warmup`, `--train-schedule=cosine`). `--train --emit=exe` builds the
-whole loop into an executable whose output is byte-identical to `--train` on both backends (the
-loop is one runtime function both call); measured training speedups remain open. See the
-[training CLI contract](docs/language-guide.md#command-line-interface).
-Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
-an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
-(`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`
-that a nested `break 'outer` / `continue 'outer` can target) execute end-to-end on both backends — as do
-**`match`** (literal / range / or (binding the same names in each alternative) / enum-variant /
-tuple / struct / `name @ sub` / array patterns —
-on `[T; N]` arrays and, as a run-time length test, on `[]T` slices, with `rest @ ..` sub-array and
-sub-slice bindings — with guards, and exhaustiveness decided by pattern usefulness with a witness — a proven-exhaustive
-match takes its last arm untested, so an exhaustive `bool` match is one branch), **`if let`** and
-**`while let`** (with `&&` chains of conditions and further `let`s), **`let … else`**,
-**destructuring `for` heads** (`for (i, x) in pairs`, `for Point { x, y } in pts`), **C-style and
-data-carrying (tagged-union) enums**, **slices `[]T`** (fat-pointer views with `.len()`, indexing,
-iteration, array→slice unsizing and range indexing `s[a..b]` — and, since every kernel operand
-resolves through one base-pointer helper, a legal operand to the whole recognized-kernel family: GEMM/GEMV, the fused
-norms, the scans, and the streaming elementwise kernels), top-level **`const`** values, **`let` tuple
-destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
-`'A'` literals**, **`"string"` literals** (a NUL-terminated `*u8`, rendered by `print`), and
-**`str`** — an immutable UTF-8 byte string with `.len()`, bounds-checked byte indexing, `s[a..b]`
-views, `==`/`<`/`.cmp()`, string-literal `match` patterns, UTF-8 decoding (`for c in s.chars()`),
-zero-copy `as_bytes()` and a checked `str_from_utf8`, `str_concat`/`str_format` onto the heap, and
-printing (inside aggregates too); the type checker never lets a program write through a `str`. And
-**constant-shape tensors run** —
-a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
-flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a
-matmul written in tensor notation (`c[i,j] = Σ a[i,k]·b[k,j]`, both the dot and accumulate spellings)
-dispatches to the same tuned `wukong_sgemm` microkernel as the flat `a[i*K+k]` form. **Symbolic-generic
-tensor dimensions execute too** — `fn f<M, N>(t: Tensor[f32, M, N])` runs at any per-call size via
-hidden runtime dim params (`tests/run/generic_shape.wk`). See the docs:
-
-- [Benchmarks](BENCHMARKS.md) — honest cross-language results vs C, C++, and Rust, with methodology.
-- [Language guide](docs/language-guide.md) — the language surface, with an honest maturity legend.
-- [Compiler internals](docs/internals.md) — architecture, MIR, optimizer, the native backend, and testing.
-- [Roadmap & limitations](docs/roadmap.md) — what runs, what's checked-only, what's planned.
-- [LLVM setup](docs/llvm-setup.md) — optional textual-IR backend (the native path uses Cranelift, no LLVM).
-- [Language direction](docs/LANGUAGE_DIRECTION.md) — thesis for generic kernel lowering, not more silent PTX families.
-- [Master plan](docs/WUKONG_MASTER_PLAN.md) — north star for the language (including AI editors); GPU SOTA is a chapter, not the product.
-- [Docs index](docs/README.md) and [crate READMEs](crates/README.md) — per-folder orientation.
-
-## Building
+## Building and testing
 
 ```sh
-cargo build                 # the whole compiler incl. the native Cranelift backend — no LLVM
-cargo test                  # unit + golden + end-to-end + differential (interp vs native) tests
-cargo check --features gpu --all-targets  # other half of the gate: `cargo test` never builds the GPU
-cargo run -p wukongc -- --help
-cargo run -p wukongc -- --run examples/fib.wk
-cargo run -p wukongc -- fmt --check my_kernels/         # the source formatter (`fmt --help`)
-cargo run -p wukong_bench --release -- tests/run examples bench/kernels   # optimizer report
-cargo run -p wukong_xbench --release      # cross-language benchmark vs C/C++/Rust (needs gcc/g++/rustc)
+cargo build                                  # the whole compiler, no LLVM needed
+cargo test --workspace                       # unit, golden, end-to-end and differential tests
+cargo check --features gpu --all-targets     # the optional GPU backend
 ```
 
-The native backend (Cranelift) is built in by default and needs no toolchain. The optional LLVM
-backend emits textual IR only (for an external `clang`/`llc`), exposed via `wukongc --emit=llvm-ir`
-— it is always built and needs no feature flag. The module names the host's triple and data layout
-and declares every runtime symbol with the signature `wukong_runtime` defines it with
-(`docs/llvm-setup.md`).
+## Documentation
 
-`wukongc fmt [--check] [--stdout] <path|->...` is the source formatter (`wukong_fmt`). It rewrites
-`.wk` files (or every `*.wk` under a directory) into one canonical style and keeps every comment.
-It never changes what a program means: each result is re-parsed and must give the identical AST,
-the same comments and the same identifiers, literals and keywords, or the file is left untouched
-and reported (exit 2). `--check` writes nothing and lists the files that would change (exit 1). A
-rewritten file keeps its permissions, a symbolic link is rewritten at the file it points to and
-stays a link, and a read-only file is refused (exit 3). The repository's own corpus is not
-reformatted yet, so `fmt --check` on it lists files.
-
-The GPU backend is the only opt-in part of the tree, so `cargo test` neither compiles nor runs it:
-pair every run with `cargo check --features gpu --all-targets`. With `--features gpu` on a machine
-that really has a device, set `WUKONG_GPU_REQUIRED=1` (and `WUKONG_PEER_REQUIRED=1` for the peer
-sweeps) so a missing device turns the suite's `[skip]` lines into failures instead of a silently
-passing test.
+- [Language guide](docs/language-guide.md) — the language surface
+- [Compiler internals](docs/internals.md) — architecture, MIR, optimizer, testing
+- [Roadmap](docs/roadmap.md) — what runs today and what is planned
+- [Benchmarks](BENCHMARKS.md) — measurements against C, C++, Rust and PyTorch
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 

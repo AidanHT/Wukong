@@ -16,5 +16,3 @@ Run off-device selftest:
 ```sh
 python tools/cloud/peers/selftest_modal_helpers.py
 ```
-
-Peer research and pin rationale: [`docs/gpu/derive/D5_peer_builds.md`](../../docs/gpu/derive/D5_peer_builds.md).

@@ -3165,7 +3165,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   length recovery; compatible inferred nested empty aggregates remain accepted.
 - Aliased scatter regression coverage now checks every output lane with recognition
   enabled and disabled. Benchmark manifests record tool paths, versions and hashes.
-  The [closeout tracker](docs/sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md) records
+  The closeout tracker records
   remaining findings and performance obligations. These changes do not establish
   new benchmark wins or full SOTA closeout.
 
@@ -3198,7 +3198,6 @@ that has been seen to swing 3.5x on identical inputs.
   allocation (~2 ppm of the backend), which it reports.
 - On that instrument `53e0891` does 31.6% fewer allocations than `d23eefc` to compile the corpus to
   object (optimizer -37.0%, backend -19.4%, parse and lex unchanged, pass invocations -0.6%).
-  See `docs/sota-campaign-2026-09/FINDING-04-compile-time-is-a-count-not-a-clock.md`.
 - `simplify-phis` no longer clones the cached predecessor map per call or allocates per parameter
   in `find_trivial`; `simplify-cfg` reads predecessors and reachability from the analysis cache
   (invalidating after each fold and merge) and skips the constant map when no `cond_br` remains.
@@ -3345,7 +3344,7 @@ all, the other said `DriverError`.
   thing that ever rendered it was `megakernel::decline` under `WUKONG_GPU_DUMP_PTX` — a switch
   documented as a PTX dumper, which buries the line under the whole module. So a gpu-native run that
   quietly fell back to **one device thread** instead of the block-cooperative megakernel said nothing.
-  `LANGUAGE_DIRECTION` Task 1.2 asks for "decline to serial **and** diagnostic"; this is the
+  The language direction asks for "decline to serial **and** diagnostic"; this is the
   diagnostic. It is **env-gated on purpose**: the fallback is correct (that path is the reference every
   megakernel run is checked against) and it is the common case, so an unconditional note would write to
   stderr on the majority of gpu-native runs. `WUKONG_GPU_DUMP_PTX` still prints it too.
@@ -3402,7 +3401,7 @@ and the check sits at the run seam, not in
 `emit_ptx`, so the device-free coverage sweeps still measure what this backend can *lower*.
 ### Tests — the `tiled_transpose` comparison fixture, and the gpu-native hang it found (`tests/compare/`)
 
-`docs/WUKONG_MASTER_PLAN.md` §7.1 lists `tiled_transpose` as a required comparison fixture — the one
+The master plan lists `tiled_transpose` as a required comparison fixture — the one
 carrying the "easier than a CUDA `__shared__` kernel" claim. Phase 2 shipped `@tile`, `shared [T; N]`
 and `sync_block()` and left the slot as a README reading "**Status: NYI**". It is filled:
 `tiled_transpose.wk` (the whole Phase 2 surface, `@generic`, 8x8 over `const N`/`const T`), a
@@ -3456,7 +3455,7 @@ policy in place of all 64 lanes.
 
 ### Measurement — the language ruler, and what it says (`bench/lang/`, `wukong_driver::lang_bench`)
 
-`WUKONG_MASTER_PLAN` Task 0.4 — the honest gpu-native baseline of a `@generic` kernel — was skipped
+The master plan's Task 0.4 — the honest gpu-native baseline of a `@generic` kernel — was skipped
 when Phase 0 was executed, so Phases 1 and 3 shipped speed features with **zero** measurement and
 Phase 4's own criterion ("improves vs Phase 3") had no baseline. It exists now, and the first round
 is a loss.
@@ -3719,7 +3718,7 @@ at four of the seven benched shapes. That is the defect this change fixes.
   `sq2048` and `gpt_d1024_down` have identical `M × N` and different lever sets, while
   `gpt_d1024_up` and `sq4096` have identical `M × N` and opposite cluster verdicts.
 - **A pre-registered falsifier fired, and the cluster predicate gained a second term.**
-  `WAVE3_DOSSIER.md` §3.8 registered in advance that "`gpt_d1024_down` prefers no cluster → the real
+  The Wave-3 derivation registered in advance that "`gpt_d1024_down` prefers no cluster → the real
   predicate involves `waves`". It does: at that shape's `f_L2` of 0.955 — the suite's highest — the
   clustered arm measured 91.4% of cuBLAS against the un-clustered arm's 96.8%. The cluster now
   requires **both** that the multicast's saving off the final configuration's binding roof clears its
@@ -3770,12 +3769,10 @@ at four of the seven benched shapes. That is the defect this change fixes.
   deliberately: `sm_count` enters the rule as pure geometry that is correct on any device, while the L2
   is one term of a cost model whose other constants were fitted on this part, so probing it alone would
   make the residency test device-aware inside a floor that is not.
-- Two documents this change makes stale **about the code** — `CAMPAIGN_CHECKPOINT.md`, which names
+- Two documents this change makes stale **about the code** — the campaign checkpoint, which names
   three now-deleted symbols as the shipped default, and `BENCHMARKS.md`, whose `sq2048` warning box
   cites a deleted constant and a deleted test — belong to concurrent lanes and are deliberately **not**
-  edited here. The exact replacement text for each is specified in
-  [`docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md`](docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md); no
-  measured number changes in either.
+  edited here; no measured number changes in either.
 
 ### Documentation — the 2026-08-11 H100 results are folded into the measurement docs
 The measurement doc set predated the campaign's first published Hopper suite, and `BENCHMARKS.md`
@@ -3785,7 +3782,7 @@ the committed round log it came from (`bench/gpu/h100/2026-08-11-h100-w2-r*.log`
 absolute
 GFLOP/s is published, because the container could not lock clocks and the logs print their absolutes
 under an explicit not-publishable banner. **The whole H100 set is labelled ITERATION-grade**: those
-rounds ran in a Modal container that is refused `nvidia-smi -lgc`, which `GPU_RETARGET_PLAN.md` §6.3
+rounds ran in a Modal container that is refused `nvidia-smi -lgc`, which the campaign's clock policy
 defines as *iteration* data rather than *publication* data (each of the eleven 2026-08-11 rounds
 records `[clock] lock:
 refused (…); running unlocked`; five of them also stamp themselves `ITERATION data, not publication
@@ -3940,7 +3937,7 @@ everywhere else.
   body rather than to the whole file.
 
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
-`GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently
+The GPU retarget plan asks for "no published claim anywhere in the repo that silently
 generalizes a 4050 number to other hardware". This closes that for the doc set, and adds the CPU
 side, which is currently the larger debt. **No measured figure was added, altered or removed** — the
 measurement docs change only with a fresh same-run measurement behind them, and there is none here.
@@ -4138,7 +4135,7 @@ provenance block lived in a PowerShell runbook.
 - **`tools/cloud/`** (a Modal app plus a `nvidia/cuda:*-devel` image) is the entry point for every
   rented-GPU session: build, device suite, corpus gates, benches and peer staging, each a named
   command so a metered session never pays for a decision. Written and reviewed **before** any GPU was
-  rented — with the round's expectations pre-registered in `docs/gpu/derive/` so a result cannot be
+  rented — with the round's expectations pre-registered so a result cannot be
   rationalized after the fact — and hardened against five ways the harness itself would have burned
   metered time (including one where the runbook's own logging aborted every run). Session ledgers and
   raw round logs are committed under `bench/gpu/` as artifacts, so no fact is paid for twice.
@@ -4208,7 +4205,7 @@ been red on ~20 `wukong_codegen_cranelift` tests since 2026-07-07.
   that could not have been assembled. It now accepts the 128-bit `<4 x f32>` form off-gate only.
 
 ### GPU retarget, Phase 2 — the backend stops being fused to one laptop card
-The datacenter retarget's local phase (`GPU_RETARGET_PLAN.md`), landed as ~20 gated merges. No
+The datacenter retarget's local phase, landed as ~20 gated merges. No
 language or CLI surface changed; every measured claim in `BENCHMARKS.md` is untouched (the perf
 identity leg of the closing regression is deferred until the machine is on AC power — no number
 here is a performance claim).
@@ -4239,8 +4236,8 @@ here is a performance claim).
   in both corpus gates so the next silent decline goes red, and megakernel declines print their
   reason under `WUKONG_GPU_DUMP_PTX`.
 - Linux portability arms (per-OS driver-library names, peer discovery, venv paths, exe suffix), a
-  CI job that finally type-checks the `gpu` feature, and six derivation dossiers committed under
-  `docs/gpu/derive/` for the rented-silicon phases. `docs/internals.md` and this changelog were
+  CI job that finally type-checks the `gpu` feature, and six derivation dossiers for the
+  rented-silicon phases. `docs/internals.md` and this changelog were
   de-duplicated from concatenated copies (with content-loss proofs).
 
 ### Benchmark instrument — a byte-identical control column, a bias fix, and one retraction
@@ -5267,8 +5264,7 @@ aborts and ICEs became ordinary diagnostics.
 
 ### Performance + honest measurement — perf-perfect session (2026-07-10/11)
 Three-target directive round (A: parallel GEMM ≈ oneMKL + near-linear model scaling; B: beat fused
-`torch.compile`; C: compile-time floor). Same-run/adjacent instruments; full ledger
-`prompts/results/perf-perfect-session1.md`.
+`torch.compile`; C: compile-time floor). Same-run/adjacent instruments.
 - **Beats fully-optimized `torch.compile`, both batch sizes (Target B MET)**: vs TorchInductor
   max-autotune, fullgraph, warmed — ATEN-pinned because the Windows Inductor CPP FP32 GEMM template
   (`cpp_CppMicroGemmFP32Vec`) is broken, so ATEN/MKL is torch's strongest *working* CPU GEMM
@@ -5294,13 +5290,13 @@ Three-target directive round (A: parallel GEMM ≈ oneMKL + near-linear model sc
   per-function codegen (byte-identical 296/296). See `docs/compile-floor.md`.
 - **Documentation reconciled to these records**: a five-way doc audit refreshed every stale perf
   claim (`README.md`, `docs/metrics.md`, `BENCHMARKS.md`, `docs/internals.md`, `docs/compile-floor.md`,
-  `next-steps.md`) to the 2026-07-11 numbers, corrected the model-vs-torch bar from *eager* to
+  the next-steps tracker) to the 2026-07-11 numbers, corrected the model-vs-torch bar from *eager* to
   *`torch.compile`* everywhere, and replaced bare-absolute-GFLOP/s headlines with %-of-MKL /
   %-roofline / same-run ratios.
 
 ### Performance + honest measurement — perf-sota session 3 (2026-07-09/10)
 Ten-target directive round; every baseline re-proven before optimizing, every win from the real
-pipeline via same-run/adjacent instruments (full ledger: `prompts/results/perf-sota-session3.md`).
+pipeline via same-run/adjacent instruments.
 - **`@parallel` head-loop regions — the model now beats all-threads PyTorch at S=512**: an
   independent-iteration `for` loop with body-local scratch inside an `@parallel` fn outlines into
   its own MIR fn + one `wukong_parallel_for` region (the whole-fn outliner's exact contract —
@@ -5423,7 +5419,7 @@ pipeline via same-run/adjacent instruments (full ledger: `prompts/results/perf-s
   goodput at fill=64.
 
 All measured same-run (clock-invariant) on a mobile RTX 4050; the documented gaps and measured negative
-results are recorded in `prompts/results/`, and every kernel stays gated against the interpreter oracle.
+results are recorded, and every kernel stays gated against the interpreter oracle.
 
 ### Added
 - **Front-end**: lexer (with `@attributes` and error recovery), recursive-descent + Pratt parser,

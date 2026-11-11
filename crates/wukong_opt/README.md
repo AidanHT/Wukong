@@ -141,10 +141,6 @@ cargo test -p wukong_opt --lib
 Source integration tests follow parse → sema → mir_build → optimize → interp, asserting clean
 `verify_function` and comparing levels 0/1/2/3. Individual modules also contain structural tests.
 
-The September 2026 CPU optimization work did not execute tests or benchmarks. Its changes,
-limitations and deferred validation commands are recorded in
-[`docs/cpu-optimizer-review-2026-09.md`](../../docs/cpu-optimizer-review-2026-09.md).
-
 The real gate for any change here:
 
 ```sh

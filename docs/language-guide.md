@@ -7,8 +7,6 @@ GPU backends. The goal is to be easier and more productive than hand-written CUD
 keeping costs visible — not to hide kernels behind a framework runtime. A win is a `.wk` program
 through the compiler, not a Rust-launched kernel zoo.
 
-The living thesis is [LANGUAGE_DIRECTION.md](LANGUAGE_DIRECTION.md); the sequenced mission (including AI-editor / vibe-coding) is [WUKONG_MASTER_PLAN.md](WUKONG_MASTER_PLAN.md). Neither file claims those surfaces run today.
-
 This guide describes the Wukong language as it exists today. Wukong is built incrementally; where
 a feature parses and type-checks but does not yet execute end-to-end, that is called out explicitly.
 
@@ -2364,9 +2362,8 @@ transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the
 are **dispatched to a tuned 256-bit
 AVX2/FMA kernel** (`wukong_vmath_f32`) through domain-aware lowering like matmul→GEMM.
 Historical measurements reported ~2–13× over C's scalar `libm`, and ~28× across cores under
-`@parallel`. Those measurements predate the exceptional-value repairs recorded in the
-[September closeout report](sota-campaign-2026-09/CLOSEOUT-2026-09-23.md); current throughput
-requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those 35 and dispatch too (this is what a RoPE
+`@parallel`. Those measurements predate the September 2026 exceptional-value repairs; current
+throughput requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those 35 and dispatch too (this is what a RoPE
 `sin`/`cos` loop and an exact erf-GELU loop compile to). What does *not* dispatch is a **composed or
 scalar** use — an intrinsic inside a larger expression, or a single call outside an elementwise `for` —
 which instead auto-vectorizes the inlined polynomial at 128-bit; `sqrt`/`rsqrt` also stay inline, being

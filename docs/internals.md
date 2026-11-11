@@ -6,7 +6,7 @@ key design bets. It is aimed at contributors.
 The compiler exists so programmers write `.wk` kernels and pass them through a real front end,
 semantic analyzer (`wukong_sema` — including compile-time shape checking), and MIR pipeline. Execution
 backends (interpreter, Cranelift native codegen, optional GPU recognizer offload and MIR→PTX) are
-interchangeable ways to run the same program; they are not the product on their own. Mission and lowering thesis live in [WUKONG_MASTER_PLAN.md](WUKONG_MASTER_PLAN.md) and [LANGUAGE_DIRECTION.md](LANGUAGE_DIRECTION.md).
+interchangeable ways to run the same program; they are not the product on their own.
 
 ## Design bets
 
@@ -3103,8 +3103,7 @@ before each 256-bit streaming store. This does not establish bounds safety or a 
 > L2, VRAM, driver) instead of being hardcoded. The two directions are deliberately opposite and
 > both correct: **peers compile for the device, modules tag the floor.** Caches are keyed by device
 > accordingly (cubin SASS by arch, autotune by arch + SM count), because a cross-arch cubin load can
-> succeed silently under forward-minor compatibility. The retarget's plan and status are
-> `GPU_RETARGET_PLAN.md`.
+> succeed silently under forward-minor compatibility.
 
 `wukong_codegen_gpu` (behind `--features gpu`) is a third execution path: being a compiler, it
 **emits PTX text** and **driver-JIT-loads it via `cudarc`**, so no `nvcc`/CUDA toolkit is needed — only
@@ -3169,8 +3168,7 @@ and shapes inside them now run the pre-Hopper f32 launcher — correct, and much
 sweeps the shape space, buckets every verdict by its `(tile, cluster, raster, persist)` signature, and
 pins **both** sets exactly, so the band cannot grow silently and closing it is an argued edit rather
 than a drift. It is not closed here because the missing modules would be **unmeasured PTX shipped on
-the strength of arithmetic**, which is the opposite of what a promotion is for;
-`docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md` carries the list a later lane needs.
+the strength of arithmetic**, which is the opposite of what a promotion is for.
 
 Every other reason the family cannot take a call *that is decidable before the
 launch* — a shape whose tensor map is unencodable (`K % 8 != 0` makes the NT row stride not a

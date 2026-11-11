@@ -4,7 +4,7 @@
 profiler bars, `torch.compile` peers, flash/conv/serving measurement. Authors write `.wk` in
 [`examples/`](../../examples/) and [`tests/run/`](../../tests/run/).
 
-Phase 0/1 of [`GPU_RETARGET_PLAN.md`](../../GPU_RETARGET_PLAN.md). Nothing here changes compiler
+Phase 0/1 of the GPU retarget. Nothing here changes compiler
 code — it gets the existing tree onto a real GPU so the ~130 device-executing correctness gates can
 run somewhere other than the dev laptop, **and it builds the strong peers** so that "better than
 SOTA" is a claim someone can check rather than a claim someone made.
@@ -19,8 +19,8 @@ Layout:
 | `peers/torch_compile_peer.py` | The `torch.compile` framework bar itself: eager / compiled / max-autotune, fairly configured. |
 | `peers/selftest_modal_helpers.py` | **Runs anywhere, needs no Modal.** Lifts `modal_app.py`'s pure staging logic out with `ast` and checks it: the CUTLASS filter port, the kernel census, the FA2 arch table, the FA3 presets, the wheel audit, the cache stats. `python tools/cloud/peers/selftest_modal_helpers.py` — a second, not a metered container. |
 
-The research behind every command here is [`docs/gpu/derive/D5_peer_builds.md`](../../docs/gpu/derive/D5_peer_builds.md)
-(45 KB, live-verified). **Read that before changing a pin**; nothing here was invented at the keyboard.
+Every pin here comes from live-verified peer-build research; nothing here was invented at the
+keyboard.
 
 ## Why Modal
 
@@ -177,16 +177,14 @@ modal shell tools/cloud/modal_app.py::interactive
 already ships it, and `::build_peers` proved the point on 2026-08-09 by building the CUTLASS
 profiler for `sm90a` on a **CPU container** for $0.258.
 
-That makes the campaign's most load-bearing unknown answerable for cents.
-[`docs/gpu/derive/D1_h100_gemm.md`](../../docs/gpu/derive/D1_h100_gemm.md) §7 item 3:
+That makes the campaign's most load-bearing unknown answerable for cents: the **actual
+registers/thread ptxas allocates for the H100 GEMM's A3/A4 configurations.** The estimates (~185)
+are derived from the generator's declarations, not from
+`cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)`. If ptxas spills at 128 accumulators, **A3
+collapses and A2 becomes the top lever.**
 
-> **Actual registers/thread ptxas allocates for A3/A4.** §2.3's estimates (~185) are derived from the
-> generator's declarations, not from `cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)`. If ptxas
-> spills at 128 accumulators, **A3 collapses and A2 becomes the top lever.**
-
-[`D2_h100_attention.md`](../../docs/gpu/derive/D2_h100_attention.md) §4.2 ranks the same census
-**first of its five experiments** ("$0, NO GPU, runs in CI"), and
-[`D3_a100.md`](../../docs/gpu/derive/D3_a100.md) §7 asks for it on `sm_80`. Every register number in
+The H100 attention derivation ranks the same census **first of its five experiments** ("$0, NO GPU,
+runs in CI"), and the A100 derivation asks for it on `sm_80`. Every register number in
 this campaign is currently derived from `.reg` declarations rather than measured — and NVIDIA's own
 CUTLASS build emits `(C7511) ... wgmma.mma_async instructions are serialized due to insufficient
 register resources` at 256x128x64, which is exactly the tile class the wide-tile work made
