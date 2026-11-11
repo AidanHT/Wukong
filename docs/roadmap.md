@@ -1197,8 +1197,8 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
 > and cuDNN through the redistributable DLLs, NVRTC-compiled CUDA-C, PyTorch in **eager** mode
 > (Triton does not install on Windows), and **no CUDA toolkit** — hence no CUTLASS, FlashAttention,
 > Marlin or vLLM peer. These are properties of that instrument; **do not extrapolate them to
-> datacenter parts.** The datacenter retarget, including re-measurement against the peers a Linux
-> cloud box can build, is `GPU_RETARGET_PLAN.md`.
+> datacenter parts.** The datacenter retarget includes re-measurement against the peers a Linux
+> cloud box can build.
 >
 > **Three families here need more than a scope note** — `BENCHMARKS.md`'s standing index has the full
 > text:
@@ -1231,7 +1231,7 @@ falling back to a different kernel, which is why the 4050 gates above stay green
 Measured standing on an **NVIDIA H100 80GB HBM3** (132 SMs, Linux container, cuBLAS with f32 output
 as the peer), full tables and a log citation per number in `BENCHMARKS.md` → *GPU backend (NVIDIA
 H100 80GB HBM3, `sm_90a`)*. **All of it is iteration-grade**: the rounds ran in a container whose
-user is refused `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 classes container rounds as
+user is refused `nvidia-smi -lgc`, and the campaign's clock policy classes container rounds as
 *iteration* data and only locked-clock root-VM rounds as *publication* data — every round records the
 refusal itself (`[clock] lock: refused (…); running unlocked`), and five of them also stamp
 themselves `ITERATION data, not publication data` in a banner (`BENCHMARKS.md` names which, and why
@@ -1284,8 +1284,7 @@ Three scope notes, because the promotion changes what the numbers above describe
 - **Sharp edge:** the promotion *narrows* the Hopper fast path. The retired rule always returned a
   128×256 row; the new one can decline, and six reachable `(tile, schedule)` signatures have no module,
   so contiguous bands of tall-skinny shapes now take the pre-Hopper f32 launcher — correct, and much
-  slower. The set is swept, enumerated and pinned by a device-free law so it cannot grow silently;
-  `docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md` lists the modules that would close it.
+  slower. The set is swept, enumerated and pinned by a device-free law so it cannot grow silently.
 
 A GPU backend, `wukong_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
@@ -1489,8 +1488,8 @@ returns Ok but re-retaining the primary context still returns error 700, and cud
 non-primary `cuCtxCreate`, so in-process recovery is impossible. *(Scope: that is a measurement of
 **one driver on WDDM**, not a CUDA law. The record-and-skip policy it justifies is correct either
 way — a lost device must never be reported as passing — but the underlying "recovery is impossible"
-finding is on the Phase-1 list to re-measure on the Linux driver, where it may relax;
-`GPU_RETARGET_PLAN.md` §2.6.)* `crate::gpu::reset_gpu` therefore
+finding is on the Phase-1 list to re-measure on the Linux driver, where it may relax.)*
+`crate::gpu::reset_gpu` therefore
 degrades to marking the device **lost**; the gates record the root fault on a loud ledger and
 report every later program as NOT RUN (never as passed, never as spuriously failed) — one faulting
 program can no longer cascade into ~100 false failures across both gates.
@@ -1691,13 +1690,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 - **Language direction (kernel language, not a recognizer catalog).** The GPU SOTA
   campaign is wrapping special-case PTX separately. The plan for making Wukong
-  itself a strong ML/DL kernel language — generic gpu-native lowering, consuming
+  itself a strong ML/DL kernel language is generic gpu-native lowering, consuming
   `@tile` / `@generic` / `shared`, explicit vendor kernels rather than silent
-  rewrites — lives in [`docs/LANGUAGE_DIRECTION.md`](LANGUAGE_DIRECTION.md). Phase 2 (`@tile`,
+  rewrites. Phase 2 (`@tile`,
   `shared`, `sync_block`) is integrated; see roadmap
-  "Works end to end" for what runs today. The sequenced
-  language mission (including AI-editor / vibe-coding) lives in
-  [`docs/WUKONG_MASTER_PLAN.md`](WUKONG_MASTER_PLAN.md).
+  "Works end to end" for what runs today.
 - Fusing arbitrary elementwise chains *under* `@parallel`. (The **parallel fused-epilogue GEMM** that
   was the remaining item here has since shipped — a `@parallel` `act(A·Bᵀ [+ bias])` nest dispatches
   to the multicore `wukong_sgemm_nt_epi_parallel`; see "Works end to end" above.)

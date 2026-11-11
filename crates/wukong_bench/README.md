@@ -40,10 +40,9 @@ With no arguments the corpus defaults to `tests/run`. Non-mode arguments are cor
 `--wukongc=`), because both quantities are per process: the runtime reads its thread count once, and
 a cold start is everything a warm in-process loop amortizes away. Every child's exit status and
 stdout are checked; a failed child, or a sweep whose output changes with the thread count, exits 1
-rather than reporting. The `cold-start:` and `scaling:` summary lines are a contract with
-`docs/sota-campaign-2026-09/analyze-sota-measure.py`, pinned on both sides (this crate's unit test,
-the analyser's `--self-test`). The scaling wall includes the serial compile and start-up, so its
-efficiency is a whole-process (Amdahl) figure.
+rather than reporting. The `cold-start:` and `scaling:` summary lines are a stable,
+machine-readable contract, pinned by this crate's unit test. The scaling wall includes the serial
+compile and start-up, so its efficiency is a whole-process (Amdahl) figure.
 
 `compile-work` is the mode to compare two revisions with: every other mode reports wall time,
 which on this host has moved 3.5x on identical inputs from thermal history alone, while a count is

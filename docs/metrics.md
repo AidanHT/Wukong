@@ -1,12 +1,12 @@
 # Metrics that matter — and Wukong's honest standing
 
-**CPU status, 2026-09-23:** the [September evaluation](cpu-evaluation-2026-09.md) and [current closeout tracker](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md) take precedence over overlapping historical ratios below. Withdrawn and noise-limited rows are not established losses or wins. Recent correctness fixes have no fresh matched-peer performance result.
+**CPU status, 2026-09-23:** the September evaluation and current closeout tracker take precedence over overlapping historical ratios below. Withdrawn and noise-limited rows are not established losses or wins. Recent correctness fixes have no fresh matched-peer performance result.
 
 This document defines, from first principles, the metrics an ML/DL kernel language and its
 compiler must win at, and records Wukong's current standing on each — including the losses.
 It is the north star for optimization work: a change that doesn't move one of these metrics
 (or protect a gate) is not worth its complexity. Numbers cited here are *recorded ratios* from
-`BENCHMARKS.md` and `prompts/results/*`; absolute GFLOP/s are deliberately absent (this
+`BENCHMARKS.md`; absolute GFLOP/s are deliberately absent (this
 hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-roofline are stable).
 
 > **Two GPUs now, and they do not mix (2026-08-11).** The **H100 (`sm_90a`)** figures — the
@@ -25,7 +25,7 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > on neither part, so it compared two different kernels — `BENCHMARKS.md` has the full retraction.
 > **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
 > recorded under that label:** the rounds ran in a Modal container whose user cannot call
-> `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 rules that "Container rounds are *iteration*
+> `nvidia-smi -lgc`, and the campaign's clock policy rules that "Container rounds are *iteration*
 > data; VM rounds are *publication* data" — each of the eleven 2026-08-11 rounds records the refusal
 > itself (`[clock] lock: refused (…); running unlocked`), and five of them also stamp themselves
 > `ITERATION data, not publication data` in an all-caps banner; `BENCHMARKS.md` names which five, and
@@ -48,8 +48,7 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > NVRTC-compiled CUDA-C, PyTorch in **eager** mode (Triton does not install on Windows), and **no
 > CUDA toolkit** — hence no CUTLASS, FlashAttention, Marlin/Machete or vLLM peer. These are
 > properties of that instrument; **do not extrapolate them to datacenter parts.** The datacenter
-> retarget, including re-measurement against the peers a Linux cloud box can build, is
-> `GPU_RETARGET_PLAN.md`.
+> retarget includes re-measurement against the peers a Linux cloud box can build.
 >
 > **Three GPU families need more than a scope note; `BENCHMARKS.md`'s standing index has the full
 > text.** (1) Every **PyTorch** comparison here is against **eager**, which this document's own M2
@@ -170,8 +169,8 @@ Current standing (recorded):
   **96–105% at 2048³ (beats IMMA), 86–88% at 1024³, ~70% at 4096³** (HBM-bound loss); fused int8
   GEMM+dequant **1.1–2.2×** the cuBLAS chain; int4 W4A16 documented lead over the *naive* Tier-A
   peer — ~~no library peer exists~~ **no library peer is bindable on this toolkit-free box**;
-  Marlin/Machete are the real W4A16 bar and are buildable on a Linux box with the toolkit
-  (`docs/gpu/derive/D5_peer_builds.md`), so this lead is over a naive kernel, not over the field;
+  Marlin/Machete are the real W4A16 bar and are buildable on a Linux box with the toolkit,
+  so this lead is over a naive kernel, not over the field;
   attention **0.37–0.66× cuDNN at S≥2048** (loss — structural: SFU/serial-softmax bound on 20
   SMs; the FA2-style warp-specialized kernels were built and measured 2026-07-09 and win only
   **4–6% at S=4096**, now the default route there, tie at 2048, lose at ≤1024 — so the cuDNN
@@ -326,8 +325,7 @@ campaign's comparison rules before it can support a performance claim.
 
 ## Current top improvement targets (ranked by user impact × measured gap)
 
-Closed in the 2026-07-09/10 round (see M1/M2 for the numbers and
-`prompts/results/perf-sota-session3.md` for the full ledger): the large-GEMM single-core
+Closed in the 2026-07-09/10 round (see M1/M2 for the numbers): the large-GEMM single-core
 tail (C-tile prefetch, 2048³ now at/above MKL-1c parity, see M1), the 256³ deliberate-serial standing
 (historically engaged at ~94–110% of MKL-all under the dynamic-claiming default;
 [current parity unestablished](../BENCHMARKS.md#cpu-parallel-gemm-evidence-scope)), the serving goodput ceiling
@@ -374,7 +372,7 @@ Remaining, ranked:
    that stood here is RETRACTED (2026-08-13): it measured the retired hand-placed `_smdb` entry, which
    the dispatcher selects at none of the three sizes. What is measured is the fused kernel's
    **67.7% / 71.4% / 47.9%** of cuBLAS int8 GEMM, so a direct dispatched-entry-vs-IMMA round is owed.
-   Everything past that is planning, not measurement — `docs/roadmap.md` and `docs/gpu/derive/`.
+   Everything past that is planning, not measurement — `docs/roadmap.md`.
 3. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors (M6; **file I/O now runs** — typed read/write blobs, interp == native).
 4. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).

@@ -2,11 +2,9 @@
 
 This folder documents the **Wukong language** (`.wk`) and the **compiler** that implements it:
 surface syntax, semantics, the compile pipeline, backends, and how to measure them honestly. It is
-not the product roadmap for a datacenter GPU stack — that campaign lives under [`gpu/`](gpu/) and
-[`GPU_RETARGET_PLAN.md`](../GPU_RETARGET_PLAN.md) at the repo root.
+not the product roadmap for a datacenter GPU stack.
 
-Start here if you are writing or running Wukong programs. Start under [`gpu/`](gpu/) only if you
-are renting silicon, reading derivation dossiers, or working on `wukong_codegen_gpu`.
+Start here if you are writing or running Wukong programs.
 
 ---
 
@@ -14,13 +12,8 @@ are renting silicon, reading derivation dossiers, or working on `wukong_codegen_
 
 | Document | What it covers |
 |---|---|
-| [Master plan](WUKONG_MASTER_PLAN.md) | North star for Wukong as a **programming language**: mission, success criteria, sequenced phases, and AI-editor / vibe-coding as a first-class user of the kernel language — not a GPU-family campaign. |
-| [Language direction](LANGUAGE_DIRECTION.md) | Design for generic gpu-native lowering: consume `@tile` / `@generic` / `shared`, explicit vendor kernels rather than silent PTX rewrites. Review thesis, not a claim those features run today. |
-| [Language branch reports](lang/README.md) | Per-lane implementation records for master-plan Phases 0–3, plus the list of claims in them that a later gate falsified. A record of what each lane did, never the current state. |
 | [Language guide](language-guide.md) | The `.wk` surface — types, tensors, control flow, `@parallel`, CLI flags — with an honest maturity legend per feature. |
 | [Compiler internals](internals.md) | Crate layering, the lexer→MIR pipeline, optimizer passes, the four execution backends, recognizers, and the test gates. |
-| [CPU optimization review](cpu-optimization-review-2026-09.md) | September 2026 branch audit, compiler/runtime changes, strengths, remaining gaps and links to the deferred CPU validation runbook. |
-| [CPU metrics follow-up](cpu-metrics-review-2026-09.md) | Historical weak CPU metrics, subsequent compiler/runtime work across parallel branches, remaining gaps and deferred validation. |
 | [Roadmap & limitations](roadmap.md) | What runs today, what is checked-only, known sharp edges, and planned work — language and compiler first, GPU as one backend among several. |
 | [LLVM setup](llvm-setup.md) | The **optional** textual-LLVM path (`--emit=llvm-ir`). The default native path is Cranelift and needs no LLVM. |
 
@@ -59,15 +52,7 @@ absent — this hardware's clocks swing too much for portable absolutes.
 
 ## GPU backend campaign (not the language thesis)
 
-[`gpu/`](gpu/) holds working documents for the **datacenter retarget**: rented-GPU runbooks,
-derivation dossiers (Wave-0 and Act-2), and the benchmark-instrument prose. That work exists to
-make `wukong_codegen_gpu` honest on A100/H100 — it does not define what Wukong the language is.
-
-| Document | What it covers |
-|---|---|
-| [`gpu/README.md`](gpu/README.md) | Index of this subtree, the benchmark instrument (`bench_instrument.rs`), and how GPU docs relate to the plan. |
-| [`gpu/derive/`](gpu/derive/) | Wave-0 derivation dossiers (D1–D7), Act-2 wave dossiers (WAVE3–WAVE6), and predict-before-measure documents — all $0 derivation, tested on silicon later. |
-| [`gpu/phase1-runbook.md`](gpu/phase1-runbook.md) | Operational checklist for a rented `sm_89` bring-up session (Modal L4). |
-| [GPU_RETARGET_PLAN.md](../GPU_RETARGET_PLAN.md) | The plan itself — mission, phases, benchmark methodology (§6), budget, and success criteria. |
+The **datacenter retarget** exists to make `wukong_codegen_gpu` honest on A100/H100 — it does not
+define what Wukong the language is.
 
 Round logs and session ledgers live under [`bench/gpu/`](../bench/gpu/), not under `docs/`.
