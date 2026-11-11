@@ -55,9 +55,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   same activations written out straight-line through the generic `Select` rule, wherever the tape
   can) pin every kink, the infinities and NaN.
 - **GPU.** The PTX `vmath` tables cover codes 0..=35: `--backend=gpu` keeps a spelling on the CPU
-  kernel, and `--backend=gpu-native` declines a program that dispatches one as `UNSUPPORTED` (before,
-  such a loop lowered as plain MIR and ran on the device; of the pre-existing corpus only
-  `spelling_value_bindings.wk` is affected).
+  kernel, and `--backend=gpu-native` is built without the spelling-only codes
+  (`LowerOptions::spell_kernels`, cleared by `wukong_driver` for the GPU-lowering backend and by the
+  gpu-native corpus sweeps), so such a loop lowers as written there, exactly as before this change;
+  a spelling that IS an existing kernel still dispatches it. A dispatched code would have declined
+  the whole program as `UNSUPPORTED` (`spelling_value_bindings.wk` among the corpus).
 - **Tests.** `tests/run/spelling_act_{gelu_tanh,gelu_erf,silu_sigmoid,softplus_mish,hard,leaky_elu}.wk`
   print every lane over NaNs of both signs, +-0, +-inf and large |x| (hex where the scalar semantics
   pin the bits, else within the declared `5e-6` the runtime's

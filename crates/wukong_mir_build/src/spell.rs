@@ -598,7 +598,13 @@ impl FnLowerer<'_> {
         let v = self.spell_value(value, j, batch, env, &mut xs)?;
         // A spelling of constants alone has no input array.
         let x = xs?;
-        Some((out, x, kernel_for(v)?))
+        let code = kernel_for(v)?;
+        // A consumer that cannot run the spelling-only codes (gpu-native's PTX) gets the loop as
+        // written; an existing kernel the spelling IS stays (`LowerOptions::spell_kernels`).
+        if !self.gemm.spell_kernels && code >= VMATH_GELU_TANH {
+            return None;
+        }
+        Some((out, x, code))
     }
 
     /// The let-free statement form, one `out[j] = <spelling>` among the statements of a

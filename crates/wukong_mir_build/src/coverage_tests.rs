@@ -13,20 +13,25 @@ use wukong_mir::{BinOp, CmpOp, Function, Op, Program, ValueId};
 use wukong_span::{Interner, SourceId};
 
 use crate::spell::{
-    VMATH_ELU_EXPM1, VMATH_GELU_ERF_MUL, VMATH_GELU_TANH_HF, VMATH_SILU_DIV, VMATH_SILU_SX,
+    VMATH_ELU_EXPM1, VMATH_GELU_ERF_MUL, VMATH_GELU_TANH, VMATH_GELU_TANH_HF, VMATH_SILU_DIV,
+    VMATH_SILU_SX,
 };
 use crate::{
-    lower_program, lower_program_reporting_dispatch, LowerOptions, NORM_LOGSOFTMAX, NORM_SOFTMAX,
-    VMATH_GELU, VMATH_SILU,
+    lower_program_reporting_dispatch, lower_program_with, LowerOptions, NORM_LOGSOFTMAX,
+    NORM_SOFTMAX, VMATH_GELU, VMATH_SIGMOID, VMATH_SILU,
 };
 
 fn lower_src(src: &str) -> (Program, Vec<Diagnostic>, Interner) {
+    lower_src_with(src, LowerOptions::default())
+}
+
+fn lower_src_with(src: &str, opts: LowerOptions) -> (Program, Vec<Diagnostic>, Interner) {
     let mut interner = Interner::new();
     let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
     assert!(pdiags.is_empty(), "parse: {pdiags:?}");
     let (sema, sdiags) = wukong_sema::check(&module, &interner);
     assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
-    let (prog, diags) = lower_program(&module, &sema, &mut interner);
+    let (prog, diags) = lower_program_with(&module, &sema, &mut interner, opts);
     assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
     for f in &prog.funcs {
         assert!(
@@ -350,6 +355,59 @@ fn batched(x: [f32; 256], mut o: [f32; 256]) {
     assert_eq!(
         vmath_code(&prog, &interner, "batched"),
         Some(VMATH_ELU_EXPM1 as i128)
+    );
+}
+
+/// `LowerOptions::spell_kernels` cleared (what `--backend=gpu-native` gets, whose PTX implements
+/// only the codes below `VM_SPELL_FIRST`): a spelling that only a spelling-only code computes lowers
+/// as written -- no kernel call at all -- while a spelling that IS an existing kernel keeps it. The
+/// default dispatches all three, or the clear proves nothing.
+#[test]
+fn clearing_spell_kernels_keeps_only_the_existing_kernels_a_spelling_is() {
+    let src = "module m
+fn gelu_spelled(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * (x[i] * x[i] * x[i]))));
+    }
+}
+fn swish(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        o[i] = x[i] * sigmoid(x[i]);
+    }
+}
+fn bound(x: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..64 {
+        let v: f32 = x[i];
+        let e: f32 = exp(-v);
+        o[i] = 1.0 / (1.0 + e);
+    }
+}
+";
+    let (on, _, on_it) = lower_src(src);
+    assert_eq!(
+        vmath_code(&on, &on_it, "gelu_spelled"),
+        Some(VMATH_GELU_TANH as i128)
+    );
+    assert_eq!(vmath_code(&on, &on_it, "swish"), Some(VMATH_SILU as i128));
+    assert_eq!(
+        vmath_code(&on, &on_it, "bound"),
+        Some(VMATH_SIGMOID as i128)
+    );
+    let (off, _, off_it) = lower_src_with(
+        src,
+        LowerOptions {
+            spell_kernels: false,
+            ..LowerOptions::default()
+        },
+    );
+    assert!(
+        kernels(func(&off, &off_it, "gelu_spelled"), &off_it).is_empty(),
+        "a spelling-only code must not be emitted when the consumer cannot run it"
+    );
+    assert_eq!(vmath_code(&off, &off_it, "swish"), Some(VMATH_SILU as i128));
+    assert_eq!(
+        vmath_code(&off, &off_it, "bound"),
+        Some(VMATH_SIGMOID as i128)
     );
 }
 

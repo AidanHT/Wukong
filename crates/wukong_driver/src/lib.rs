@@ -500,9 +500,15 @@ fn no_recognize() -> bool {
 ///   with `UNSUPPORTED: VecKernelCall (CPU raw-AVX2 kernel) not lowered to PTX` unless the operator
 ///   happened to know to set `WUKONG_P4_NO_256=1`.
 ///
-/// [`BackendKind::Gpu`] is deliberately NOT in the second rule: that path tree-walks the program in
-/// the interpreter and offloads recognized calls only, so it wants the CPU recipes exactly as much
-/// as `interp` and `native` do. Only *whole-program* lowering needs MIR a PTX backend can consume.
+/// * `spell_kernels` - the spelling-only `wukong_vmath_f32` codes (`wukong_runtime::vspell`, P12.10),
+///   cleared for `--backend=gpu-native` by the same reasoning: its PTX `mrt_vmath` implements the
+///   codes below them only, so a dispatched spelling there declined the whole program where the
+///   loop as written (the same bits, by the recognizer's own rule) lowers.
+///
+/// [`BackendKind::Gpu`] is deliberately NOT in the second or third rule: that path tree-walks the
+/// program in the interpreter and offloads recognized calls only (a code it has no GPU kernel for
+/// runs the CPU kernel), so it wants the CPU recipes exactly as much as `interp` and `native` do.
+/// Only *whole-program* lowering needs MIR a PTX backend can consume.
 ///
 /// The `WUKONG_P4_NO_256` kill-switch is untouched and still read inside `mir_build`; it remains the
 /// same-run A/B knob for measuring the 256-bit win on CPU, and the escape hatch if a recipe body is
@@ -522,6 +528,7 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
         recognize: !no_recognize(),
         vec_kernels: !matches!(opts.backend, BackendKind::GpuLower)
             && opts.target_cpu.allows_vec_kernels(),
+        spell_kernels: !matches!(opts.backend, BackendKind::GpuLower),
         strict_fp: opts.strict_fp,
         // P12.21: an implicit `@parallel` grain on every CPU-executing path; the PTX lowering keeps
         // one index per iteration (one GPU thread each).
@@ -4001,6 +4008,62 @@ mod lower_options_tests {
             !lower_options_for(&opts_for(BackendKind::GpuLower)).vec_kernels,
             "gpu-native lowers the whole program to PTX and cannot lower Win64 machine code"
         );
+    }
+
+    /// Only whole-program GPU lowering gives up the spelling-only vmath codes, whose PTX it lacks;
+    /// every CPU-executing path keeps them (the offload path runs a code it has no GPU kernel for on
+    /// the CPU). And the switch is what decides: the written-out GELU dispatches code 36 for
+    /// `native` and no kernel at all for `gpu-native`, which lowers the loop instead.
+    #[test]
+    fn only_whole_program_gpu_lowering_clears_the_spelling_kernels() {
+        for b in [BackendKind::Interp, BackendKind::Native, BackendKind::Gpu] {
+            assert!(
+                lower_options_for(&opts_for(b)).spell_kernels,
+                "{b:?} executes the recognized calls on the CPU and keeps the spelling kernels"
+            );
+        }
+        assert!(!lower_options_for(&opts_for(BackendKind::GpuLower)).spell_kernels);
+
+        const SRC: &str = "fn gelu_spelled(x: [f32; 64], mut o: [f32; 64]) {\n\
+            for i in 0..64 { o[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * \
+            (x[i] * x[i] * x[i])))); }\n}\n";
+        let vmath_codes = |backend: BackendKind| -> Vec<i128> {
+            let mut sm = SourceMap::new();
+            let id = sm.add("spell_opts.wk".to_string(), SRC.to_string());
+            let (tokens, _) = wukong_lexer::tokenize(sm.source(id), id);
+            let mut interner = Interner::new();
+            let (module, _) =
+                wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+            let (sema, _) = wukong_sema::check(&module, &interner);
+            let lo = lower_options_for(&opts_for(backend));
+            let (program, md) =
+                wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lo);
+            assert!(!md.iter().any(|d| d.is_error()), "mir_build errors: {md:?}");
+            let f = &program.funcs[0];
+            let consts: std::collections::HashMap<wukong_mir::ValueId, i128> = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| match i.op {
+                    wukong_mir::Op::ConstInt(k, _) => i.result.map(|r| (r, k)),
+                    _ => None,
+                })
+                .collect();
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| match &i.op {
+                    wukong_mir::Op::Call { func, args }
+                        if interner.resolve(*func) == "wukong_vmath_f32" =>
+                    {
+                        consts.get(&args[3]).copied()
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(vmath_codes(BackendKind::Native), vec![36]);
+        assert_eq!(vmath_codes(BackendKind::GpuLower), Vec::<i128>::new());
     }
 
     /// The optimizer's 256-bit kernels follow the lowering's switch exactly, so the interpreter and

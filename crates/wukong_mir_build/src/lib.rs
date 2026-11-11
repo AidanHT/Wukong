@@ -1151,6 +1151,23 @@ pub struct LowerOptions {
     /// rather than the environment.
     pub vec_kernels: bool,
 
+    /// Dispatch a natural activation spelling to one of the spelling-only `wukong_vmath_f32` codes
+    /// (`wukong_runtime::vspell`, `VM_SPELL_FIRST..=VM_SPELL_LAST`, P12.10) -- `true`, the default.
+    /// When `false`, a spelling whose tree only such a code computes lowers as written instead,
+    /// exactly as it did before those codes existed; a spelling that IS an existing kernel
+    /// (`x * sigmoid(x)` is `VMATH_SILU`, `1 / (1 + exp(-x))` is `VMATH_SIGMOID`) still dispatches
+    /// it.
+    ///
+    /// This exists for the reason [`Self::vec_kernels`] does: the MIR is built once for whichever
+    /// backend was asked for, and `--backend=gpu-native`'s PTX `mrt_vmath` implements codes
+    /// `0..=35` only. A spelling code there is an `UNSUPPORTED` decline of the WHOLE program, so
+    /// dispatching it would turn a loop the PTX backend lowers fine (a GELU written out,
+    /// `tests/run/spelling_value_bindings.wk`) into a program it cannot run. The loop as written
+    /// computes the same bits as the kernel (that is what dispatching a spelling requires), so
+    /// nothing but the CPU kernel is given up. `wukong_driver` clears it for the GPU-lowering
+    /// backend only, and the gpu-native corpus coverage sweeps build with it cleared too.
+    pub spell_kernels: bool,
+
     /// Strict floating-point mode for the WHOLE program (`--fp=strict`; `false`, the default, is
     /// `--fp=fast`). It is the program-wide spelling of the `@strict_fp` function attribute and
     /// means exactly what that attribute means for every function: no FMA contraction of a source
@@ -1178,6 +1195,7 @@ impl Default for LowerOptions {
             unroll_for_autodiff: true,
             recognize: true,
             vec_kernels: true,
+            spell_kernels: true,
             strict_fp: false,
             implicit_grain: false,
         }
@@ -1385,6 +1403,7 @@ fn lower_program_pooled(
     let gemm = GemmSyms {
         recognize: opts.recognize,
         vec_kernels: opts.vec_kernels,
+        spell_kernels: opts.spell_kernels,
         // Program-wide `--fp=strict`. Applied per function by `strict_fp_gemm` below, beside the
         // `@strict_fp` attribute it is the global spelling of.
         strict_fp: opts.strict_fp,
@@ -3691,6 +3710,10 @@ struct GemmSyms {
     /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
     /// backend can lower.
     vec_kernels: bool,
+    /// The spelling-only `wukong_vmath_f32` codes switch ([`LowerOptions::spell_kernels`]). Rides
+    /// here because this struct reaches `spell.rs`'s matcher on every path that calls it (the
+    /// per-statement probe, the `let`-reading one, `@parallel` regions and batched nests alike).
+    spell_kernels: bool,
     /// Strict floating-point mode for the function being lowered (`@strict_fp`, or the program-wide
     /// [`LowerOptions::strict_fp`]). Rides here for the reason `recognize` does: this struct is
     /// copied into every lowerer, recipe builder and outlined `@parallel` region, so the mode cannot

@@ -573,8 +573,8 @@ spelling's **derivative**: route it to an intrinsic's rule only where the two ag
 kinks included, and give a select-spelled spelling with a kink its own rule in
 `tape_nn::algebraic_derivative` that hands the adjoint to the branch its selects take (two trees
 with one forward but different tie-breaks need two codes, like `VM_LEAKYRELU` and `VM_LEAKY_GE`).
-The PTX `vmath` tables do not take the code, so `--backend=gpu-native` declines a program that
-dispatches it.
+The PTX `vmath` tables do not take the code; `LowerOptions::spell_kernels` keeps every code from
+`VM_SPELL_FIRST` on out of `--backend=gpu-native`'s MIR, so the loop lowers as written there.
 
 ## Adding a run-time check
 

@@ -2240,9 +2240,9 @@ slices, `Tensor[f32, N]`, `@parallel` functions and batched `[R, C]` nests all d
 (`tests/run/spelling_act_*.wk` compare every lane with the same expression evaluated where no
 recognizer sees it). The spellings are differentiable (`--emit=grad`, `--train`), and at a kink (the
 leaky selects at `x = 0`, the hard activations' `x + 3` at 0 or 6) the gradient follows the branch
-the spelling's own select takes, as it would for the selects written out. On `--backend=gpu-native`
-a program that dispatches one is declined as unsupported (its PTX table stops at the 36 intrinsic
-codes), never lowered to different bits.
+the spelling's own select takes, as it would for the selects written out. On `--backend=gpu-native`,
+whose PTX table stops at the 36 intrinsic codes, a spelling with no intrinsic kernel lowers as
+written instead.
 
 ### Scalar builtins ✅
 

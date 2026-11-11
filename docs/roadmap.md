@@ -1898,11 +1898,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `0.01`, an ELU `alpha` other than 1, a QuickGELU slope other than `1.702`); every loop of a
   `@strict_fp` function or under `--fp=strict` (strict mode turns every recognizer off); and the ReLU
   select over a `let`-bound value (velem's matcher does not see through the binding).
-  `--backend=gpu-native` declines a program that dispatches one of the new codes (its PTX `mrt_vmath`
-  table covers 0..=35), where before those loops lowered as plain MIR and ran on the device; among the
-  pre-existing corpus only `tests/run/spelling_value_bindings.wk` is affected. `--backend=gpu`
-  offload keeps them on the CPU kernel. At a kink the spellings' gradients follow their own selects
-  (a leaky select's `x = 0`, a hard activation's `x + 3` at 0 or 6).
+  `--backend=gpu-native` does not get the new codes at all (its PTX `mrt_vmath` table covers 0..=35;
+  `LowerOptions::spell_kernels` is cleared for it), so those loops still lower as plain MIR there and
+  run on the device, as before; giving that backend the spellings means lowering codes 36..=60 in
+  PTX. `--backend=gpu` offload keeps them on the CPU kernel. At a kink the spellings' gradients
+  follow their own selects (a leaky select's `x = 0`, a hard activation's `x + 3` at 0 or 6).
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment

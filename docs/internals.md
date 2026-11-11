@@ -2431,8 +2431,11 @@ kernel would change the answer. P12.10 gives each spelling a kernel of its own i
   `(-3, 3)` in `x`, but `clamp` keeps `v` on the closed `[0, 6]` and `x + 3` rounds to 6 already at
   `3 - 2^-22`). The calls reuse the `wukong_vmath_f32{,_parallel}` symbols, so no recognizer arm,
   interpreter intrinsic or `tape.rs` `Syms` entry is new. The PTX tables stop at 35: `--backend=gpu`
-  keeps a spelling on the CPU kernel, and `--backend=gpu-native` declines the program as
-  `UNSUPPORTED`.
+  keeps a spelling on the CPU kernel, and `--backend=gpu-native` never sees one --
+  `LowerOptions::spell_kernels`, cleared by `wukong_driver::lower_options_for` for that backend (as
+  `vec_kernels` is) and by the gpu-native corpus sweeps' `hostvec::build`, keeps every code from
+  `VM_SPELL_FIRST` on out of its MIR, so the loop lowers as written (the same bits) instead of
+  declining the whole program.
 - **Gates.** `vspell_lanes_equal_the_scalar_twin_bit_for_bit` (every code, every lane position, the
   tail, serial and `_parallel`, NaNs, infinities, subnormals); `spelling_census_tests` (41 spellings x
   array/slice/tensor x inline/`let`-bound, each row's expected kernel by name, `census_report` prints
