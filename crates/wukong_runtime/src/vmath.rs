@@ -65,15 +65,16 @@
 use crate::vspell::{
     elu_expm1_8, gelu_erf_cdf8, gelu_erf_div8, gelu_erf_mul8, gelu_tanh8, gelu_tanh_cdf8,
     gelu_tanh_fast8, gelu_tanh_hf8, gelu_tanh_nofma8, hardsigmoid_clamp8, hardsigmoid_minmax8,
-    hardswish_clamp8, hardswish_minmax8, leaky_lt8, mish_log1p8, mish_naive8, mish_softplus8,
-    quick_gelu8, sigmoid_ratio8, silu_div8, silu_sx8, softplus_log1p8, softplus_naive8,
+    hardswish_clamp8, hardswish_minmax8, leaky_ge8, leaky_lt8, leaky_max8, mish_log1p8,
+    mish_naive8, mish_softplus8, quick_gelu8, sigmoid_ratio8, silu_div8, silu_sx8, softplus_log1p8,
+    softplus_naive8,
 };
 pub(crate) use crate::vspell::{
     VM_ELU_EXPM1, VM_GELU_ERF_CDF, VM_GELU_ERF_DIV, VM_GELU_ERF_MUL, VM_GELU_TANH,
     VM_GELU_TANH_CDF, VM_GELU_TANH_FAST, VM_GELU_TANH_HF, VM_GELU_TANH_NOFMA, VM_HARDSIGMOID_CLAMP,
-    VM_HARDSIGMOID_MINMAX, VM_HARDSWISH_CLAMP, VM_HARDSWISH_MINMAX, VM_LEAKY_LT, VM_MISH_LOG1P,
-    VM_MISH_NAIVE, VM_MISH_SOFTPLUS, VM_QUICK_GELU, VM_SIGMOID_RATIO, VM_SILU_DIV, VM_SILU_SX,
-    VM_SOFTPLUS_LOG1P, VM_SOFTPLUS_NAIVE,
+    VM_HARDSIGMOID_MINMAX, VM_HARDSWISH_CLAMP, VM_HARDSWISH_MINMAX, VM_LEAKY_GE, VM_LEAKY_LT,
+    VM_LEAKY_MAX, VM_MISH_LOG1P, VM_MISH_NAIVE, VM_MISH_SOFTPLUS, VM_QUICK_GELU, VM_SIGMOID_RATIO,
+    VM_SILU_DIV, VM_SILU_SX, VM_SOFTPLUS_LOG1P, VM_SOFTPLUS_NAIVE,
 };
 
 // --- op codes (shared with the recognizer in wukong_mir_build) ------------------------------------
@@ -1203,6 +1204,8 @@ macro_rules! with_vmath8_table {
             (VM_HARDSWISH_CLAMP, hardswish_clamp8),
             (VM_ELU_EXPM1, elu_expm1_8),
             (VM_LEAKY_LT, leaky_lt8),
+            (VM_LEAKY_GE, leaky_ge8),
+            (VM_LEAKY_MAX, leaky_max8),
         }
     };
 }

@@ -18,8 +18,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   kernel, below). It now dispatches to
   `wukong_vmath_f32`: to an existing kernel where the spelling IS that kernel's operations
   (`1.0 / (1.0 + exp(-x))` is `sigmoid`, `x * (1.0 / (1.0 + exp(-x)))` is `silu`, the stable
-  softplus, `exp(x) - 1.0` ELU, the `>=` and `max(x, 0.01 * x)` leaky selects), else to one of 23
-  new op codes, 36..=58 (`wukong_runtime::vspell`), each the kernel of one spelling: its scalar twin
+  softplus, `exp(x) - 1.0` ELU, the `x > 0.0` leaky select), else to one of 25 new op codes,
+  36..=60 (`wukong_runtime::vspell`), each the kernel of one spelling: its scalar twin
   is the spelling's operations in source order with the lowering's FMA contractions, its AVX2 body is
   generated from the same definition, and the NaN a NaN input yields is pinned to the spelling's.
   The matcher (`wukong_mir_build::spell`) reads the store value — through any leading `let`s — as
@@ -37,10 +37,23 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **The tanh GELU expansion of `tests/run/spelling_value_bindings.wk` dispatches again** — to
   `VM_GELU_TANH`, never to `gelu()`'s kernel, which it differs from in the last bits
   (`tests/recognizer-census.txt`: `wukong_vmath_f32*2` -> `*3`). No corpus program lost a dispatch.
-- **Autodiff.** Every new code is differentiable: each routes to the backward rule of the activation
-  it spells (`tape_nn::spelling_base`; every such rule reads the input, never the forward output),
-  and QuickGELU's and the erf GELU's derivatives are composed (`spelling_activation_vjps` gates all
-  23 against the f64 closed form and the finite difference of the spelling's own kernel).
+- **Autodiff.** Every new code is differentiable. A smooth spelling routes to the backward rule of
+  the activation it spells (`tape_nn::spelling_base`; every such rule reads the input, never the
+  forward output), and QuickGELU's and the erf GELU's derivatives are composed
+  (`spelling_activation_vjps` gates all 25 against the f64 closed form and the finite difference of
+  the spelling's own kernel). A select-spelled spelling with a kink has a rule of its own that hands
+  the adjoint to the branch its own selects take, as the language's `Select` VJP does: routed to the
+  intrinsics' rules, `x < 0 ? 0.01x : x` and `x >= 0 ? x : 0.01x` took the slope at `x = +-0`
+  (`dx = 0.01*dout` instead of `dout`), `max(x, 0.01x)` the identity at `+inf`,
+  `clamp(x + 3, 0, 6)` hardsigmoid/hardswish read 0 (and 1 instead of 1.5) at `x = +-3` and
+  `3 + 2^-22`, and the `min`/`max` forms read the ramp at `3 - 2^-22`, where `x + 3` already rounds
+  to 6. That is also why `x >= 0 ? x : 0.01*x` and `max(x, 0.01x)` have codes of their own
+  (`VM_LEAKY_GE`, 59; `VM_LEAKY_MAX`, 60) though their forward bits are the leaky kernel's on every
+  input: the code is how the tape tells the tie-breaks apart. The autodiff test
+  `spelling_vjps_break_ties_at_the_kink_like_their_own_selects` and the driver's
+  `spelled_activation_gradients_break_ties_like_their_own_selects` (which also differentiates the
+  same activations written out straight-line through the generic `Select` rule, wherever the tape
+  can) pin every kink, the infinities and NaN.
 - **GPU.** The PTX `vmath` tables cover codes 0..=35: `--backend=gpu` keeps a spelling on the CPU
   kernel, and `--backend=gpu-native` declines a program that dispatches one as `UNSUPPORTED` (before,
   such a loop lowered as plain MIR and ran on the device; of the pre-existing corpus only

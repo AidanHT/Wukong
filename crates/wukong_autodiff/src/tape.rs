@@ -77,8 +77,10 @@ pub(crate) const VM_ASIN: i64 = 33;
 pub(crate) const VM_ACOS: i64 = 34;
 pub(crate) const VM_CBRT: i64 = 35;
 // The natural spellings of the activations (`wukong_runtime::vspell`, P12.10): the same functions
-// written another way, each with its own forward kernel. `tape_nn::spelling_base` routes each to
-// the backward rule of the activation it spells.
+// written another way, each with its own forward kernel. `tape_nn::spelling_base` routes each smooth
+// one to the backward rule of the activation it spells; the select-spelled ones with a kink (the
+// leaky selects, the clamp/min-max hard activations) have rules of their own that break the tie
+// at the kink the way the spelling's own selects do.
 pub(crate) const VM_GELU_TANH: i64 = 36;
 pub(crate) const VM_GELU_TANH_HF: i64 = 37;
 pub(crate) const VM_GELU_TANH_NOFMA: i64 = 38;
@@ -102,6 +104,8 @@ pub(crate) const VM_HARDSWISH_MINMAX: i64 = 55;
 pub(crate) const VM_HARDSWISH_CLAMP: i64 = 56;
 pub(crate) const VM_ELU_EXPM1: i64 = 57;
 pub(crate) const VM_LEAKY_LT: i64 = 58;
+pub(crate) const VM_LEAKY_GE: i64 = 59;
+pub(crate) const VM_LEAKY_MAX: i64 = 60;
 /// QuickGELU's slope (`wukong_runtime::vspell`'s `QUICK`, the `f32` of `1.702`), mirrored.
 pub(crate) const QUICK_GELU_SLOPE: f64 = 1.702;
 /// The leaky-ReLU negative slope baked into `wukong_runtime::vmath` (`LEAKY_ALPHA`). Mirrored, so a

@@ -25,10 +25,11 @@ module tests.run.spelling_act_leaky_elu
 // spelling below is an elementwise loop `o[i] = <spelling of x[i]>` that the recognizer dispatches
 // to a 256-bit `wukong_vmath_f32` kernel computing THAT spelling's own scalar semantics
 // (wukong_runtime/src/vspell.rs; the matcher is wukong_mir_build/src/spell.rs): `leaky_select_gt`
-// -> VM_LEAKYRELU (8), `leaky_select_ge` -> VM_LEAKYRELU (8), `leaky_max_scaled` -> VM_LEAKYRELU
-// (8), `leaky_select_lt` -> VM_LEAKY_LT (58), `elu_select_exp_minus_one` -> VM_ELU (7),
-// `elu_select_expm1` -> VM_ELU_EXPM1 (57). `leaky_select_gt` runs a second time through a `[]f32`
-// slice helper, where the kernel takes a run-time length.
+// -> VM_LEAKYRELU (8), `leaky_select_ge` -> VM_LEAKY_GE (59, the leaky kernel's bits under a code
+// of its own, for its derivative at zero), `leaky_max_scaled` -> VM_LEAKY_MAX (60, likewise, for
+// its derivative at +inf), `leaky_select_lt` -> VM_LEAKY_LT (58), `elu_select_exp_minus_one` ->
+// VM_ELU (7), `elu_select_expm1` -> VM_ELU_EXPM1 (57). `leaky_select_gt` runs a second time
+// through a `[]f32` slice helper, where the kernel takes a run-time length.
 //
 // WHAT IS PRINTED. For each spelling, one line of 19 flags -- lane i is 1 when the dispatched lane
 // equals, bit for bit, the same spelling evaluated per element through a plain `fn` the recognizer
@@ -118,14 +119,14 @@ fn main() -> i32 {
     for i in 0..19 { r0[i] = ref_leaky_select_gt(x[i]); }
     show(o0, r0, 0x7ffff);
 
-    // leaky_select_ge -> VM_LEAKYRELU (8)
+    // leaky_select_ge -> VM_LEAKY_GE (59)
     let mut o1: [f32; 19] = [-12345.0; 19];
     let mut r1: [f32; 19] = [-12345.0; 19];
     for i in 0..19 { o1[i] = if x[i] >= 0.0 { x[i] } else { x[i] * 0.01 }; }
     for i in 0..19 { r1[i] = ref_leaky_select_ge(x[i]); }
     show(o1, r1, 0x7ffff);
 
-    // leaky_max_scaled -> VM_LEAKYRELU (8)
+    // leaky_max_scaled -> VM_LEAKY_MAX (60)
     let mut o2: [f32; 19] = [-12345.0; 19];
     let mut r2: [f32; 19] = [-12345.0; 19];
     for i in 0..19 { o2[i] = max(x[i], 0.01 * x[i]); }

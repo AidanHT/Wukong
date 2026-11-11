@@ -24,10 +24,17 @@
 //! multiplication and addition are commutative bit for bit, NaN payload included) and compared for
 //! equality with the canonical tree of each kernel ([`table`]). Two spellings that lower to the same
 //! operations (PyTorch's `x_cube` binding and its inline `(x*x*x)`) share a kernel for free; two
-//! that differ in a single rounding never do. The few rows that name an EXISTING kernel for a
-//! different tree (the leaky ReLU's `>=` and `max(x, 0.01*x)` forms) carry the proof that the two
-//! trees agree on every input in their comment, and every row has a `tests/run/spelling_act_*.wk`
-//! fixture comparing each lane with the loop the recognizer never sees.
+//! that differ in a single rounding never do. A row names an EXISTING kernel only for the tree that
+//! IS that kernel's operations, and every row has a `tests/run/spelling_act_*.wk` fixture comparing
+//! each lane with the loop the recognizer never sees.
+//!
+//! A code also names the spelling to the **autodiff tape**, which differentiates the call by it
+//! (`wukong_autodiff::tape_nn`). So two trees share a code only when they also share a derivative
+//! at every input, kinks included: the backward of a select-spelled activation hands the adjoint
+//! to the branch its own compare takes. `x >= 0 ? x : 0.01*x` and `max(x, 0.01*x)` compute the
+//! leaky kernel's bits on every input, but the first takes the identity branch at `x = 0` and the
+//! second the slope at `x = +inf`, where the leaky kernel's `x > 0` does the opposite -- the same
+//! forward, different tie-breaks, hence codes of their own (`VMATH_LEAKY_GE`, `VMATH_LEAKY_MAX`).
 
 use std::sync::OnceLock;
 
@@ -65,6 +72,8 @@ pub(crate) const VMATH_HARDSWISH_MINMAX: u32 = 55;
 pub(crate) const VMATH_HARDSWISH_CLAMP: u32 = 56;
 pub(crate) const VMATH_ELU_EXPM1: u32 = 57;
 pub(crate) const VMATH_LEAKY_LT: u32 = 58;
+pub(crate) const VMATH_LEAKY_GE: u32 = 59;
+pub(crate) const VMATH_LEAKY_MAX: u32 = 60;
 
 /// A unary function a spelling applies -- each the language's own inlined form, which the runtime
 /// kernel of the same name mirrors op for op (`emit_tanh` / `tanh1`, `emit_erf` / `erf1`, ...).
@@ -386,15 +395,17 @@ fn table() -> &'static [(V, u32)] {
             // `x > 0 ? x : 0.01*x` IS `vmath::leakyrelu1` (`LEAKY_ALPHA * x`; the product commutes).
             (gt(x(), k(0.0), x(), mul(k(0.01), x())), VMATH_LEAKYRELU),
             // `x >= 0 ? x : 0.01*x` differs from the `>` form only at x = +-0, where it returns x
-            // and the kernel returns 0.01*x -- the same zero, sign included. A NaN fails both
-            // compares. So it is the leaky kernel bit for bit.
-            (ge(x(), k(0.0), x(), mul(k(0.01), x())), VMATH_LEAKYRELU),
+            // and the kernel returns 0.01*x -- the same zero, sign included; a NaN fails both
+            // compares. So its kernel computes the leaky kernel's bits, but under its own code: its
+            // derivative at +-0 is the identity branch's 1, not the leaky kernel's 0.01.
+            (ge(x(), k(0.0), x(), mul(k(0.01), x())), VMATH_LEAKY_GE),
             // `max(x, 0.01*x)` = `x > 0.01*x ? x : 0.01*x`. For finite x > 0, 0.01*x < x (the
             // product rounds below x), so it returns x; for x < 0 (and -inf), 0.01*x >= x, so it
             // returns 0.01*x; at +-0 and +inf the compare is false and it returns 0.01*x, which is
-            // x's zero and +inf -- what the kernel returns at +-0 and +inf; a NaN fails the compare
-            // and both return 0.01*x. So it is the leaky kernel bit for bit.
-            (max(x(), mul(k(0.01), x())), VMATH_LEAKYRELU),
+            // x's zero and +inf -- what the leaky kernel returns at +-0 and +inf; a NaN fails the
+            // compare and both return 0.01*x. So its kernel computes the leaky kernel's bits, under
+            // its own code: at +inf its derivative is the product's 0.01, not the leaky kernel's 1.
+            (max(x(), mul(k(0.01), x())), VMATH_LEAKY_MAX),
             // `x < 0 ? 0.01*x : x` returns a NaN untouched (no arithmetic on it) -- its own code.
             (gt(k(0.0), x(), mul(k(0.01), x()), x()), VMATH_LEAKY_LT),
             // ---- ELU, alpha 1 ----

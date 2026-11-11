@@ -9,7 +9,7 @@
 | `methods.rs` | Method-call desugaring (before every other pass), trait-bound dispatch per instance, function-typed parameters as pseudo-generics, the alias-fact taint for indirect calls |
 | `noalias.rs` | `@noalias` → MIR `ParamAttrs` (`record_param`); the name-level disjointness proof the recognizers and the `@parallel` region outliner use (`promised_disjoint`, `could_share_storage`) |
 | `par_grain.rs` | `@parallel(grain = G)`: chunk-count emission at the `wukong_parallel_for` call and the chunk-span -> iteration mapping in the outlined body |
-| `spell.rs` | Natural spellings of the activations (P12.10): the store value read as the tree of operations it lowers to, canonicalized and matched against the table of `wukong_vmath_f32` kernels (codes 36..=58 and the existing ones it IS); `spelling_census_tests.rs` is its census |
+| `spell.rs` | Natural spellings of the activations (P12.10): the store value read as the tree of operations it lowers to, canonicalized and matched against the table of `wukong_vmath_f32` kernels (codes 36..=60 and the existing ones it IS); `spelling_census_tests.rs` is its census |
 
 No `tests/` directory — tests are `#[cfg(test)] mod tests` at the bottom of `lib.rs`.
 

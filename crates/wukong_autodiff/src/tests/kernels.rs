@@ -243,11 +243,25 @@ fn spelling_derivative_f64(op: i64, x: f64) -> f64 {
                 1.0
             }
         }
+        59 => {
+            if x >= 0.0 {
+                1.0
+            } else {
+                0.01
+            }
+        }
+        60 => {
+            if x > 0.0 {
+                1.0
+            } else {
+                0.01
+            }
+        }
         other => panic!("no f64 reference derivative for spelling {other}"),
     }
 }
 
-/// P12.10: every natural-spelling code (36..=58) is differentiable -- a loss written with
+/// P12.10: every natural-spelling code (36..=60) is differentiable -- a loss written with
 /// `0.5*x*(1 + tanh(..))` or `x / (1 + exp(-x))` dispatches the spelling's kernel, and its backward
 /// must not decline where the intrinsic's did not. Gated against the f64 closed form and the
 /// finite difference of the spelling's own forward kernel.
@@ -256,10 +270,10 @@ fn spelling_activation_vjps() {
     let smooth: &[f32] = &[-1.7, -0.6, 0.4, 1.3];
     let hard: &[f32] = &[-4.0, -1.5, 0.8, 4.0];
     let kinked: &[f32] = &[2.1, 0.6, -1.7, -0.4];
-    for op in 36..=58i64 {
+    for op in 36..=60i64 {
         let xs = match op {
             53..=56 => hard,
-            57 | 58 => kinked,
+            57..=60 => kinked,
             _ => smooth,
         };
         let mut it = Interner::default();
@@ -271,6 +285,72 @@ fn spelling_activation_vjps() {
             .collect();
         let inputs = vec![xs.to_vec(), cb, vec![0.0]];
         tape_gate(&fwd, &[0], &inputs, &[want], &mut it);
+    }
+}
+
+/// P12.10: on its kink a select-spelled activation's derivative is the branch its own select takes
+/// -- the language's `Select` VJP hands the adjoint to the operand selected -- so the spelling's
+/// rule must break the tie there exactly as the loop it replaced, not as the intrinsic it
+/// resembles. The finite difference is meaningless on a kink (it averages the two slopes), so these
+/// lanes are gated on the analytic gradient alone, against values read off each spelling's selects
+/// by hand: `x < 0 ? 0.01x : x` and `x >= 0 ? x : 0.01x` take `x` at `+-0` (1, where `VM_LEAKYRELU`
+/// takes 0.01), `max(x, 0.01x)` the product at `+inf` (0.01, where it takes 1);
+/// `clamp(x + 3, 0, 6)` passes `v = x + 3` on the closed `[0, 6]` (at `x = -3`, `3`
+/// and `3 + 2^-22`, whose `v` rounds to 6); `min(max(v, 0), 6)` only on the open `(0, 6)` IN `v`,
+/// so not at `3 - 2^-22` either; hardswish is `(x*h)/6`, so `(h + passed*x)/6`. A NaN fails every
+/// ordered compare: the `<` and `clamp` selects then hand it through (1, 1/6, NaN for the
+/// product), the `>=` and `max` ones take the other operand (0.01, 0).
+#[test]
+fn spelling_vjps_break_ties_at_the_kink_like_their_own_selects() {
+    let below3 = f32::from_bits(0x403f_ffff); // 3 - 2^-22: `x + 3` rounds up to 6.0
+    let above3 = f32::from_bits(0x4040_0001); // 3 + 2^-22: `x + 3` rounds down to 6.0
+    let inf = f32::INFINITY;
+    let xs = [0.0, -0.0, -3.0, 3.0, below3, above3, f32::NAN, inf, -inf];
+    let (b, a) = (below3 as f64, above3 as f64);
+    let s6 = 1.0 / 6.0;
+    let rows: [(i64, [f64; 9]); 7] = [
+        // VM_LEAKY_LT / _GE / _MAX
+        (58, [1.0, 1.0, 0.01, 1.0, 1.0, 1.0, 1.0, 1.0, 0.01]),
+        (59, [1.0, 1.0, 0.01, 1.0, 1.0, 1.0, 0.01, 1.0, 0.01]),
+        (60, [0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 0.01, 0.01, 0.01]),
+        // VM_HARDSIGMOID_MINMAX / _CLAMP
+        (53, [s6, s6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        (54, [s6, s6, s6, s6, s6, s6, s6, 0.0, 0.0]),
+        // VM_HARDSWISH_MINMAX / _CLAMP
+        (55, [0.5, 0.5, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0]),
+        (
+            56,
+            [
+                0.5,
+                0.5,
+                -0.5,
+                1.5,
+                (6.0 + b) / 6.0,
+                (6.0 + a) / 6.0,
+                f64::NAN,
+                1.0,
+                0.0,
+            ],
+        ),
+    ];
+    for (op, dact) in rows {
+        let mut it = Interner::default();
+        let n = xs.len();
+        let fwd = build_vmath_dot(&mut it, n, op);
+        let (prog, gname) = build(&fwd.func, &[0], &mut it);
+        let cb = coef_vec(n);
+        let inputs = vec![xs.to_vec(), cb.clone(), vec![0.0]];
+        let got = analytic_grad_f32(&prog, gname, &fwd, &inputs, &[0], &it);
+        for j in 0..n {
+            let want = cb[j] as f64 * dact[j];
+            let g = got[0][j];
+            let ok = if want.is_nan() {
+                g.is_nan()
+            } else {
+                (g - want).abs() <= 1e-6 * (1.0 + want.abs())
+            };
+            assert!(ok, "op {op} at x = {:e}: dx {g}, want {want}", xs[j]);
+        }
     }
 }
 

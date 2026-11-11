@@ -2407,22 +2407,32 @@ kernel would change the answer. P12.10 gives each spelling a kernel of its own i
   kernel table. Two non-constant operands are never swapped: `sigmoid(x) * x` returns the sigmoid's
   sign-flipped NaN where `x * sigmoid(x)` returns the input's, so they are different kernels
   (`VM_SILU_SX`, `VM_SILU`). A row may name an EXISTING kernel only for a tree that is its operations
-  (`1/(1 + exp(-x))` is `VM_SIGMOID`) or carries the proof that it agrees on every input (the `>=`
-  and `max(x, 0.01*x)` leaky selects).
+  (`1/(1 + exp(-x))` is `VM_SIGMOID`, `x > 0 ? x : 0.01*x` is `VM_LEAKYRELU`): agreeing on every
+  value is not enough, because the code is all the autodiff tape differentiates by, so the
+  derivative must agree at every input too. `x >= 0 ? x : 0.01*x` and `max(x, 0.01*x)` compute the
+  leaky kernel's bits on every input but take the other branch at `x = 0` and at `x = +inf`
+  respectively, so they have codes of their own (`VM_LEAKY_GE`, `VM_LEAKY_MAX`).
 - **One definition per kernel.** `wukong_runtime::vspell`'s `spell!` expands each spelling's
   expression twice, over scalar operations (the twin, the tail, the no-AVX2 fallback) and over AVX2
   intrinsics (the eight-lane body listed in `vmath`'s `with_vmath8_table`), every transcendental the
   shared `vmath` kernel the inlined MIR mirrors (`tanh1`/`tanh8`, `erf1`/`erf8`, ...). The NaN a NaN
   input yields is derived from the expression and pinned in both bodies (`NanRule`), so it cannot
   follow whichever operand order an optimizing build of the runtime chose.
-- **Codes 36..=58** (`VM_SPELL_FIRST..=VM_SPELL_LAST`) extend `wukong_vmath_f32`'s table; `apply1`
+- **Codes 36..=60** (`VM_SPELL_FIRST..=VM_SPELL_LAST`) extend `wukong_vmath_f32`'s table; `apply1`
   and `vmath8_for` stay total over `0..=VM_SPELL_LAST`. They are mirrored as `VMATH_*` in
   `wukong_mir_build::spell` and as `VM_*` in `wukong_autodiff::tape`, whose `tape_nn::spelling_base`
-  routes each to the backward rule of the activation it spells (every such rule reads `x`, never the
-  forward output) and composes QuickGELU's and the erf GELU's. The calls reuse the
-  `wukong_vmath_f32{,_parallel}` symbols, so no recognizer arm, interpreter intrinsic or `tape.rs`
-  `Syms` entry is new. The PTX tables stop at 35: `--backend=gpu` keeps a spelling on the CPU kernel,
-  and `--backend=gpu-native` declines the program as `UNSUPPORTED`.
+  routes each smooth spelling to the backward rule of the activation it spells (every such rule reads
+  `x`, never the forward output) and composes QuickGELU's and the erf GELU's. The select-spelled
+  ones with a kink -- the leaky selects (58..=60) and the `min`/`max` and `clamp` hard activations
+  (53..=56) -- have rules of their own in `algebraic_derivative`: each is the spelling's selects over
+  the forward's rounded `v = x + 3`, handing the adjoint to the operand selected exactly as the
+  generic `Select` VJP does for the same selects written out (the intrinsics' rules break those ties
+  differently: `VM_LEAKYRELU` takes the slope at `x = 0`, `VM_HARDSIGMOID` uses the open interval
+  `(-3, 3)` in `x`, but `clamp` keeps `v` on the closed `[0, 6]` and `x + 3` rounds to 6 already at
+  `3 - 2^-22`). The calls reuse the `wukong_vmath_f32{,_parallel}` symbols, so no recognizer arm,
+  interpreter intrinsic or `tape.rs` `Syms` entry is new. The PTX tables stop at 35: `--backend=gpu`
+  keeps a spelling on the CPU kernel, and `--backend=gpu-native` declines the program as
+  `UNSUPPORTED`.
 - **Gates.** `vspell_lanes_equal_the_scalar_twin_bit_for_bit` (every code, every lane position, the
   tail, serial and `_parallel`, NaNs, infinities, subnormals); `spelling_census_tests` (41 spellings x
   array/slice/tensor x inline/`let`-bound, each row's expected kernel by name, `census_report` prints

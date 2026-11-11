@@ -568,8 +568,13 @@ move `VM_SPELL_LAST`. Then add the tree the lowering emits for it to `wukong_mir
 that the two agree on every input), mirror the code in `wukong_autodiff::tape` and route it in
 `tape_nn::spelling_base` (or compose its derivative in `act_backward`), add a census row in
 `spelling_census_tests.rs`, and print every lane of it in a `tests/run/spelling_act_*.wk` fixture
-beside the flag comparing it with the same expression in a plain `fn`. The PTX `vmath` tables do not
-take the code, so `--backend=gpu-native` declines a program that dispatches it.
+beside the flag comparing it with the same expression in a plain `fn`. A code also names the
+spelling's **derivative**: route it to an intrinsic's rule only where the two agree at every input,
+kinks included, and give a select-spelled spelling with a kink its own rule in
+`tape_nn::algebraic_derivative` that hands the adjoint to the branch its selects take (two trees
+with one forward but different tie-breaks need two codes, like `VM_LEAKYRELU` and `VM_LEAKY_GE`).
+The PTX `vmath` tables do not take the code, so `--backend=gpu-native` declines a program that
+dispatches it.
 
 ## Adding a run-time check
 

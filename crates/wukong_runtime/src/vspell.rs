@@ -91,11 +91,24 @@ pub const VM_ELU_EXPM1: i64 = 57;
 /// every input but a signalling NaN, which the select returns untouched where the leaky kernel's
 /// multiply quiets it.
 pub const VM_LEAKY_LT: i64 = 58;
+/// `x >= 0 ? x : 0.01*x` -- the leaky ReLU with the zero on the identity side. Equal to
+/// `VM_LEAKYRELU` on EVERY input (at `+-0` it returns `x` where the leaky kernel returns `0.01*x`,
+/// the same zero; a NaN fails both compares and is multiplied in both), so its forward could have
+/// been that kernel. It is its own code for the backward: the derivative at `x = +-0` is the
+/// branch the select takes (`1`), not the leaky kernel's slope, and the code is the only thing the
+/// autodiff tape can tell the two spellings apart by.
+pub const VM_LEAKY_GE: i64 = 59;
+/// `max(x, 0.01*x)`, i.e. `x > 0.01*x ? x : 0.01*x`. Equal to `VM_LEAKYRELU` on EVERY input (for a
+/// finite `x > 0` the product rounds below `x`; for `x < 0` and `-inf` it is `>= x`; at `+-0` and
+/// `+inf` the compare is false and the product is `x`'s own zero and `+inf`; a NaN is multiplied in
+/// both), and like [`VM_LEAKY_GE`] its own code for the backward: at `+inf` its select hands the
+/// adjoint to the product (`0.01`) where the leaky kernel's `x > 0` takes the identity.
+pub const VM_LEAKY_MAX: i64 = 60;
 
 /// The first spelling code.
 pub const VM_SPELL_FIRST: i64 = VM_GELU_TANH;
 /// The last spelling code -- and the last `wukong_vmath_f32` code of all.
-pub const VM_SPELL_LAST: i64 = VM_LEAKY_LT;
+pub const VM_SPELL_LAST: i64 = VM_LEAKY_MAX;
 
 // --- constants: the f32 values the source literals round to ---------------------------------------
 
@@ -141,6 +154,15 @@ mod s {
     #[inline(always)]
     pub fn sel_gt(a: f32, b: f32, t: f32, e: f32) -> f32 {
         if a > b {
+            t
+        } else {
+            e
+        }
+    }
+    /// `a >= b ? t : e` -- the MIR `Cmp(Foge)` + `Select` (false on a NaN).
+    #[inline(always)]
+    pub fn sel_ge(a: f32, b: f32, t: f32, e: f32) -> f32 {
+        if a >= b {
             t
         } else {
             e
@@ -220,6 +242,12 @@ mod v {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn sel_gt(a: __m256, b: __m256, t: __m256, e: __m256) -> __m256 {
         _mm256_blendv_ps(e, t, _mm256_cmp_ps::<_CMP_GT_OQ>(a, b))
+    }
+    /// `a >= b ? t : e` per lane (ordered: false on a NaN).
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn sel_ge(a: __m256, b: __m256, t: __m256, e: __m256) -> __m256 {
+        _mm256_blendv_ps(e, t, _mm256_cmp_ps::<_CMP_GE_OQ>(a, b))
     }
     #[inline]
     #[target_feature(enable = "avx2,fma")]
@@ -526,6 +554,21 @@ spell!(
     }
 );
 
+spell!(
+    /// [`VM_LEAKY_GE`].
+    leaky_ge1, leaky_ge8, NanRule::Quiet, |x| {
+        o::sel_ge(x, o::k(0.0), x, o::mul(o::k(LEAKY), x))
+    }
+);
+
+spell!(
+    /// [`VM_LEAKY_MAX`]: `max(a, b)` is `a > b ? a : b`.
+    leaky_max1, leaky_max8, NanRule::Quiet, |x| {
+        let scaled = o::mul(o::k(LEAKY), x);
+        o::sel_gt(x, scaled, x, scaled)
+    }
+);
+
 /// The scalar twin of spelling code `op`, or `None` when `op` is not one. The eight-lane bodies are
 /// listed in `vmath`'s `with_vmath8_table`, next to every other code's;
 /// `vspell_codes_are_total_in_both_tables` keeps the two lists equal.
@@ -555,6 +598,8 @@ pub(crate) fn apply_spell(op: i64, x: f32) -> Option<f32> {
         VM_HARDSWISH_CLAMP => hardswish_clamp1(x),
         VM_ELU_EXPM1 => elu_expm1_1(x),
         VM_LEAKY_LT => leaky_lt1(x),
+        VM_LEAKY_GE => leaky_ge1(x),
+        VM_LEAKY_MAX => leaky_max1(x),
         _ => return None,
     })
 }
@@ -707,6 +752,24 @@ mod tests {
         }
     }
 
+    /// The `>=` leaky select and `max(x, 0.01*x)` are `VM_LEAKYRELU` on every input, signalling
+    /// NaN included: their own codes exist for their derivatives (at zero, at `+inf`), not for
+    /// different bits.
+    #[test]
+    fn the_ge_and_max_leaky_spellings_are_the_leaky_kernel_on_every_input() {
+        for x in probe_inputs() {
+            let want = crate::vmath::apply1(crate::vmath::VM_LEAKYRELU, x);
+            for (op, got) in [(VM_LEAKY_GE, leaky_ge1(x)), (VM_LEAKY_MAX, leaky_max1(x))] {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "op {op} x {:#x}",
+                    x.to_bits()
+                );
+            }
+        }
+    }
+
     /// The spellings that are the same function as an existing kernel on every non-NaN input are
     /// exactly that: the leaky select from the negative side is `VM_LEAKYRELU` (a quiet NaN too).
     #[test]
@@ -747,7 +810,7 @@ mod tests {
             (x + 3.0).clamp(0.0, 6.0) / 6.0
         }
         type Ref = fn(f64) -> f64;
-        let refs: [(i64, Ref); 23] = [
+        let refs: [(i64, Ref); 25] = [
             (VM_GELU_TANH, gelu_t),
             (VM_GELU_TANH_HF, gelu_t),
             (VM_GELU_TANH_NOFMA, gelu_t),
@@ -771,6 +834,8 @@ mod tests {
             (VM_HARDSWISH_CLAMP, |x| x * hardsigmoid(x)),
             (VM_ELU_EXPM1, |x| if x > 0.0 { x } else { x.exp_m1() }),
             (VM_LEAKY_LT, |x| if x < 0.0 { 0.01 * x } else { x }),
+            (VM_LEAKY_GE, |x| if x >= 0.0 { x } else { 0.01 * x }),
+            (VM_LEAKY_MAX, |x| x.max(0.01 * x)),
         ];
         // Finite sweep only, inside [-12, 12]. The error is measured against the scale of the
         // terms the spelling combines, `max(|f(x)|, |x|, 1e-3)`: every spelling here is `O(|x|)`, and
@@ -819,7 +884,7 @@ mod tests {
         let gelu_t = |x: f64| 0.5 * x * (1.0 + (c0 * (x + c1 * x * x * x)).tanh());
         // (code, lowest x, reference)
         type Ref<'a> = &'a dyn Fn(f64) -> f64;
-        let rows: [(i64, f64, Ref); 30] = [
+        let rows: [(i64, f64, Ref); 32] = [
             (VM_GELU_TANH, -1.5, &gelu_t),
             (VM_GELU_TANH_HF, -1.5, &gelu_t),
             (VM_GELU_TANH_NOFMA, -1.5, &gelu_t),
@@ -872,6 +937,14 @@ mod tests {
                     x
                 }
             }),
+            (VM_LEAKY_GE, -40.0, &|x| {
+                if x >= 0.0 {
+                    x
+                } else {
+                    LEAKY as f64 * x
+                }
+            }),
+            (VM_LEAKY_MAX, -40.0, &|x| x.max(LEAKY as f64 * x)),
             // The two compositions of an existing kernel the spellings also name.
             (VM_SIGMOID, -40.0, &sig),
             (VM_SILU, -40.0, &|x| x * sig(x)),
