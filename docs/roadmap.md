@@ -1078,6 +1078,15 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   changes its value without an error, and an input's output appears when it finishes, not as it
   runs. A top-level `return`/`defer` is refused,
   a program reads end of input from `read_stdin_u8`, and the GPU backends are not offered.
+- **Doc comments, `--emit=doc` and doc tests.** `///` attaches to the item, struct field, enum
+  variant, trait or `impl` method or `extern` declaration after it and `//!` to the file, on the AST
+  (`Docs`); one that documents nothing is `E0210`. `--emit=doc` prints the root file's
+  documentation as Markdown — every item in source order with its signature as `wukongc fmt` prints
+  it, fields, variants and methods under their item. `wukongc --doctest <file>` compiles and runs
+  every ```` ```wk ```` example in the file's doc comments with the file's items in scope
+  (`no_run`, `compile_fail[,<code>]`, `ignore`), on interp or native, and reports each with its
+  line; a diagnostic in an example points at its line and column in the doc comment
+  (`crates/wukongc/tests/doc.rs`, `tests/doc/`, `examples/relu.wk`). 🟡 See the sharp edges below.
 - **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
   64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training
   loop shows its progress and output printed before a runtime failure is already out. The GPU
@@ -1118,9 +1127,10 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   start of a line, which silently continues the expression above (`acc = a[i]` then `(b + c)` is
   a call), is **`W0031 ambiguous_continuation`** (only where a statement could begin; `- y` with a
   space stays silent). The parser hands both out on a separate channel
-  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. `E0210` is
-  reserved for making a missing `;` an error. Not yet: imported files' parser lints (the loader
-  still uses the lint-free entry point), and `defer` statements' terminator.
+  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. Making a
+  missing `;` an error would take a new code: `E0210` is now the doc-comment error (a doc comment
+  that documents nothing). Not yet: imported files' parser lints (the loader still uses the
+  lint-free entry point), and `defer` statements' terminator.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
@@ -1716,6 +1726,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   it is erased to `[]u8` before monomorphization), and a slice of `str`s does not print (`E0448`,
   as for any slice of non-scalars).
 
+- **Doc comments and doc tests are single-file and plain.** `--emit=doc` documents the root file
+  only: imports are not followed, an item is not cross-linked to the types its signature names, and
+  every item is listed whether `pub` or not. A heading inside a doc comment (`# Examples`) is copied
+  through as written, so it may sit at a level above the page's own `##` item headings. Only the
+  line forms `///` and `//!` are doc comments (`/** */` and `/*! */` are ordinary, as is `////`).
+  A struct field's or trait method's attributes are not in a signature (the AST does not keep them).
+  There are no hidden `# ` lines in a doc example, a `compile_fail` code is checked against every
+  error the example produced (not only the first), and examples are not linted. An example
+  compiles with all of the file's items but the file's `fn main`, so it cannot call that `main`.
+  `--doctest` runs the root file's examples only, one after another in one process.
 - **`wukongc fmt` refuses what it cannot reprint, and keeps a few comments only approximately.**
   The formatter never changes a program's meaning (every output must re-parse to the identical AST,
   keep every comment and every identifier, literal and keyword; see `docs/internals.md`,

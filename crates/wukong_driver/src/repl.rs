@@ -696,6 +696,7 @@ impl Session {
         Built {
             module: Module {
                 name: None,
+                docs: Default::default(),
                 items,
                 span,
             },

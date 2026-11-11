@@ -159,7 +159,9 @@ fn split_artifacts(stdout: &str) -> Vec<(String, String)> {
 #[test]
 fn multi_artifact_emit_prints_each_single_stage_artifact() {
     let root = repo_root();
-    let stages = ["tokens", "ast", "mir-high", "mir", "mir-text", "llvm-ir"];
+    let stages = [
+        "tokens", "ast", "doc", "mir-high", "mir", "mir-text", "llvm-ir",
+    ];
     // Written backwards: the order on the command line is not the order of the artifacts.
     let list = format!(
         "--emit={}",

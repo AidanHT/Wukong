@@ -22,6 +22,7 @@
 
 mod check;
 mod comments;
+pub mod doc;
 mod printer;
 
 #[cfg(test)]

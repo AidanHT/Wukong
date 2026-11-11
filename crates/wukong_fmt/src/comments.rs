@@ -48,7 +48,7 @@ impl<'a> Printer<'a> {
 
     /// Emit the blank line an own-line element starting at `lo` keeps, if any.
     fn blank_before(&mut self, lo: u32) {
-        if !self.block_start && self.newlines_between(self.last_end, lo) >= 2 {
+        if self.blank_lines && !self.block_start && self.newlines_between(self.last_end, lo) >= 2 {
             self.out.push('\n');
         }
         self.block_start = false;

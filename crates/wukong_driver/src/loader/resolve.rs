@@ -1165,7 +1165,8 @@ impl Rewriter<'_> {
 
 /// Drop an `extern` declaration that repeats an earlier one with the same name and the same
 /// written signature: the C function is one symbol however many modules declare it. A
-/// conflicting redeclaration is kept, so sema reports it as the duplicate it is (E0300).
+/// conflicting redeclaration is kept, so sema reports it as the duplicate it is (E0300). A dropped
+/// declaration's doc comment goes with it: `item_docs` stays index-aligned with `items`.
 fn merge_extern_decls(root_items: &mut [Item], extra: &mut [(usize, Item)], interner: &Interner) {
     let mut seen: FxHashMap<Symbol, String> = FxHashMap::default();
     let items = root_items
@@ -1175,16 +1176,24 @@ fn merge_extern_decls(root_items: &mut [Item], extra: &mut [(usize, Item)], inte
         let ItemKind::Extern(blk) = &mut item.kind else {
             continue;
         };
-        blk.items.retain(|f| {
-            let sig = extern_signature(f, interner);
-            match seen.get(&f.name.sym) {
-                Some(prev) => *prev != sig,
-                None => {
-                    seen.insert(f.name.sym, sig);
-                    true
+        let keep: Vec<bool> = blk
+            .items
+            .iter()
+            .map(|f| {
+                let sig = extern_signature(f, interner);
+                match seen.get(&f.name.sym) {
+                    Some(prev) => *prev != sig,
+                    None => {
+                        seen.insert(f.name.sym, sig);
+                        true
+                    }
                 }
-            }
-        });
+            })
+            .collect();
+        let mut k = keep.iter().copied();
+        blk.items.retain(|_| k.next().unwrap_or(true));
+        let mut k = keep.iter().copied();
+        blk.item_docs.retain(|_| k.next().unwrap_or(true));
     }
 }
 

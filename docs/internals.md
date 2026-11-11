@@ -504,6 +504,53 @@ before it, an open block comment (`E0103`), and an input that is so far only att
 (`repl::after_attributes`, the skipper `classify` also uses) all read on. The rules a user sees
 are in the language guide, "The REPL".
 
+**Doc comments (`wukong_parser::docs`).** The AST carries them: `Docs` (one `DocLine { text, span }`
+per comment line; `text()` / `unindented()` apply rustdoc's common-indent rule) on `Item`, `Field`,
+`Variant` and `Module` (the `//!` docs), plus `TraitDecl::method_docs` and
+`ExternBlock::item_docs`, index-aligned with their members. The token stream has no comments, so
+`Parser::new` finds them once: it rescans only the gaps between tokens that contain `//`, with the
+lexer's own trivia scan (`wukong_lexer::trivia_comments`, so a `///` in a string or block comment is
+never one), and records each doc comment with the index of the token it precedes. A documentable
+construct calls `claim_docs(first)` once it has read its attributes and `pub`, taking the unclaimed
+`///` lines before tokens `first..=pos`; `module()` takes the `//!` lines before its first item with
+`claim_inner_docs`. Every entry point that parses a module or a statement list ends with
+`report_stray_docs`: an unclaimed doc comment documents nothing and is `E0210`, one per run of
+consecutive lines in one gap, suppressed when the parse already has an error (recovery skips
+tokens). **A new documentable construct must claim its docs, or its doc comments become `E0210`.**
+`parse_doctest_tokens` parses a doc example: an item wherever one starts at the top level (after
+any attributes), and statement lists between them — `Parser::items_end_stmts`, set only there, makes
+`block_contents` stop at a top-level item (no delimiter open), so a nested block's `const` stays a
+statement. `--emit=ast` prints `doc "..."` lines where docs attach.
+
+**`--emit=doc` (`wukong_fmt::doc`).** A root-file stage after `ast` (`EmitStage::Doc`, extension
+`.md`; `check` and `grad` combine with it): `driver::emit_doc` hands the source to
+`wukong_fmt::doc::document`, which re-lexes and re-parses it and writes Markdown — the title (the
+`module` path, else the file name), the `//!` docs, then per item a `##` heading, its signature in a
+`wk` fence and its docs, with fields / variants / methods / `extern` declarations as a list. The
+signature is the formatter's printer run on a `Src` with **no comments** and `blank_lines` off:
+`Printer::fn_signature` (the head `fn_decl` prints before its body, wrapped by the same width rule),
+`Printer::item` for the other items, a hand-written header for an `impl`; list entries are the
+printer's flat (one-line) form (`field_decl`, `variant`). A construct the printer refuses falls back
+to its source text.
+
+**`--doctest` (`wukong_driver::doctest`).** The file is parsed, then compiled on its own through
+lowering (`check_file`, the same `lower` the examples go through); an error in either stops
+everything, so a `compile_fail` example cannot pass for the file's error. Every
+`Docs` is walked in source order, and each CommonMark fence (```` ``` ````/`~~~`, closed by a run at
+least as long) whose info string has the word `wk` or `wukong` is an example; the other words are
+the tags `ignore`, `no_run`, `compile_fail` and error codes (anything else fails the example). Each
+example compiles as one program in a fresh `SourceMap` and `Interner`: the file re-parsed with its
+`fn main` dropped; the example as its own source file, **laid out over the file's lines and
+columns** (`layout`: every code line at its line and column, the rest blank), so its diagnostics
+need no remapping; and, unless the example declares `fn main`, a wrapper parsed from
+`fn main() -> i32 { __wukong_doctest_body; return 0; }` whose placeholder is replaced by the
+example's statements (the REPL's splice). Then `load_imports` relative to the file, the alias
+expansion, sema and `lower_program_located`; an error anywhere is the example's compile failure
+(which `compile_fail` wants). Otherwise the program is pruned to `main`, optimized at `-O`, verified
+and run with stdout and stderr captured (`run_capturing`, `begin_stderr_capture`) on the
+interpreter or the native JIT: it passes on `Ok(0)`. Lints do not run. The report is stdout; reasons
+and captured output are stderr.
+
 ## Diagnostics
 
 Every diagnostic has a stable code (`E01xx` lexer, `E02xx` parser, `E03xx` name res, `E04xx` types,
@@ -3419,9 +3466,13 @@ distinguish. A `pub` written on a declaration inside a `pub extern { .. }` stays
 block's `pub` already exports it. An empty `where` (`fn f() where { .. }`) is kept rather than
 deleted.
 
+Doc comments are comments to the printer — placed like any other — and part of the AST to the
+self-check, so law (b) also proves each one stayed on the construct it documented
+(`doc_tests.rs` feeds it an output that moves one).
+
 **Adding syntax means extending `wukong_fmt` in the same commit.** The exhaustive matches fail the
 build on a new AST variant, and `crates/wukong_fmt/tests/corpus.rs` — every `.wk` under `tests/run`
-(with `lib/`), `examples`, `tests/imports`, `tests/warn` and `tests/fail` must format (`Syntax` is
+(with `lib/`), `examples`, `tests/imports`, `tests/warn`, `tests/fail` and `tests/doc` must format (`Syntax` is
 allowed in `tests/fail` only), with zero `Unsupported` and every output a fixed point — fails on a
 new fixture the printer cannot reprint. A second corpus test inserts comments at token boundaries
 and formats at 100 and 40 columns; comments cannot change an AST, so nothing may be refused.

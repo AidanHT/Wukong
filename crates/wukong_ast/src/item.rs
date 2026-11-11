@@ -7,6 +7,10 @@ use wukong_span::{Span, Symbol};
 pub struct Item {
     pub id: NodeId,
     pub attrs: Vec<Attr>,
+    /// The `///` comments written before the item (before, between or after its attributes and
+    /// `pub`). For an `impl` block's flattened method, that method's own doc comments; for the
+    /// block's [`ItemKind::Impl`] marker, the block's.
+    pub docs: Docs,
     pub kind: ItemKind,
     pub span: Span,
 }
@@ -51,6 +55,8 @@ pub struct TraitDecl {
     pub name: Ident,
     pub is_pub: bool,
     pub methods: Vec<FnDecl>,
+    /// Each method's doc comments, index-aligned with `methods`.
+    pub method_docs: Vec<Docs>,
 }
 
 /// An `impl` block: the type it extends, the trait it implements (if any), and its methods.
@@ -131,6 +137,8 @@ pub struct Field {
     pub is_pub: bool,
     pub ty: TypeExpr,
     pub span: Span,
+    /// The `///` comments written before the field.
+    pub docs: Docs,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +155,8 @@ pub struct Variant {
     pub data: VariantData,
     pub discriminant: Option<Expr>,
     pub span: Span,
+    /// The `///` comments written before the variant.
+    pub docs: Docs,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +186,9 @@ pub struct Import {
 pub struct ExternBlock {
     pub abi: Symbol,
     pub items: Vec<FnDecl>,
+    /// Each declaration's doc comments, index-aligned with `items`. (The block's own are the
+    /// item's [`Item::docs`].)
+    pub item_docs: Vec<Docs>,
 }
 
 /// An attribute such as `@simd`, `@tile(64)`, `@parallel(grain = 1)`, or `@export("name")`.
@@ -214,5 +227,64 @@ impl Attr {
     /// [`AttrArg::KeyValue`] to read a keyed argument.
     pub fn args(&self) -> &[AttrArg] {
         &self.args
+    }
+}
+
+/// Doc comments: the `///` lines written before an item, field, variant or method (outer docs), or
+/// the `//!` lines at the top of a file (inner docs, [`crate::Module::docs`]). Their text is
+/// Markdown. A doc comment the parser cannot attach to anything is an error (`E0210`), so every
+/// one in a program that parses is in exactly one `Docs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Docs {
+    /// One entry per comment line, in source order.
+    pub lines: Vec<DocLine>,
+}
+
+/// One doc comment line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocLine {
+    /// The text after the `///` or `//!` marker, exactly as written (its leading space included;
+    /// the CR of a CRLF line ending not).
+    pub text: String,
+    /// The whole comment, marker included.
+    pub span: Span,
+}
+
+impl Docs {
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// The lines with the indentation every non-blank line shares removed (rustdoc's rule, so
+    /// `/// text` reads as `text` and an indented code line keeps its extra indent), each with
+    /// the source offset its remaining text starts at. A blank line is `""`, at its marker's end.
+    pub fn unindented(&self) -> Vec<(&str, u32)> {
+        let indent = |t: &str| t.len() - t.trim_start_matches([' ', '\t']).len();
+        let common = self
+            .lines
+            .iter()
+            .filter(|l| !l.text.trim().is_empty())
+            .map(|l| indent(&l.text))
+            .min()
+            .unwrap_or(0);
+        self.lines
+            .iter()
+            .map(|l| {
+                // The marker is three ASCII bytes (`///`, `//!`), so the text starts 3 bytes in.
+                let base = l.span.lo + 3;
+                if l.text.trim().is_empty() {
+                    ("", base + l.text.len() as u32)
+                } else {
+                    (&l.text[common..], base + common as u32)
+                }
+            })
+            .collect()
+    }
+
+    /// The doc text as one Markdown string: the [`Docs::unindented`] lines joined with `\n`, with
+    /// no trailing newline.
+    pub fn text(&self) -> String {
+        let lines: Vec<&str> = self.unindented().into_iter().map(|(t, _)| t).collect();
+        lines.join("\n")
     }
 }

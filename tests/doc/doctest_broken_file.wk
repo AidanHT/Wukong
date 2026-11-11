@@ -1,0 +1,12 @@
+//! A file that does not compile on its own: `wukongc --doctest` reports the file's error and runs
+//! none of its examples, so the `compile_fail` one below cannot pass for an error that is not its
+//! own. On its own it compiles: `helper(1)` is a call of the right arity and type.
+module tests.doc.doctest_broken_file
+
+/// ```wk,compile_fail
+/// let y = helper(1);
+/// ```
+fn helper(x: i32) -> i32 {
+    let b: bool = x;
+    return 1;
+}

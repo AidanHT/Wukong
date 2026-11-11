@@ -108,8 +108,8 @@ pub const LINTS: &[Lint] = &[
         code: "W0020",
         default: LintLevel::Warn,
     },
-    // The parser's statement-terminator lints (`wukong_parser::ParseOutput::lints`); `E0210` is
-    // reserved for the day a missing `;` becomes an error.
+    // The parser's statement-terminator lints (`wukong_parser::ParseOutput::lints`). Should a
+    // missing `;` ever become an error it needs a new code: `E0210` is the doc-comment error.
     Lint {
         name: "missing_semicolon",
         code: "W0030",

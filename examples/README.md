@@ -29,6 +29,13 @@ writes `dot.mir-low`, `dot.ll` and `dot.o`.
 To try the language a line at a time, `cargo run -p wukongc -- --repl` starts an interactive
 session: paste a function from an example, then call it (`:help` lists the commands).
 
+The `///` and `//!` doc comments are part of the program: `--emit=doc examples/relu.wk` prints
+them as Markdown with every item's signature, and `--doctest examples/relu.wk` compiles and runs the
+```` ```wk ```` examples in them. `relu.wk` documents `relu` with an example that asserts every
+output lane and the file with a `compile_fail` example (a buffer of the wrong length is `E0501`);
+`saxpy_array.wk` documents its `saxpy` kernel with an example that calls it and asserts every
+output lane. `crates/wukongc/tests/doc.rs` runs both.
+
 `--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
 them, so the combination is rejected rather than silently discarding half the work.
 

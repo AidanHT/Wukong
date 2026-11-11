@@ -2,19 +2,36 @@
 // EXPECT-OUT-VALUES: 12 24 36 48
 module examples.saxpy_array
 
-/// SAXPY over fixed-size arrays: out = a*x + y, computed elementwise.
-/// Run: wukongc --run examples/saxpy_array.wk   (prints out[0..4])
-fn main() -> i32 {
-    let a: f32 = 2.0;
-    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-    let y: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
-    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
-
+/// SAXPY over fixed-size arrays: out[i] = a*x[i] + y[i], computed elementwise.
+/// A reusable kernel with an array out-parameter.
+/// Run: wukongc --run examples/saxpy_array.wk   (prints 12 24 36 48)
+///
+/// Every lane of `out` is written, whatever it held before (3*1 + 1 = 4, 3*(-2) + 1 = -5,
+/// 3*0.5 + 1 = 2.5, 3*0 + (-4) = -4):
+///
+/// ```wk
+/// let x: [f32; 4] = [1.0, -2.0, 0.5, 0.0];
+/// let y: [f32; 4] = [1.0, 1.0, 1.0, -4.0];
+/// let mut out: [f32; 4] = [9.0, 9.0, 9.0, 9.0];
+/// saxpy(3.0, x, y, out);
+/// assert(out[0] == 4.0);
+/// assert(out[1] == -5.0);
+/// assert(out[2] == 2.5);
+/// assert(out[3] == -4.0);
+/// ```
+fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
     let mut i: i32 = 0;
     while i < 4 {
         out[i] = a * x[i] + y[i];
         i = i + 1;
     }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let y: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
+    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    saxpy(2.0, x, y, out);
 
     print(out[0]); // 12
     print(out[1]); // 24

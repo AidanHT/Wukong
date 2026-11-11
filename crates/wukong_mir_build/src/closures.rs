@@ -685,6 +685,7 @@ impl Lifter<'_> {
         self.items.push(Item {
             id: item_id,
             attrs: self.attrs.clone(),
+            docs: Default::default(),
             kind: ItemKind::Fn(FnDecl {
                 // The literal's span is the function's declaration span (source locations and
                 // diagnostics point at the closure).

@@ -971,6 +971,7 @@ dependencies = [
  "wukong_codegen_gpu",
  "wukong_codegen_llvm",
  "wukong_diag",
+ "wukong_fmt",
  "wukong_interp",
  "wukong_lexer",
  "wukong_mir",

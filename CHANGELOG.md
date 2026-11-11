@@ -557,6 +557,62 @@ All notable changes to Wukong are documented here. The format is loosely based o
   gains the tree's `wukong_sreduce_f32*2`; `parallel_region_reassigned_local` trades one 256-bit
   `veckernel` (a lane-tree reduction inside a `@parallel` region) for `wukong_sreduce_f32*4`.
 
+### Doc comments, `--emit=doc` and doc tests (`gap7/doc-comments`, N14)
+
+- **Added: doc comments on the AST.** `///` documents the item, struct field, enum variant (and
+  struct-variant field), trait or `impl` method, or `extern` declaration written after it —
+  attributes, `pub`, blank lines and plain comments may come between — and `//!` documents the
+  file (before its first item, after the `module` header). They are `Docs` on `Item`, `Field`,
+  `Variant` and `Module`, plus `TraitDecl::method_docs` and `ExternBlock::item_docs`; the text is
+  Markdown with the common indent removed. The parser finds them by rescanning only the gaps between
+  its tokens with the lexer's own trivia scan (`wukong_lexer::trivia_comments`), so a `///` inside a
+  string or a block comment never counts. `--emit=ast` shows them as `doc "..."` lines.
+- **Added: `E0210`, a doc comment that documents nothing** (rustc's E0585): before a closing `}`, at
+  the end of the file, on a statement or inside an expression, on the `module` header, or a `//!`
+  after the first item. One error per run of consecutive doc lines, with a machine-applicable `//`
+  fix for a one-line comment, and none in a file that already has a syntax error
+  (`tests/fail/doc_comment_documents_nothing.wk`). An error, not a warning: a doc comment is
+  published and run, so one silently dropped is lost documentation. Every `///` already in the
+  corpus documents an item. W0030's catalogue text, the roadmap and the lint table no longer
+  reserve E0210 (the older entry below that reserves it is superseded): a missing-`;` error would
+  need a new code.
+- **Added: `--emit=doc`**, the root file's documentation as Markdown on stdout: the title (`module`
+  path or file name), the `//!` docs, then every item in source order with a `##` heading, its
+  signature in a `wk` fence — printed by `wukong_fmt`'s own printer, so it reads exactly as
+  `wukongc fmt` writes it, without comments or blank lines (a function stops before its body, an
+  `impl` at its header) — and its `///` docs, with fields, variants, methods and `extern`
+  declarations listed under their item with their own docs. A pure function of the file (a
+  `determinism.rs` test). A root-file stage after `ast`: it combines with every stage of an
+  `--emit` list (`check` and `grad` included) and is `<stem>.md` under `-o`; `--depfile` and
+  `--passes` are refused with it as with `tokens`/`ast`.
+- **Added: `wukongc --doctest <file.wk>`**, which compiles and runs every fenced example tagged `wk`
+  (or `wukong`) in the file's doc comments, rustdoc-style. An example is compiled with the file's
+  own items (all but its `fn main`) and its own items, which may come before, between or after its
+  statements; the statements, in order, are wrapped in `fn main() -> i32 { ...; return 0; }`
+  unless it declares `main`; it must exit 0 (a failed
+  `assert`, a non-zero `return` or `exit(n)` fails it). Tags: `no_run` (compile only),
+  `compile_fail` (must not compile; `compile_fail,E0501` with that code), `ignore` (skipped); an
+  unknown tag fails the example. The example is its own source file laid out over the file's lines
+  and columns, so a diagnostic in it points at the doc comment it is written in. One
+  `doctest <file>:<line> (<what it documents>) ... ok|FAILED|ignored` line per example and a
+  `doctest result:` summary on stdout; reasons, compile errors and captured output on stderr; exit
+  1 if any failed. A file that does not compile on its own (through lowering) runs no example and
+  reports its errors, so a `compile_fail` example cannot pass for the file's error. Interp or
+  native at the given `-O`, `--fp` and `--target-cpu`; every other flag is refused by name. USAGE
+  documents both flags.
+- **The formatter keeps doc comments on what they document.** Its self-check's AST law now compares
+  the docs too, so a reformat that moved a doc comment to another item would be refused (a test
+  feeds the check exactly that output); doc comments on every documentable construct are pinned
+  through a golden. The formatter's corpus test also formats `tests/doc/`.
+- **Examples documented and tested:** `examples/relu.wk` documents `relu` with an example that
+  asserts every output lane and the file with a `compile_fail,E0501` example (a buffer of the wrong
+  length); `examples/saxpy_array.wk` moves its loop into a `saxpy` kernel that `main` calls and
+  documents it with an example that calls it and asserts every output lane (an example only sees
+  the file's items, never its `main`, so one that calls nothing checks nothing).
+  `crates/wukongc/tests/doc.rs` runs them, the `tests/doc/` fixtures (a hand-written `--emit=doc`
+  page, every passing kind of example on interp and native at `-O0`/`-O2`, every way an example
+  fails) and `--emit=doc` over the whole corpus.
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

@@ -263,12 +263,22 @@ impl AstPrinter<'_> {
         if let Some(name) = &m.name {
             self.line(format!("module {}", self.path_str(name, ".")));
         }
+        self.docs(&m.docs);
         for item in &m.items {
             self.item(item);
         }
     }
 
+    /// A node's doc comments, as one `doc "…"` line (the text escaped, its lines joined by `\n`);
+    /// nothing when it has none.
+    fn docs(&mut self, d: &Docs) {
+        if !d.is_empty() {
+            self.line(format!("doc {:?}", d.text()));
+        }
+    }
+
     fn item(&mut self, item: &Item) {
+        self.docs(&item.docs);
         for a in &item.attrs {
             self.line(self.attr_str(a));
         }
@@ -304,6 +314,7 @@ impl AstPrinter<'_> {
                             p.sym(field.name.sym),
                             p.type_str(&field.ty)
                         ));
+                        p.indented(|q| q.docs(&field.docs));
                     }
                 });
             }
@@ -321,6 +332,15 @@ impl AstPrinter<'_> {
                             p.variant_data_str(&v.data),
                             disc
                         ));
+                        p.indented(|q| {
+                            q.docs(&v.docs);
+                            if let VariantData::Struct(fields) = &v.data {
+                                for f in fields.iter().filter(|f| !f.docs.is_empty()) {
+                                    q.line(format!("field {}", q.sym(f.name.sym)));
+                                    q.indented(|r| r.docs(&f.docs));
+                                }
+                            }
+                        });
                     }
                 });
             }
@@ -354,8 +374,11 @@ impl AstPrinter<'_> {
             ItemKind::Extern(e) => {
                 self.line(format!("extern {}", self.sym(e.abi)));
                 self.indented(|p| {
-                    for f in &e.items {
+                    for (k, f) in e.items.iter().enumerate() {
                         p.line(p.fn_sig_str(f));
+                        if let Some(d) = e.item_docs.get(k) {
+                            p.indented(|q| q.docs(d));
+                        }
                     }
                 });
             }
@@ -363,13 +386,16 @@ impl AstPrinter<'_> {
                 let vis = if t.is_pub { "pub " } else { "" };
                 self.line(format!("trait {}{}", vis, self.sym(t.name.sym)));
                 self.indented(|p| {
-                    for f in &t.methods {
+                    for (k, f) in t.methods.iter().enumerate() {
                         let body = if f.body.is_some() {
                             " (default body)"
                         } else {
                             ""
                         };
                         p.line(format!("{}{}", p.fn_sig_str(f), body));
+                        if let Some(d) = t.method_docs.get(k) {
+                            p.indented(|q| q.docs(d));
+                        }
                     }
                 });
             }
@@ -843,6 +869,7 @@ mod tests {
         };
         let m = Module {
             name: Some(path),
+            docs: Docs::default(),
             items: vec![],
             span: Span::dummy(),
         };
@@ -877,6 +904,7 @@ mod tests {
         Item {
             id: NodeId::DUMMY,
             attrs: vec![],
+            docs: Docs::default(),
             kind,
             span: Span::dummy(),
         }
@@ -920,6 +948,7 @@ mod tests {
                         span: Span::dummy(),
                     }),
                     span: Span::dummy(),
+                    docs: Docs::default(),
                 },
                 Variant {
                     name: id(&mut i, "B"),
@@ -928,15 +957,18 @@ mod tests {
                         is_pub: false,
                         ty: named_ty(&mut i, "f32"),
                         span: Span::dummy(),
+                        docs: Docs::default(),
                     }]),
                     discriminant: None,
                     span: Span::dummy(),
+                    docs: Docs::default(),
                 },
                 Variant {
                     name: id(&mut i, "C"),
                     data: VariantData::Unit,
                     discriminant: None,
                     span: Span::dummy(),
+                    docs: Docs::default(),
                 },
             ],
         });
@@ -967,10 +999,12 @@ mod tests {
                 where_preds: vec![],
                 body: None,
             }],
+            item_docs: vec![Docs::default()],
         });
 
         let m = Module {
             name: None,
+            docs: Docs::default(),
             items: vec![item(aliased), item(selective), item(e), item(ext)],
             span: Span::dummy(),
         };

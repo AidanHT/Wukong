@@ -19,6 +19,7 @@ harnesses that consume them live in `crates/wukongc/tests/` and reach this direc
 | `warn/` | 12 top-level `*.wk` | Must **compile** and produce exactly the warnings (lints) their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list, in order. |
 | `imports/` | 6 | Flat import-graph fixtures consumed **only** by `crates/wukong_driver/src/loader.rs` unit tests. E2e harnesses ignore this directory. |
 | `filetests/` | 37 `*.mir` / `*.wk`, **recursive** (`opt/`, `mir-text/`, `verify/`, `cli/`) | FileCheck-style tests of what the compiler *emits* — chiefly what each optimizer pass does to the MIR. Each file carries its own `RUN:` and `CHECK:` lines. The only directory scanned recursively; an `Inputs/` subdirectory holds files a `RUN:` line reads, not tests. |
+| `doc/` | 3 `*.wk` + 1 `*.md` | Doc-comment fixtures for `crates/wukongc/tests/doc.rs`: `geometry.wk` (every documentable construct; doc examples of every kind that pass) with its hand-written `--emit=doc` page `geometry.md`, `doctest_failures.wk` (one doc example per way of failing), and `doctest_broken_file.wk` (a file that does not compile on its own, so none of its examples runs). Formatted by the formatter's corpus test; not run by `run.rs`. |
 
 See each subdirectory's `README.md` for format details and landmines.
 

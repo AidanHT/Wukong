@@ -62,6 +62,7 @@ pub fn parse_module_tokens_with_lints(
     let mut p = Parser::new(tokens, src, interner);
     p.next_node = first_node_id;
     let module = p.module();
+    p.report_stray_docs();
     ParseOutput {
         module,
         diags: std::mem::take(&mut p.diags),
@@ -94,6 +95,7 @@ impl Parser<'_> {
         } else {
             None
         };
+        let docs = self.claim_inner_docs();
         let mut items = Vec::new();
         while !self.at(T::Eof) {
             let before = self.pos;
@@ -105,6 +107,7 @@ impl Parser<'_> {
         }
         Module {
             name,
+            docs,
             items,
             span: start.to(self.prev_span()),
         }
@@ -112,10 +115,12 @@ impl Parser<'_> {
 
     /// One source item. Usually exactly one AST item; an `impl` block yields its marker item plus
     /// one flattened `fn` item per method, and an unparseable item yields none.
-    fn parse_item(&mut self) -> Vec<Item> {
+    pub(crate) fn parse_item(&mut self) -> Vec<Item> {
         let start = self.span();
+        let first = self.pos;
         let attrs = self.parse_attrs();
         let is_pub = self.eat(T::Pub);
+        let docs = self.claim_docs(first);
         let kind = match self.kind() {
             T::Fn => ItemKind::Fn(self.parse_fn(is_pub)),
             T::Struct => ItemKind::Struct(self.parse_struct(is_pub)),
@@ -124,7 +129,7 @@ impl Parser<'_> {
             T::Import => ItemKind::Import(self.parse_import()),
             T::Extern => ItemKind::Extern(self.parse_extern(is_pub)),
             T::Trait => ItemKind::Trait(self.parse_trait(is_pub)),
-            T::Impl => return self.parse_impl(start, attrs),
+            T::Impl => return self.parse_impl(start, attrs, docs),
             // `type` is a contextual keyword: only `type Name` at item position starts an alias,
             // so `type` stays usable as an ordinary identifier everywhere else.
             T::Ident if self.at_word(0, "type") && self.nth(1) == T::Ident => {
@@ -148,6 +153,7 @@ impl Parser<'_> {
         vec![Item {
             id: self.nid(),
             attrs,
+            docs,
             kind,
             span: start.to(self.prev_span()),
         }]
@@ -422,10 +428,13 @@ impl Parser<'_> {
             span: name.span,
         };
         let mut methods = Vec::new();
+        let mut method_docs = Vec::new();
         self.expect(T::LBrace);
         while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let first = self.pos;
             let _attrs = self.parse_attrs();
             if self.at(T::Fn) {
+                method_docs.push(self.claim_docs(first));
                 methods.push(self.parse_fn_with(false, Some(&receiver)));
             } else {
                 let sp = self.span();
@@ -445,6 +454,7 @@ impl Parser<'_> {
             name,
             is_pub,
             methods,
+            method_docs,
         }
     }
 
@@ -452,7 +462,7 @@ impl Parser<'_> {
     /// function item named `Type.method` (its receiver, if any, desugared to `self: Type`, and
     /// every `Self` in the block read as `Type`), preceded by an [`ItemKind::Impl`] marker that
     /// records the block for sema.
-    fn parse_impl(&mut self, start: wukong_span::Span, attrs: Vec<Attr>) -> Vec<Item> {
+    fn parse_impl(&mut self, start: wukong_span::Span, attrs: Vec<Attr>, docs: Docs) -> Vec<Item> {
         self.bump(); // impl
         let first = self.parse_dotted_path();
         let (trait_ref, self_ty) = if self.eat(T::For) {
@@ -467,8 +477,10 @@ impl Parser<'_> {
         let saved = std::mem::replace(&mut self.self_ty, ty_name);
         while !self.at(T::RBrace) && !self.at(T::Eof) {
             let mstart = self.span();
+            let mfirst = self.pos;
             let mattrs = self.parse_attrs();
             let is_pub = self.eat(T::Pub);
+            let mdocs = self.claim_docs(mfirst);
             if !self.at(T::Fn) {
                 let sp = self.span();
                 self.error(
@@ -502,6 +514,7 @@ impl Parser<'_> {
             out.push(Item {
                 id: self.nid(),
                 attrs: mattrs,
+                docs: mdocs,
                 kind: ItemKind::Fn(f),
                 span: mstart.to(self.prev_span()),
             });
@@ -511,6 +524,7 @@ impl Parser<'_> {
         let marker = Item {
             id: self.nid(),
             attrs,
+            docs,
             kind: ItemKind::Impl(ImplDecl {
                 self_ty,
                 trait_ref,
@@ -542,9 +556,11 @@ impl Parser<'_> {
         let mut fields = Vec::new();
         self.expect(T::LBrace);
         while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let first = self.pos;
             let _attrs = self.parse_attrs(); // field attributes accepted, not yet stored
             let fstart = self.span();
             let is_pub = self.eat(T::Pub);
+            let docs = self.claim_docs(first);
             let fname = self.ident();
             self.expect(T::Colon);
             let ty = self.parse_type();
@@ -553,6 +569,7 @@ impl Parser<'_> {
                 is_pub,
                 ty,
                 span: fstart.to(self.prev_span()),
+                docs,
             });
             if !self.eat(T::Comma) {
                 break;
@@ -578,6 +595,7 @@ impl Parser<'_> {
         self.expect(T::LBrace);
         while !self.at(T::RBrace) && !self.at(T::Eof) {
             let vstart = self.span();
+            let vdocs = self.claim_docs(self.pos);
             let vname = self.ident();
             let data = if self.at(T::LParen) {
                 self.bump();
@@ -595,7 +613,9 @@ impl Parser<'_> {
                 let mut fs = Vec::new();
                 while !self.at(T::RBrace) && !self.at(T::Eof) {
                     let fstart = self.span();
+                    let first = self.pos;
                     let is_pub = self.eat(T::Pub);
+                    let docs = self.claim_docs(first);
                     let fname = self.ident();
                     self.expect(T::Colon);
                     let ty = self.parse_type();
@@ -604,6 +624,7 @@ impl Parser<'_> {
                         is_pub,
                         ty,
                         span: fstart.to(self.prev_span()),
+                        docs,
                     });
                     if !self.eat(T::Comma) {
                         break;
@@ -624,6 +645,7 @@ impl Parser<'_> {
                 data,
                 discriminant,
                 span: vstart.to(self.prev_span()),
+                docs: vdocs,
             });
             if !self.eat(T::Comma) {
                 break;
@@ -690,13 +712,16 @@ impl Parser<'_> {
             self.interner.intern("\"C\"")
         };
         let mut items = Vec::new();
+        let mut item_docs = Vec::new();
         if self.eat(T::LBrace) {
             while !self.at(T::RBrace) && !self.at(T::Eof) {
+                let first = self.pos;
                 let item_pub = self.at(T::Pub) && self.nth(1) == T::Fn;
                 if item_pub {
                     self.bump(); // pub
                 }
                 if self.at(T::Fn) {
+                    item_docs.push(self.claim_docs(first));
                     items.push(self.parse_fn(is_pub || item_pub));
                 } else {
                     self.bump();
@@ -704,9 +729,15 @@ impl Parser<'_> {
             }
             self.expect(T::RBrace);
         } else if self.at(T::Fn) {
+            // `extern fn f();`: one declaration, documented by the item's own comments.
+            item_docs.push(Docs::default());
             items.push(self.parse_fn(is_pub));
         }
-        ExternBlock { abi, items }
+        ExternBlock {
+            abi,
+            items,
+            item_docs,
+        }
     }
 }
 

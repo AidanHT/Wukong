@@ -1,0 +1,14 @@
+// Loader unit-test fixture: repeats the root's `extern "C"` declaration of `cos` (merged away on
+// loading) before a documented declaration of `sin`, whose doc comment must stay with it.
+module ns_ext_docs
+
+extern "C" {
+    /// The root's `cos`, declared again.
+    fn cos(x: f64) -> f64;
+    /// The sine, in radians.
+    fn sin(x: f64) -> f64;
+}
+
+pub fn sin_plus_cos(x: f64) -> f64 {
+    return sin(x) + cos(x);
+}

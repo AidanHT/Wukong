@@ -29,6 +29,7 @@ cargo test -p wukongc --test run
 | file | role |
 |---|---|
 | `emit.rs` | intermediate `--emit` stages produce expected artifacts |
+| `doc.rs` | `--emit=doc` prints `tests/doc/geometry.md` (hand-written) for `tests/doc/geometry.wk`, composes with a stage list and `-o <stem>` (`<stem>.md`), needs a clean parse, and succeeds on every example and `tests/run` program; `--doctest` passes every kind of example in `geometry.wk` (run, `no_run`, `compile_fail,<code>`, own `main`, `ignore`) on interp and native at `-O0`/`-O2`, reports each way an example in `tests/doc/doctest_failures.wk` fails (with the doc comment's line and column for a compile error) and exits 1, runs the examples' doc tests, and refuses the flags it cannot honour |
 | `examples.rs` | `examples/*.wk` through the CLI: each declared class holds, interp == native, `-O` invariance, and every runnable example's in-file `EXPECT-EXIT` / `EXPECT-OUT*` header (the `tests/run` grammar via `common/mod.rs`) matches its output |
 | `corpus_lint.rs` | static corpus checks: every directive parses, every `EXPECT-OUT-APPROX` tolerance is in `DECLARED_TOLERANCES` with a cited source, the comparator's own mutation controls |
 | `diag_json.rs` | `--error-format=json` schema v1 against the real binary: the v0 prefix is unchanged and the v1 fields (end positions, byte range, `suggestions`, `children`, `rendered`, `version`) are present |

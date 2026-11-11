@@ -68,6 +68,8 @@ impl Path {
 #[derive(Clone, Debug)]
 pub struct Module {
     pub name: Option<Path>,
+    /// The file's own documentation: the `//!` comments before its first item.
+    pub docs: Docs,
     pub items: Vec<Item>,
     pub span: Span,
 }
