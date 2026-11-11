@@ -55,7 +55,10 @@
 //! tightens the error bound (`partition_is_closer_to_f64_than_one_chain` pins the direction). The
 //! max-family folds pick an element, so on NaN-free data they return the same *value* under any
 //! partition; only which of `+0.0`/`-0.0` represents a zero maximum, and whether a NaN survives the
-//! `maxps` fold, depend on the documented order.
+//! `maxps` fold, depend on the documented order. For the additive folds, *which* NaN payload a NaN
+//! result carries is not part of the contract (the caveat `colreduce.rs` states): one binary computes
+//! one payload on every backend and thread count, but `fadd` is commutative in LLVM IR, so Rust code
+//! that spells the same tree may surface a different one.
 //!
 //! Each op is **monomorphized** (`reduce_chunk_avx2_mono::<OP>`), so the per-step `match op` is
 //! resolved at compile time instead of sitting in the loop body — the shape `velem.rs` and `vmath.rs`
@@ -1195,12 +1198,30 @@ mod tests {
                         }
                     };
                     assert_eq!(
-                        got.to_bits(),
-                        want.to_bits(),
+                        tree_bits(got, op),
+                        tree_bits(want, op),
                         "n={n} op={op} parallel={parallel}: {got} vs documented {want}"
                     );
                 }
             }
+        }
+    }
+
+    /// The bits `the_kernel_is_the_documented_tree` compares. For the max family the NaN payload is
+    /// part of the documented order (a strict-compare select is not commutative, so the optimizer
+    /// must keep it), so every bit counts. For the additive ops only *whether* the result is a NaN
+    /// counts: `documented_tree` is ordinary Rust, `fadd` is commutative in LLVM IR, and at `-O3` the
+    /// optimizer vectorizes its accumulator loops and may make either addend SRC1 of the `addps` —
+    /// which decides which of two NaNs (say `x`'s quiet NaN and the default NaN of an `inf - inf`)
+    /// survives. That is the caveat `colreduce.rs` documents for its additive kinds; a release build
+    /// of this test hit it at `n = 8191` (`0xFFC00000` from the kernel, `0x7FC00000` from the
+    /// reference). Every non-NaN result — finite, `±0`, `±inf` — still compares bit for bit.
+    fn tree_bits(v: f32, op: i64) -> u32 {
+        let payload_exact = matches!(op, RED_MAX | RED_MIN | RED_MAXABS);
+        if v.is_nan() && !payload_exact {
+            f32::NAN.to_bits()
+        } else {
+            v.to_bits()
         }
     }
 
