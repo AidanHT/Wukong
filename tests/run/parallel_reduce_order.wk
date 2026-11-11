@@ -1,0 +1,267 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1164412288
+// EXPECT-OUT: 1144780675
+// EXPECT-OUT: 1144780675
+// EXPECT-OUT: 1144780675
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 1100585984
+// EXPECT-OUT: 1100585984
+// EXPECT-OUT: 1159553331
+// EXPECT-OUT: 1159553331
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 1164386304
+// EXPECT-OUT: 3323739648
+module tests.run.parallel_reduce_order
+
+// P13.7: in a `@parallel` function an `f32` reduction has ONE value, whichever way it is spelled
+// and whether or not a multicore kernel fires. `@parallel` licenses exactly one reassociation — the
+// runtime reduction kernel's tree (language guide, "Reduction order"):
+//
+//   1. the addends, in iteration order, are cut into chunks of 8,192;
+//   2. in a chunk, element 64b + 8t + j of each whole 64-element block folds into accumulator t,
+//      lane j; the whole 8-element groups of the < 64 remainder fold into accumulator 0;
+//   3. acc[t] = acc[t + h] (+) acc[t] for h = 4, 2, 1; the < 8 tail folds into lanes 0..;
+//   4. the lanes combine as ((l0 (+) l1) (+) (l2 (+) l3)) (+) ((l4 (+) l5) (+) (l6 (+) l7));
+//   5. the chunk partials fold in ascending order from the identity, and the seed folds in once
+//      (untouched when the range is empty).
+//
+// (+) is `+` (a product addend `a * b` contributes fma(a, b, acc)), or `a > b ? a : b` for fmax.
+// Below, the kernel shape `for i in 0..n { s += x[i] }` runs `wukong_sreduce_f32_parallel`; the
+// `..=` range, the `step`, the shifted index, `@generic`, the region body and the commuted product
+// run the compiler's chunk-buffer lowering over the serial twin `wukong_sreduce_f32`; and every
+// one of them must print the same bits. The run suite checks this on the interpreter and native at
+// -O0..-O3; crates/wukongc/tests/parallel_lane.rs reruns it on 1, 2, 3 and 8 threads and with
+// recognition off.
+//
+// Every EXPECT-OUT is the `bits()` of a result evaluated by hand with an independent scalar model
+// of the tree above (exact rational arithmetic, one round-to-nearest-even per f32 operation) —
+// never recorded from compiler output. On this data the three orders a reduction can have are
+// three different numbers: the parallel tree gives 3704.34375 (1164412288), the sequential
+// vectorizer's lane tree — the second-to-last line, from `plain`, a loop without `@parallel` —
+// gives 3698.0 (1164386304), and a strict left fold 3700.2056 (1164395338). A lowering that drifts
+// to either of the other two changes a printed line.
+//
+// Data (n = 20000: two full chunks and a 3616-element third), each step one f32 rounding:
+//   x[i] = 1000 + f32(0.1) * (i % 13) for even i, f32(0.37) - (1000 + f32(0.1) * (i % 13)) for
+//   odd i — adjacent terms cancel to about 0.37, so the running sums swing by 1000;
+//   y[i] = (i % 7) * 0.25 - 0.75 (exact);
+//   z[i] = -(i * 0.5), so z[0] = -0.0, with a NaN at i = 19998. `fmax` drops a NaN that a later
+//   element of the same fold meets, so the tree keeps -0.0 (2147483648) where a left fold ends at
+//   z[19999] = -9999.5 (3323739648, the last line, from `plain_max`).
+
+@parallel
+fn sum_kernel(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n {
+        s += x[i];
+    }
+    return s;
+}
+
+@parallel
+fn sum_inclusive(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..=n - 1 {
+        s = s + x[i];
+    }
+    return s;
+}
+
+@parallel
+fn sum_step(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n step 1 {
+        s += x[i];
+    }
+    return s;
+}
+
+@parallel
+fn sum_shifted(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 1..n + 1 {
+        s += x[i - 1];
+    }
+    return s;
+}
+
+@parallel
+@generic
+fn sum_generic(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n {
+        s += x[i];
+    }
+    return s;
+}
+
+// The row loop is an outlined region; each row's reduction runs inside its body.
+@parallel
+fn sum_rows(x: []f32, n: i64, @noalias mut out: [f32; 3]) {
+    let seed: f32 = 0.5;
+    for r in 0..3 {
+        let mut s: f32 = seed;
+        for i in 0..n {
+            s += x[i];
+        }
+        out[r] = s;
+    }
+}
+
+@parallel
+fn dot_kernel(x: []f32, y: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n {
+        s += x[i] * y[i];
+    }
+    return s;
+}
+
+@parallel
+fn dot_commuted(x: []f32, y: []f32, n: i64, off: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n {
+        s = s + y[i] * x[i + off];
+    }
+    return s;
+}
+
+@parallel
+fn dot_inclusive(x: []f32, y: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..=n - 1 {
+        s += x[i] * y[i];
+    }
+    return s;
+}
+
+@parallel
+fn max_kernel(z: []f32, n: i64) -> f32 {
+    let mut m: f32 = -1.0e30;
+    for i in 0..n {
+        m = fmax(m, z[i]);
+    }
+    return m;
+}
+
+@parallel
+fn max_swapped(z: []f32, n: i64) -> f32 {
+    let mut m: f32 = -1.0e30;
+    for i in 0..n {
+        m = fmax(z[i], m);
+    }
+    return m;
+}
+
+@parallel
+fn max_inclusive(z: []f32, n: i64) -> f32 {
+    let mut m: f32 = -1.0e30;
+    for i in 0..=n - 1 {
+        m = fmax(m, z[i]);
+    }
+    return m;
+}
+
+@parallel
+fn empty_kernel(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = -0.0;
+    for i in 0..n {
+        s += x[i];
+    }
+    return s;
+}
+
+@parallel
+fn empty_inclusive(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = -0.0;
+    for i in 0..=n - 1 {
+        s += x[i];
+    }
+    return s;
+}
+
+fn plain(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n {
+        s += x[i];
+    }
+    return s;
+}
+
+@strict_fp
+fn plain_max(z: []f32, n: i64) -> f32 {
+    let mut m: f32 = -1.0e30;
+    for i in 0..n {
+        m = fmax(m, z[i]);
+    }
+    return m;
+}
+
+fn main() -> i32 {
+    let n: i64 = 20000;
+    let mut x: []f32 = alloc_f32(n);
+    let mut y: []f32 = alloc_f32(n);
+    let mut z: []f32 = alloc_f32(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let a: f32 = ((i % 13) as f32) * 0.1;
+        let b: f32 = 1000.0 + a;
+        if i % 2 == 0 {
+            x[i] = b;
+        } else {
+            x[i] = 0.37 - b;
+        }
+        let c: f32 = ((i % 7) as f32) * 0.25;
+        y[i] = c - 0.75;
+        z[i] = -((i as f32) * 0.5);
+        i = i + 1;
+    }
+    z[19998] = f32_from_bits(0x7fc00000);
+
+    print(bits(sum_kernel(x, n)));
+    print(bits(sum_inclusive(x, n)));
+    print(bits(sum_step(x, n)));
+    print(bits(sum_shifted(x, n)));
+    print(bits(sum_generic(x, n)));
+    let mut rows: [f32; 3] = [0.0; 3];
+    sum_rows(x, n, rows);
+    print(bits(rows[0]));
+    print(bits(rows[1]));
+    print(bits(rows[2]));
+
+    print(bits(dot_kernel(x, y, n)));
+    print(bits(dot_commuted(x, y, n, 0)));
+    print(bits(dot_inclusive(x, y, n)));
+
+    print(bits(max_kernel(z, n)));
+    print(bits(max_swapped(z, n)));
+    print(bits(max_inclusive(z, n)));
+
+    // One chunk of 100; two chunks, the second one element long.
+    print(bits(sum_kernel(x, 100)));
+    print(bits(sum_inclusive(x, 100)));
+    print(bits(sum_kernel(x, 8193)));
+    print(bits(sum_shifted(x, 8193)));
+
+    // An empty range keeps the seed bit for bit: -0.0, not 0.0 + -0.0.
+    print(bits(empty_kernel(x, 0)));
+    print(bits(empty_inclusive(x, 0)));
+
+    print(bits(plain(x, n)));
+    print(bits(plain_max(z, n)));
+    free(x);
+    free(y);
+    free(z);
+    return 0;
+}

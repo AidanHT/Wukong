@@ -277,8 +277,8 @@ static CATALOG: &[Explanation] = &[
     entry!(
         "E0309",
         "`@tile` cannot be applied",
-        "A `@tile` attribute names a tiling the compiler cannot perform, so it would have no \
-         effect. Four conditions reach this code. (1) The loop form: `@tile` strip-mines \
+        "A `@tile` attribute names a tiling the compiler cannot perform. Five conditions reach \
+         this code. (1) The loop form: `@tile` strip-mines \
          `for <i> in <start>..<end>` — one identifier, an exclusive range with a known end and no \
          `step` — into a full-tile nest plus a remainder loop. `for i in 0..=n`, a stepped or open \
          range, and iteration over an array cannot be rewritten that way. (2) The argument: a tile \
@@ -289,10 +289,14 @@ static CATALOG: &[Explanation] = &[
          whole-function recognizer interception replaces the nest with a kernel that brings its own \
          blocking, and the whole-function `@parallel` outliner rewrites the loop into runtime \
          chunks — both build their lowerer with no tile queue at all, so `@generic` is the way to \
-         keep the loops tileable. Every one of these used to be silent — the width was discarded \
-         where it stood, and a function-item queue additionally SHIFTED, so the next loop was \
+         keep the loops tileable. The first four used to be silent — the width was discarded where \
+         it stood, and a function-item queue additionally SHIFTED, so the next loop was \
          strip-mined at the wrong width. Either drop the attribute or write the loop in the form it \
-         can rewrite."
+         can rewrite. (5) The loop is a `@parallel` `f32` reduction: its value is the parallel \
+         reduction tree, and a strip-mined body folds one statement at a time, in source order, so \
+         the width used to be applied and change the RESULT rather than the schedule. Drop the \
+         `@tile` (the tree already works in fixed 8,192-element chunks), or mark the function \
+         `@strict_fp`, whose reductions fold in source order and can be strip-mined."
     ),
     entry!(
         "E0312",

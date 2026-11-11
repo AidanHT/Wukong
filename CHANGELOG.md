@@ -495,6 +495,68 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
   value; a closure that captures still has no run-time value (no heap environment).
 
+### A `@parallel` reduction loop has one value, whichever way it runs (`gap7/parallel-reduce-order`, P13.7)
+
+- **Changed: every `f32` reduction loop of a fast `@parallel` function computes the parallel
+  reduction tree**, the 8,192-element-chunk tree of the runtime's reduction kernel, over its addends
+  in iteration order — every such loop on its own, that is; a reduction inside a nest that a
+  multi-loop kernel takes is the next bullet. Before, only the kernel shape `for k in 0..n { s += f(x[k], y[k]) }` did; an
+  `..=` range, a `step`, a non-zero start, an offset index, an addend with no kernel, `@generic`,
+  `WUKONG_NO_RECOGNIZE`, an unsigned counter — and the kernel shape itself inside an outlined region
+  body — silently fell back to the vectorizer's lane tree or the source fold: on the data of
+  `tests/run/parallel_reduce_order.wk`, `0..n` printed 3704.34375, `0..=n - 1` 3700.2056 (a left fold)
+  and the same `0..n` loop inside an outlined region 3698.0 (the lane tree). All of them now print
+  3704.34375, on any thread count, both backends and every `-O` level. A spelling no kernel matches runs on one thread: the
+  loop fills a chunk buffer with its addends and hands each chunk to the serial twin
+  `wukong_sreduce_f32` (`wukong_mir_build::par_reduce`). `f64`/integer reductions, `@strict_fp`, a
+  body that is not one fold statement, `while` and `for x in array` loops keep their orders; the
+  language guide's table under Attributes gives the whole rule, and the guide no longer calls a
+  decline "always correct" without saying which bits.
+- **Not covered: a reduction nested in a nest a multi-loop kernel replaces whole** — a matmul
+  (GEMM, NT-GEMM), a GEMV or vector·matrix product, a column reduction, a norm, a loss, a softmax
+  backward. When that kernel fires the inner reduction has the kernel's own documented order (a
+  column sum's row-ascending fold, a GEMM's FMA accumulation over `K`); when it declines — recognition off,
+  `@generic`, a spelling the matcher does not take, or the may-overlap arm a versioned nest picks at
+  run time — the inner loop is a reduction on its own and takes the tree. So for such a nest whether
+  the kernel fired still moves the low-order bits, as it does without `@parallel`; both orders are
+  deterministic, and `@strict_fp` replaces both with the source order. The guide's table has the row,
+  and the roadmap keeps it as a sharp edge.
+- **Changed: the `bf16`/`f16` `_parallel` reductions are the `f32` tree on the widened values**
+  (`wukong_{sum,dot,reduce}_{bf16,f16}_parallel`): one chunk reducer over `TreeElem` (`f32`, `Bf16`,
+  `F16`) in `reduce.rs`, so a half reduction is bit-for-bit `wukong_sreduce_f32` on a widened copy,
+  and the uncast spelling `s = s + x[k]` (formerly a source-order scalar loop) agrees with the cast
+  one. Their low bits move where the old per-chunk half partitions rounded differently (the sum of
+  the first 100 bf16 values of `parallel_reduce_order_lowp.wk` was 2615542.25 and is 2615542.5); the
+  serial half kernels outside `@parallel` are unchanged.
+- **A product addend keeps the rounding the source gives it.** `s = s + a * b` contracts in the
+  source — one `f32` fused multiply-add of the widened factors, whatever the product's own type — so
+  the tree folds it as `fma(a, b, acc)`: a `bf16 * bf16`, `f16 * f16`, `bf16 * i8` or `f32 * i16`
+  product is never rounded on its own. (The first cut of this change rounded such a product to its
+  own type and summed it: a one-element `@parallel` bf16 dot of 1.0078125 * 1.0078125 printed
+  1.515625 after a 0.5 seed instead of 1.51568603515625, and the uncast f16 dot of
+  `parallel_reduce_order_lowp.wk`'s data overflowed 126 f16 products to +-inf and returned a NaN.)
+  The compound `s += a * b` fuses an `f32` product, as the kernel does, and rounds a half product to
+  its half type first, as the source does. A narrow-integer addend (`i8`/`u8`/`i16`/`u16`, which sema
+  promotes into the `f32` fold exactly) takes the tree too, converted with its own signedness,
+  instead of the source's left fold.
+- **Changed: `@tile` on a `@parallel` `f32` reduction loop is `E0309`.** The strip-miner runs
+  before every reduction lowering and lowers the fold body one statement at a time, so
+  `@tile(64) for i in 0..n { s += x[i]; }` folded in source order: 3700.2056 on the data of
+  `parallel_reduce_order.wk`, where the same loop without `@tile` gives the tree's 3704.34375. A
+  scheduling hint changed the bits. The width is now refused (not consumed), the loop keeps the
+  tree, and `@strict_fp` — whose reductions fold in source order — keeps such a loop tileable
+  (`tests/fail/tile_on_parallel_reduction.wk`; `--explain E0309` lists the case).
+- **Fixed: a reduction kernel no longer fires on a range whose end reads the accumulator**
+  (`for k in 0..(s as i64) { s += x[k] }`): the source re-evaluates the end every iteration, the kernel
+  read it once.
+- Tests: `tests/run/parallel_reduce_order.wk` and `parallel_reduce_order_lowp.wk` (hand-evaluated
+  bits; the tree, the vectorizer's tree and a left fold are three different numbers on their data),
+  `parallel_lane.rs`'s thread-count / backend / recognition-off sweep, `par_reduce_tests.rs`, and the
+  runtime's `the_kernel_is_the_documented_tree`, `tree_is_independent_of_thread_count_and_completion_
+  order` and `lowp_parallel_is_the_f32_tree_of_the_widened_values`. Census: `parallel_reduce_elem_bf16`
+  gains the tree's `wukong_sreduce_f32*2`; `parallel_region_reassigned_local` trades one 256-bit
+  `veckernel` (a lane-tree reduction inside a `@parallel` region) for `wukong_sreduce_f32*4`.
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

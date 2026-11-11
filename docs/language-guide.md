@@ -1595,19 +1595,52 @@ artifact and the program's output are identical with and without it.
 independent chunks: a labelled loop, a plain `break` out of the parallelized loop, a `return` out of
 it, or a mid-function region whose modelled body-local is reassigned inside an inner loop. (A
 `break`/`continue` targeting an *inner* loop is that loop's own control flow and stays legal.) The
-result is always correct — the fallback is the ordinary scalar/vectorized loop — but the parallel
-speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
+fallback costs speed, never bits: it is the ordinary scalar/vectorized loop, whose iterations are
+independent, so it computes what the threaded loop computes. Only the parallel speedup is silently
+absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
 Fixtures: `tests/run/parallel_control_flow.wk`, `parallel_region_reassigned_local.wk`.
 
-"Correct" here means *a* correct evaluation of the program under the fast floating-point contract,
-not *the same bits*. An `f32` **reduction** has three possible summation orders depending on how it
-is compiled — the source's left-to-right fold (`@strict_fp`, or a loop no path vectorizes), the
-sequential vectorizer's lane-partitioned tree, and the `@parallel` reduction kernel's fixed
-8192-element chunks (see [Floating-point semantics](#floating-point-semantics-)) — and adding
-`@parallel`, removing it, or making the reduction loop decline (a `step`, an `..=` range, an `f64`
-accumulator) moves the loop between the last two, which changes low-order bits. Each order is
-deterministic on its own: independent of thread count, `-O` level, backend and host. Write
-`@strict_fp` when the bits must not depend on the spelling.
+The same holds for a **reduction** — the one place `@parallel` changes arithmetic (✅). In a
+`@parallel` function in fast mode, an `f32` reduction loop — a `for` over any range whose body is the
+single fold `s += e`, `s = s + e`, a `+` chain holding `s` once, or a running `fmax`/`fmin`, with an
+`f32` accumulator and an addend built from arithmetic, casts, indexing, fields, math intrinsics and
+`if` (an `f32` value, a `bf16`/`f16` one, or an `i8`/`u8`/`i16`/`u16` one, which sema promotes into
+the accumulator exactly) — is evaluated with **the parallel reduction tree** (see [Floating-point
+semantics](#floating-point-semantics-)) over its addends in iteration order, and *only* with it. The
+multicore kernel, its single-threaded twin, and the compiler's own lowering of a spelling no kernel
+matches (an `..=` range, a `step`, an offset index, an addend no kernel has, a loop inside an
+outlined region, `@generic`, `WUKONG_NO_RECOGNIZE`) all return the same bits, on any thread count,
+on both backends and at every `-O` level (`tests/run/parallel_reduce_order.wk`). A `bf16`/`f16`
+reduction, cast or uncast, is the same tree over the exactly widened values
+(`tests/run/parallel_reduce_order_lowp.wk`).
+
+All of that is about a reduction loop *on its own*. A reduction nested in a loop nest that a
+multi-loop kernel replaces whole — a matmul (GEMM, NT-GEMM), a GEMV or vector·matrix product, a
+column reduction, a norm, a loss, a softmax backward — is part of that kernel's computation and has
+the kernel's documented order when the kernel fires. When it does not — recognition off, `@generic`,
+a spelling the recognizer does not match, or the may-overlap arm a versioned nest runs when its
+buffers turn out to overlap at run time — the inner loop is a reduction on its own again and takes
+the parallel tree. So for those nests, whether the kernel fired does change the low-order bits. Both
+orders are deterministic, and `@strict_fp` replaces both with the source order. The order is decided
+by the program text and, for such a nest, by whether its kernel fires:
+
+| the reduction | its order |
+|---|---|
+| an `f32` reduction loop on its own in a fast `@parallel` function (`bf16`/`f16` and narrow-integer addends included) | the parallel reduction tree |
+| the same loop without `@parallel` | the vectorizer's tree if the vectorizer takes it, else the source's left fold; a `bf16`/`f16` one read through `as f32` runs the half kernel's own order |
+| an `f32` reduction loop that is the inner reduction of a nest a multi-loop kernel takes (matmul, GEMV, vector·matrix, column reduction, norm, loss, softmax backward), `@parallel` or not | that kernel's own order when it fires; when it declines — recognition off, `@generic`, an unmatched spelling, or a versioned nest's may-overlap arm — the order the loop has on its own (the two rows above) |
+| an `f64`, integer or `bf16`/`f16`-accumulator reduction, `@parallel` or not | as without `@parallel`: the vectorizer's tree where it applies (integer folds are exact in any order) |
+| any reduction in a `@strict_fp` function | the source's left fold |
+| a `while` loop, a `for x in array` loop, a body that is not one fold statement, an addend that calls a user function or reads the accumulator | the source's left fold |
+
+So for a reduction loop on its own, removing `@parallel` — never a decline — is what moves it to
+another tree, and `@strict_fp` is the way to make the bits independent of the annotation and of
+every kernel. `@tile` cannot strip-mine such a loop, since a strip-mined body folds in source order:
+it is `E0309` (`tests/fail/tile_on_parallel_reduction.wk`). A spelling no kernel
+matches runs on one thread: it fills a chunk buffer with its addends (a product addend `a * b` as its
+two factors) and folds each chunk with the runtime's serial reduction `wukong_sreduce_f32`, which is
+what `--remarks=dispatch` reports for it where the kernel shape reports
+`wukong_sreduce_f32_parallel`. Only its speed depends on the spelling.
 
 A sequential `for` **reduction** — `s += e`, `s = s + e`, any `+` chain holding `s` once
 (`s = s + x + y` is `s += x + y`), or a running `fmax`/`fmin`, over an `f32`, `f64`, `i32` or `i64`
@@ -1656,8 +1689,10 @@ fixed arithmetic order:
 
 A matmul that is **not** recognized — declined by the matcher, written under `@generic`, or built
 with `WUKONG_NO_RECOGNIZE` — computes the loop as written: `s + a*b` contracts to one FMA, and the
-inner reduction follows the vectorized-reduction partition described above. The two orders coincide
-when the contraction is shorter than one vector group (K ≤ 3), and the corpus pins exactly that with
+inner reduction follows the vectorized-reduction partition described above (in a fast `@parallel`
+function, the parallel reduction tree, which agrees with the kernel's order only at K = 1). Without
+`@parallel` the two orders coincide when the contraction is shorter than one vector group (K ≤ 3),
+and the corpus pins exactly that with
 non-dyadic data whose fused and unfused results differ in every lane
 (`tests/run/lang_generic_gemm_fma_order.wk`). Past that, a recognized and an unrecognized matmul may
 differ in the last bits: both are documented reassociations of the same sum, and neither is "the"
@@ -1673,9 +1708,10 @@ max/min, and `fmax(m, abs(x[k]))` absmax — the per-tensor max/range softmax st
 quantization need) — dispatches to a
 deterministic multicore reduction kernel that reaches aggregate memory bandwidth (~8× single-threaded
 C), with a result independent of core count (✅) — provided the data is **`f32`** and the loop is a
-**half-open, unit-step** range. A `step k` or `..=` range declines to the ordinary (correct, but
-single-threaded) scalar loop with no diagnostic (`tests/run/for_step_gemm.wk`), and that
-half-open/unit-step precondition holds for every recognized kernel. What does *not* matter is how the
+**half-open, unit-step** range over the bare loop index. Any other spelling of the same reduction — a
+`step k`, an `..=` range, a shifted index — runs single-threaded, with no diagnostic, and returns the
+kernel's bits (the parallel reduction tree above); the half-open/unit-step precondition holds for every
+recognized kernel (`tests/run/for_step_gemm.wk`). What does *not* matter is how the
 index is spelled: a row base hoisted into a local (`let ib = i*K;` then `a[ib + p]`) and a dimension
 written as a bare module `const` are normalized back to the canonical `a[i*K + p]` form before
 recognition (`wukong_mir_build::canon`), so ordinary refactoring does not silently cost you the
@@ -1713,8 +1749,10 @@ store rather than writing it as its own loop: `c[i*N+j] = silu(bias[j] + s)` fus
 GEMM + `wukong_velem_f32` pair the two-loop spelling does. Element type is handled case by
 case rather than being an f32-only gate: a `bf16`/`f16` array read through the explicit widening cast —
 `s = s + (x[k] as f32)` — dispatches to the multicore low-precision reduction kernels
-(`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop
-(`tests/run/parallel_reduce_elem_bf16.wk`); an `f64` reduction has no kernel and always declines.
+(`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` runs single-threaded
+through the compiler's lowering of the same tree, with the same bits
+(`tests/run/parallel_reduce_elem_bf16.wk`, `parallel_reduce_order_lowp.wk`); an `f64` reduction has no
+kernel and keeps the vectorizer's tree.
 Explicit `@simd`-typed vector values are still under construction (🔵); `@tile` ships (next section).
 
 ### `@strict_fp` — source-order floating point ✅
@@ -1776,7 +1814,7 @@ cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`
 (`'outer: for i in 0..n` is strip-mined and keeps its label). Fixture:
 `tests/run/lang_tile_saxpy.wk` (`@tile(2)`, `n=5`, remainder lane prints 3).
 
-**A `@tile` that cannot be applied is `E0309`, not silence.** Four conditions reach it:
+**A `@tile` that cannot be applied is `E0309`, not silence.** Five conditions reach it:
 
 - the **loop form** — anything other than one identifier over an exclusive, step-less range with a
   known end. `for i in 0..=n`, a stepped range, an open range and `for x in xs` cannot be strip-mined
@@ -1795,7 +1833,13 @@ cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`
   whole-function `@parallel` outliner rewrites the loop into runtime chunks
   (`tests/fail/tile_on_parallel_fn.wk`). Both build their lowerer with no tile queue, so `@generic`
   — which keeps the loops — is what makes `@tile` apply. Composing `@parallel` with `@tile` means
-  writing the nest yourself, as `tests/run/lang_tiled_transpose.wk` does.
+  writing the nest yourself, as `tests/run/lang_tiled_transpose.wk` does;
+- a **`@parallel` `f32` reduction** — its value is the parallel reduction tree (see *Reduction
+  order* under [Floating-point semantics](#floating-point-semantics-)), and a strip-mined body folds
+  one statement at a time, in source order, so the width would change the result, not the
+  schedule. Drop the `@tile` (the tree already works in fixed 8,192-element chunks), or mark the
+  function `@strict_fp`, whose reductions fold in source order and can be strip-mined
+  (`tests/fail/tile_on_parallel_reduction.wk`).
 
 A refused width is **not** consumed, so the function-item queue does not shift: it stays at the head
 for the next loop that can take it. Before `E0309`, an unsupported first loop discarded its width
@@ -2395,7 +2439,10 @@ rounded once (`tests/run/fp_contract_rules.wk` pins every clause):
   compound `s += y*z` outside a vectorized float reduction, which rounds the product first (the
   spelling `s = s + y*z` contracts).
 - A vectorized float reduction accumulates `s += x[i]*y[i]` (either spelling) with one FMA per
-  lane — part of the reduction tree below.
+  lane — part of the reduction tree below. The `@parallel` tree fuses the same way: either spelling
+  of an `f32` product, and `s = s + a*b` whatever the product's own type (a `bf16 * bf16` product
+  there is never rounded to bf16, because the source contracts it in `f32`); only a compound
+  `s += a*b` of a half or integer product is rounded to that type first.
 - A vectorized loop body, its 256-bit recipe and its scalar remainder apply the identical rule, so
   every lane of one loop agrees.
 
@@ -2403,38 +2450,52 @@ This is the contract of Clang's `-ffp-contract=on` (fusion within one expression
 statements). GCC's GNU-dialect default, `-ffp-contract=fast`, also fuses across statements; Wukong
 never does. `--fp=strict` / `@strict_fp` is `-ffp-contract=off`.
 
-**Reduction order (fast mode).** A float sum loop `s = s + e(i)` (or `s += e(i)`) is reassociated,
-into one of two fixed trees depending on how it is compiled:
+**Reduction order (fast mode).** A float sum loop `s = s + e(i)` (or `s += e(i)`) on its own is
+reassociated into one of two fixed trees, and the program text alone picks which — the `@parallel`
+attribute of the enclosing function and the accumulator's type (the table under
+[Attributes](#attributes-) gives the whole rule) — never whether a kernel fired, a thread count, a
+backend or an `-O` level. (A sum loop nested in a nest that a recognized multi-loop kernel replaces
+whole — a matmul, a GEMV, a column reduction, a norm — has that kernel's order when it fires; see
+*Recognized kernels* below.)
 
-- **Sequential vectorized**: the vectorizer's lane-partitioned tree — `U` independent eight-lane
+- **Sequential vectorized** (no `@parallel`, or an `f64` accumulator): the vectorizer's
+  lane-partitioned tree — `U` independent eight-lane
   accumulators (`U` from the recipe's register pressure), combined in accumulator order, then lanes
   0–7 folded in order, then the loop's initial value, then the scalar tail. The partition depends on
   the expression only, never on the host ISA, the 2,048-element 256-bit threshold or
   `WUKONG_P4_NO_256` (the `@parallel` paragraph under [Attributes](#attributes-) and
   `docs/internals.md` give the full rule). Other float element types keep the portable 128-bit
   partition.
-- **`@parallel` reduction kernel**: in a `@parallel` function a recognized `f32` reduction (dot
-  product, sum, squared distance, max/min/absmax — the shapes listed under
-  [Attributes](#attributes-)) calls
-  `wukong_sreduce_f32_parallel`. The array is cut into **fixed 8,192-element chunks**; within a
-  chunk, 64-element blocks feed eight independent eight-lane accumulators (block element `8·t + j`
-  folds into accumulator `t`, lane `j`; one FMA per element for the product forms), the `< 64`
-  remainder folds in 8-element steps into accumulator 0, the accumulators combine by the fixed
-  halving tree `acc[t] = acc[t + h] ⊕ acc[t]` for `h = 4, 2, 1`, the `< 8` tail folds into the low
-  lanes, the lanes combine as `((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`, and the chunk partials fold in
-  ascending chunk order. A chunk shorter than 64 elements therefore runs on one accumulator.
-  `bf16`/`f16` reductions widen to `f32` and cut on the same boundary. The result is the same on
-  one core or sixteen, natively or in the interpreter.
+- **The `@parallel` reduction tree** (every `f32` reduction loop of a fast `@parallel` function, and
+  `bf16`/`f16` ones on their exactly widened values): the addends, in iteration order, are cut into
+  **fixed 8,192-element chunks**; within a chunk, 64-element blocks feed eight independent eight-lane
+  accumulators (block element `8·t + j` folds into accumulator `t`, lane `j`; a product addend
+  `a * b` folds as one FMA of its two factors, each converted to `f32` as the source converts it —
+  except a compound `s += a * b` whose product is a `bf16`/`f16` or integer value, which the source
+  rounds to that type first and which is then an ordinary addend), the `< 64` remainder folds in 8-element steps into accumulator 0,
+  the accumulators combine by the fixed halving tree `acc[t] = acc[t + h] ⊕ acc[t]` for `h = 4, 2, 1`,
+  the `< 8` tail folds into the low lanes, the lanes combine as `((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`,
+  the chunk partials fold in ascending chunk order from the identity, and the seed folds in once (and
+  stays bit for bit when the range is empty). A chunk shorter than 64 elements therefore runs on one
+  accumulator. The kernel shape `for k in 0..n { s += f(x[k], y[k]) }` runs it on all cores
+  (`wukong_sreduce_f32_parallel`, or the `bf16`/`f16` `_parallel` twins); every other spelling runs it
+  on one thread through the kernel's serial twin. The result is the same on one core or sixteen,
+  natively or in the interpreter, recognized or not (`tests/run/parallel_reduce_order.wk`) —
+  for a reduction loop that is not the inner loop of a nest a multi-loop kernel takes.
 
 The two trees differ from each other and from the source's left-to-right fold, so adding or removing
-`@parallel` — or a reduction declining the kernel (a `step`, an `..=` range, an `f64` accumulator) —
-changes low-order bits; see the `@parallel` note under [Attributes](#attributes-). Max/min reductions
-use the same trees; their finite non-zero result is order-independent, but because `fmax`/`fmin`
-return `b` on a NaN or a `±0` tie, *which* NaN or which zero survives can depend on the order.
+`@parallel` on a function changes the low-order bits of its `f32` reductions. For a reduction loop
+on its own that annotation and `@strict_fp` are the only switches (`@tile` on such a loop is
+refused, `E0309`); a reduction inside a recognized multi-loop nest also moves with recognition (see
+below and the `@parallel` note under [Attributes](#attributes-)). Max/min
+reductions use the same trees; their finite non-zero result is order-independent, but because
+`fmax`/`fmin` return `b` on a NaN or a `±0` tie, *which* NaN or which zero survives — and whether a NaN
+survives at all — depends on the order.
 
 *Why 8,192.* The chunk length is part of the numerical contract, not a cache-tuning knob. It is
-fixed — the same on every host — because the serial kernel, the parallel kernel and the interpreter
-must cut the array at the same boundaries to agree. A streaming reduction reads each element once,
+fixed — the same on every host — because the serial kernel, the parallel kernel, the interpreter and
+the compiler's lowering of every non-kernel spelling must cut the addends at the same boundaries to
+agree. A streaming reduction reads each element once,
 so a chunk's cache residency buys nothing; the length only sets how many independent tasks exist
 (128 at 2^20 elements) and how long the partial array is, and load balancing can be tuned by how
 many chunks one task claims without moving a bit. Changing 8,192 would change every recognized
@@ -2445,7 +2506,9 @@ runtime kernel that evaluates the same mathematical expression in its own docume
 blocks and packs the `K` sum and accumulates with FMA, a fused softmax/norm kernel reduces each row
 with its own lane tree. The result is deterministic and identical across backends, thread counts and
 `-O` levels, but it is not the source's order; `@generic` keeps the loop (with contraction and the
-vectorizer's reduction tree), `@strict_fp` keeps the source order.
+vectorizer's reduction tree — in a fast `@parallel` function, the parallel reduction tree, as for
+any other declined nest), `@strict_fp` keeps the source order. Whether such a kernel fires
+therefore changes the low-order bits of the reductions inside its nest, `@parallel` or not.
 
 **NaN in the math intrinsics.** Every math intrinsic returns a NaN for a NaN argument. *Which* NaN
 (sign and payload) is pinned only where the runtime documents it — its elementwise kernels return

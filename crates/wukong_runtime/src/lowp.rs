@@ -31,10 +31,11 @@
 //!
 //! The partition is a pure function of `n` — never of the thread count, the ISA tier or the call
 //! site — so the SIMD path, the scalar twin, the interpreter and the native backend all return
-//! identical bits. NOTE the `_parallel` reduction twins fold over the fixed `reduce::RCHUNK`
-//! decomposition, which reassociates against the flat serial kernel: a `@parallel` reduction here
-//! is deterministic on any thread count but **not** bit-equal to its serial sibling (see
-//! [`par_chunk_reduce`]).
+//! identical bits. NOTE the `_parallel` reduction twins are a different order: they are the `f32`
+//! `@parallel` reduction tree (`reduce::tree` — fixed `RCHUNK` chunks, the 64-element partition,
+//! the ascending partial fold) over the widened values, so a `@parallel` bf16/f16 reduction is
+//! bit-for-bit the `f32` one on the widened array and **not** bit-equal to the flat serial sibling
+//! (see the "Parallel reductions" section).
 //!
 //! ## Why the lane count is load-bearing, not an implementation detail
 //!
@@ -788,91 +789,40 @@ pub unsafe extern "C" fn wukong_dot_bf16(x: *const u16, y: *const u16, n: i64) -
     dot_scalar_bf16(x, y)
 }
 
-// ---- Parallel reductions (`@parallel`): deterministic, bit-identical on any thread count ----
+// ---- Parallel reductions (`@parallel`): the f32 reduction tree on the widened values ----
+//
+// The `_parallel` twins are NOT the flat serial kernels above run per chunk. They are
+// `reduce::tree` over the widened values — the one documented `@parallel` reduction order
+// (fixed `RCHUNK` chunks, the 64-element partition, the halving tree, the ascending partial fold),
+// which `wukong_sreduce_f32` computes for an `f32` array. The widen is exact, so a bf16/f16
+// `@parallel` reduction returns bit-for-bit what `wukong_sreduce_f32` returns on the widened
+// array, and therefore what the compiler's own lowering of the same reduction computes when no
+// half kernel matches its spelling (P13.7: the value of a `@parallel` reduction must not depend on
+// whether a kernel fired). Thread count, pool and scheduler move no bit: chunk partials land in
+// slot order (`reduce::chunk_tree`). The interpreter marshals these very entries.
 
-/// Cut `[0, n)` into fixed `crate::reduce::RCHUNK` chunks, reduce each with `per_chunk(lo, hi)` (one of
-/// the serial kernels over the sub-range — a pure function of its chunk), then fold the partials in
-/// **ascending chunk order** from `ident`. rayon's indexed `collect()` preserves chunk order regardless
-/// of which thread computed each, so the result is identical on every call no matter the core count:
-/// the native `@parallel` path and the interpreter (which marshals this very function) agree
-/// bit-for-bit. NOTE this chunked fold reassociates vs the *flat* whole-array serial kernel
-/// (`wukong_sum_bf16` et al.), so a `@parallel` reduction is **not** bit-equal to its non-`@parallel`
-/// twin. Unlike these half-precision serial entries, the f32 reduction entries already share the
-/// same fixed-chunk decomposition between serial and parallel calls.
-#[inline]
-fn par_chunk_reduce(
-    n: usize,
-    ident: f32,
-    per_chunk: impl Fn(usize, usize) -> f32 + Sync,
-    combine: impl Fn(f32, f32) -> f32,
-) -> f32 {
-    let nchunks = n.div_ceil(crate::reduce::RCHUNK);
-    // With one worker, a parallel map cannot reduce the work. Fold directly without allocating
-    // partials or handing off to a pool. Keep every RCHUNK boundary AND the identity-seeded fold:
-    // calling the flat serial sibling would change rounding, and returning an uncombined single
-    // partial could change signed-zero/NaN behavior for the supplied combine operation.
-    if nchunks < 2 || crate::wuk_pool_width() <= 1 {
-        let mut acc = ident;
-        for c in 0..nchunks {
-            let lo = c * crate::reduce::RCHUNK;
-            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
-            acc = combine(acc, per_chunk(lo, hi));
-        }
-        return acc;
-    }
-    // Fork on the unified kernel pool, never on rayon's implicit global registry: this is a path that
-    // can be a process's FIRST rayon touch (a bf16 model whose first parallel op is a reduction), and
-    // `run_on_wuk_pool` is what installs the runtime's 16 MiB worker stacks before anything can build
-    // rayon's 2 MiB default (`crate::ensure_global_pool`, lib.rs:324-329). Scheduling-only: the fixed
-    // `RCHUNK` decomposition and the ordered fold below are what fix the bits, so which pool runs the
-    // map cannot change them. `per_chunk` is borrowed, not moved — `&P` is `Send` because `P: Sync`.
-    let per_chunk = &per_chunk;
-    // `par::map_units`: partial `c` in slot `c` under either scheduler (`WUKONG_KERNEL_DYN`), so the
-    // index-order fold below is unchanged.
-    let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
-        crate::par::map_units(nchunks, |c| {
-            let lo = c * crate::reduce::RCHUNK;
-            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
-            per_chunk(lo, hi)
-        })
-    });
-    let mut acc = ident;
-    for p in partials {
-        acc = combine(acc, p);
-    }
-    acc
+/// `reduce::tree` over `n` stored bf16 values (`y == x` for the unary ops).
+///
+/// # Safety
+/// `x` and `y` must each point to `n` readable `u16`.
+unsafe fn tree_bf16(x: *const u16, y: *const u16, n: i64, op: i64) -> f32 {
+    use crate::reduce::Bf16;
+    // SAFETY: `Bf16` is `repr(transparent)` over `u16`; validity is the caller's contract.
+    unsafe { crate::reduce::tree(x as *const Bf16, y as *const Bf16, n, op, true) }
 }
 
-/// Select the ISA before calling this helper, so workers invoke the selected kernel directly.
-/// Short inputs retain the public entries' flat result, without an extra identity fold.
-#[inline]
-fn par_half_reduce(
-    x: &[u16],
-    ident: f32,
-    per_chunk: impl Fn(&[u16]) -> f32 + Sync,
-    combine: impl Fn(f32, f32) -> f32,
-) -> f32 {
-    if x.len() <= crate::reduce::RCHUNK {
-        return per_chunk(x);
-    }
-    par_chunk_reduce(x.len(), ident, |lo, hi| per_chunk(&x[lo..hi]), combine)
+/// `reduce::tree` over `n` stored IEEE-f16 values (`y == x` for the unary ops).
+///
+/// # Safety
+/// `x` and `y` must each point to `n` readable `u16`.
+unsafe fn tree_f16(x: *const u16, y: *const u16, n: i64, op: i64) -> f32 {
+    use crate::reduce::F16;
+    // SAFETY: `F16` is `repr(transparent)` over `u16`; validity is the caller's contract.
+    unsafe { crate::reduce::tree(x as *const F16, y as *const F16, n, op, true) }
 }
 
-#[inline]
-fn par_half_dot(x: &[u16], y: &[u16], per_chunk: impl Fn(&[u16], &[u16]) -> f32 + Sync) -> f32 {
-    if x.len() <= crate::reduce::RCHUNK {
-        return per_chunk(x, y);
-    }
-    par_chunk_reduce(
-        x.len(),
-        0.0,
-        |lo, hi| per_chunk(&x[lo..hi], &y[lo..hi]),
-        |a, b| a + b,
-    )
-}
-
-/// Multicore bf16 sum — the `@parallel` twin of [`wukong_sum_bf16`]. Each fixed chunk is summed by the
-/// serial kernel and the partials added ascending, so the result is deterministic (interp == native).
+/// Multicore bf16 sum — the `@parallel` reduction tree over the widened values (see the section
+/// note above): bit-for-bit `wukong_sreduce_f32(widen(x), widen(x), n, RED_SUM)`.
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
@@ -882,19 +832,11 @@ fn par_half_dot(x: &[u16], y: &[u16], per_chunk: impl Fn(&[u16], &[u16]) -> f32 
 pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 {
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
-    if n <= 0 {
-        return 0.0;
-    }
-    let x = std::slice::from_raw_parts(x, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    if crate::isa::avx2() {
-        // SAFETY: feature detected once; borrowed chunks are read-only valid subslices.
-        return par_half_reduce(x, 0.0, |chunk| sum_bf16_avx(chunk), |a, b| a + b);
-    }
-    par_half_reduce(x, 0.0, sum_scalar_bf16, |a, b| a + b)
+    // SAFETY: same contract; the unary sum never reads `y`.
+    unsafe { tree_bf16(x, x, n, crate::reduce::RED_SUM) }
 }
 
-/// Multicore IEEE-f16 sum — the `@parallel` twin of [`wukong_sum_f16`].
+/// Multicore IEEE-f16 sum — the `@parallel` reduction tree over the widened values.
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
@@ -904,19 +846,12 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
 pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
-    if n <= 0 {
-        return 0.0;
-    }
-    let x = std::slice::from_raw_parts(x, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    if crate::isa::f16c() && crate::isa::avx() {
-        // SAFETY: features detected once; borrowed chunks are read-only valid subslices.
-        return par_half_reduce(x, 0.0, |chunk| sum_f16_avx(chunk), |a, b| a + b);
-    }
-    par_half_reduce(x, 0.0, sum_scalar_f16, |a, b| a + b)
+    // SAFETY: same contract; the unary sum never reads `y`.
+    unsafe { tree_f16(x, x, n, crate::reduce::RED_SUM) }
 }
 
-/// Multicore bf16 dot — the `@parallel` twin of [`wukong_dot_bf16`].
+/// Multicore bf16 dot — the `@parallel` reduction tree over the widened values (one fused
+/// multiply-add per element, as `RED_DOT`).
 ///
 /// # Safety
 /// `x` and `y` must each point to `n` readable `u16`.
@@ -927,20 +862,11 @@ pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, 
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(y, n);
-    if n <= 0 {
-        return 0.0;
-    }
-    let x = std::slice::from_raw_parts(x, n as usize);
-    let y = std::slice::from_raw_parts(y, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    if crate::isa::avx2() && crate::isa::fma() {
-        // SAFETY: features detected once; x/y may overlap because both are read-only.
-        return par_half_dot(x, y, |xc, yc| dot_bf16_avx(xc, yc));
-    }
-    par_half_dot(x, y, dot_scalar_bf16)
+    // SAFETY: same contract.
+    unsafe { tree_bf16(x, y, n, crate::reduce::RED_DOT) }
 }
 
-/// Multicore IEEE-f16 dot — the `@parallel` twin of [`wukong_dot_f16`].
+/// Multicore IEEE-f16 dot — the `@parallel` reduction tree over the widened values.
 ///
 /// # Safety
 /// `x` and `y` must each point to `n` readable `u16`.
@@ -951,22 +877,13 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(y, n);
-    if n <= 0 {
-        return 0.0;
-    }
-    let x = std::slice::from_raw_parts(x, n as usize);
-    let y = std::slice::from_raw_parts(y, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    if crate::isa::f16c() && crate::isa::fma() {
-        // SAFETY: features detected once; x/y may overlap because both are read-only.
-        return par_half_dot(x, y, |xc, yc| dot_f16_avx(xc, yc));
-    }
-    par_half_dot(x, y, dot_scalar_f16)
+    // SAFETY: same contract.
+    unsafe { tree_f16(x, y, n, crate::reduce::RED_DOT) }
 }
 
-/// Multicore bf16 max-family reduction (`RED_MAX`/`RED_MIN`/`RED_MAXABS`) — the `@parallel` twin of
-/// [`wukong_reduce_bf16`]. Partials fold with the op's `fold2`/`ident` (the same `Cmp+Select` the
-/// recognizer emits), so max/min/absmax stay deterministic over the fixed chunk decomposition.
+/// Multicore bf16 max-family reduction (`RED_MAX`/`RED_MIN`/`RED_MAXABS`) — the `@parallel`
+/// reduction tree over the widened values, folding with the op's `fold2`/`ident` (the same
+/// `Cmp+Select` the recognizer emits), so which NaN or which zero survives is the tree's answer.
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
@@ -976,29 +893,11 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
 pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
-    if n <= 0 {
-        return crate::reduce::ident(op);
-    }
-    let x = std::slice::from_raw_parts(x, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    if crate::isa::avx2() {
-        // Keep the same operand order within each kernel and in the ordered partial fold.
-        return par_half_reduce(
-            x,
-            crate::reduce::ident(op),
-            |chunk| reduce_minmax_bf16_avx(op, chunk),
-            |a, b| crate::reduce::fold2(a, b, op),
-        );
-    }
-    par_half_reduce(
-        x,
-        crate::reduce::ident(op),
-        |chunk| reduce_minmax_scalar(Half::Bf16, op, chunk),
-        |a, b| crate::reduce::fold2(a, b, op),
-    )
+    // SAFETY: same contract; the unary max family never reads `y`.
+    unsafe { tree_bf16(x, x, n, op) }
 }
 
-/// Multicore IEEE-f16 max-family reduction — the `@parallel` twin of [`wukong_reduce_f16`].
+/// Multicore IEEE-f16 max-family reduction — the `@parallel` reduction tree over the widened values.
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
@@ -1008,26 +907,8 @@ pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: 
 pub unsafe extern "C" fn wukong_reduce_f16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
-    if n <= 0 {
-        return crate::reduce::ident(op);
-    }
-    let x = std::slice::from_raw_parts(x, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    if crate::isa::f16c() && crate::isa::avx() {
-        // Keep the same operand order within each kernel and in the ordered partial fold.
-        return par_half_reduce(
-            x,
-            crate::reduce::ident(op),
-            |chunk| reduce_minmax_f16_avx(op, chunk),
-            |a, b| crate::reduce::fold2(a, b, op),
-        );
-    }
-    par_half_reduce(
-        x,
-        crate::reduce::ident(op),
-        |chunk| reduce_minmax_scalar(Half::F16, op, chunk),
-        |a, b| crate::reduce::fold2(a, b, op),
-    )
+    // SAFETY: same contract; the unary max family never reads `y`.
+    unsafe { tree_f16(x, x, n, op) }
 }
 
 /// Scalar twin of the bf16→f32 axpby: `out[i] = a·widen(x[i]) + b·widen(y[i])`. The op order
@@ -2778,89 +2659,106 @@ mod tests {
         assert!(peer > 1e-4, "sequential f32 dot only {peer:.3e} off");
     }
 
-    /// The IDENTICAL chunk fold the `_parallel` kernels perform, computed sequentially (no rayon): cut
-    /// `[0, n)` on the fixed `RCHUNK` boundary, reduce each chunk with the serial kernel, fold the
-    /// partials ascending from `ident(op)`. The parallel kernel must equal this bit-for-bit — that is
-    /// its thread-count-independence contract — and it reassociates vs the flat whole-array serial.
-    fn seq_chunked(x: &[u16], y: &[u16], op: i64, is_f16: bool) -> f32 {
-        use crate::reduce::{fold2, ident, RCHUNK, RED_DOT, RED_SUM};
-        let n = x.len();
-        let nchunks = n.div_ceil(RCHUNK).max(1);
-        let mut acc = ident(op);
-        for c in 0..nchunks {
-            let lo = c * RCHUNK;
-            let hi = ((c + 1) * RCHUNK).min(n);
-            let len = (hi - lo) as i64;
-            // SAFETY: [lo, hi) ⊆ [0, n); the slices are valid for `len` u16.
-            let p = unsafe {
-                match (op, is_f16) {
-                    (RED_DOT, false) => wukong_dot_bf16(x[lo..].as_ptr(), y[lo..].as_ptr(), len),
-                    (RED_DOT, true) => wukong_dot_f16(x[lo..].as_ptr(), y[lo..].as_ptr(), len),
-                    (RED_SUM, false) => wukong_sum_bf16(x[lo..].as_ptr(), len),
-                    (RED_SUM, true) => wukong_sum_f16(x[lo..].as_ptr(), len),
-                    (_, false) => wukong_reduce_bf16(x[lo..].as_ptr(), len, op),
-                    (_, true) => wukong_reduce_f16(x[lo..].as_ptr(), len, op),
-                }
-            };
-            acc = fold2(acc, p, op);
-        }
-        acc
-    }
-
+    /// The `_parallel` half reductions ARE the `f32` reduction tree on the widened values: bit-for-bit
+    /// `wukong_sreduce_f32` over the widened array, for every op the compiler emits, at every seam of
+    /// the partition and of the `RCHUNK` decomposition, on finite data and on NaN / signed-zero /
+    /// infinite data. This is what makes a `@parallel` bf16/f16 reduction agree with the compiler's
+    /// own lowering of the same reduction when no half kernel matches its spelling (P13.7).
     #[test]
-    fn parallel_reductions_match_sequential_chunked() {
-        use crate::reduce::{RED_DOT, RED_MAX, RED_MAXABS, RED_MIN, RED_SUM};
-        // Sizes straddling the fixed RCHUNK (8192) boundary: the < 2-chunk guard path, an exact chunk,
-        // a one-over partial, and several full chunks + a non-mult-of-8 tail.
-        for &n in &[1usize, 8, 8191, 8192, 8193, 3 * 8192 + 13] {
-            let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.013 - 0.5).collect();
-            let ys: Vec<f32> = (0..n).map(|i| (i % 53) as f32 * 0.017 - 0.3).collect();
-            let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
-            let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
-            let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
-            let yf16: Vec<u16> = ys.iter().map(|&v| f16_bits(v)).collect();
-            let nn = n as i64;
-            // SAFETY: the half inputs and outputs are sized n for the axpby family.
-            unsafe {
-                assert_eq!(
-                    wukong_sum_bf16_parallel(xbf.as_ptr(), nn).to_bits(),
-                    seq_chunked(&xbf, &xbf, RED_SUM, false).to_bits(),
-                    "sum_bf16 n={n}"
-                );
-                assert_eq!(
-                    wukong_sum_f16_parallel(xf16.as_ptr(), nn).to_bits(),
-                    seq_chunked(&xf16, &xf16, RED_SUM, true).to_bits(),
-                    "sum_f16 n={n}"
-                );
-                assert_eq!(
-                    wukong_dot_bf16_parallel(xbf.as_ptr(), ybf.as_ptr(), nn).to_bits(),
-                    seq_chunked(&xbf, &ybf, RED_DOT, false).to_bits(),
-                    "dot_bf16 n={n}"
-                );
-                assert_eq!(
-                    wukong_dot_f16_parallel(xf16.as_ptr(), yf16.as_ptr(), nn).to_bits(),
-                    seq_chunked(&xf16, &yf16, RED_DOT, true).to_bits(),
-                    "dot_f16 n={n}"
-                );
-                for &op in &[RED_MAX, RED_MIN, RED_MAXABS] {
-                    let gb = wukong_reduce_bf16_parallel(xbf.as_ptr(), nn, op);
-                    assert_eq!(
-                        gb.to_bits(),
-                        seq_chunked(&xbf, &xbf, op, false).to_bits(),
-                        "reduce_bf16 op={op} n={n}"
-                    );
-                    // Determinism: a second call returns the identical bits.
-                    assert_eq!(
-                        gb.to_bits(),
-                        wukong_reduce_bf16_parallel(xbf.as_ptr(), nn, op).to_bits(),
-                        "reduce_bf16 nondeterministic op={op} n={n}"
-                    );
-                    let gf = wukong_reduce_f16_parallel(xf16.as_ptr(), nn, op);
-                    assert_eq!(
-                        gf.to_bits(),
-                        seq_chunked(&xf16, &xf16, op, true).to_bits(),
-                        "reduce_f16 op={op} n={n}"
-                    );
+    fn lowp_parallel_is_the_f32_tree_of_the_widened_values() {
+        use crate::reduce::{
+            wukong_sreduce_f32, RCHUNK, RED_DOT, RED_MAX, RED_MAXABS, RED_MIN, RED_SUM,
+        };
+        for &n in &[
+            0usize,
+            1,
+            7,
+            8,
+            9,
+            63,
+            64,
+            65,
+            129,
+            211,
+            RCHUNK - 1,
+            RCHUNK,
+            RCHUNK + 1,
+            3 * RCHUNK + 13,
+        ] {
+            for special in [false, true] {
+                let mut xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.013 - 0.5).collect();
+                let ys: Vec<f32> = (0..n).map(|i| (i % 53) as f32 * 0.017 - 0.3).collect();
+                if special {
+                    for (k, v) in xs.iter_mut().enumerate() {
+                        match k % 29 {
+                            3 => *v = -0.0,
+                            11 => *v = 0.0,
+                            17 if k % 3 == 0 => *v = f32::NAN,
+                            23 => *v = f32::NEG_INFINITY,
+                            _ => {}
+                        }
+                    }
+                }
+                for is_f16 in [false, true] {
+                    let bits = |v: &[f32]| -> Vec<u16> {
+                        v.iter()
+                            .map(|&f| if is_f16 { f16_bits(f) } else { bf16_bits(f) })
+                            .collect()
+                    };
+                    let (xb, yb) = (bits(&xs), bits(&ys));
+                    let widen = |b: &[u16]| -> Vec<f32> {
+                        b.iter()
+                            .map(|&h| {
+                                if is_f16 {
+                                    f16_to_f32(h)
+                                } else {
+                                    bf16_bits_to_f32(h)
+                                }
+                            })
+                            .collect()
+                    };
+                    let (xw, yw) = (widen(&xb), widen(&yb));
+                    let nn = n as i64;
+                    // SAFETY: every buffer holds n elements.
+                    unsafe {
+                        let f32_tree = |y: &[f32], op| {
+                            wukong_sreduce_f32(xw.as_ptr(), y.as_ptr(), nn, op).to_bits()
+                        };
+                        let (sum, dot) = if is_f16 {
+                            (
+                                wukong_sum_f16_parallel(xb.as_ptr(), nn),
+                                wukong_dot_f16_parallel(xb.as_ptr(), yb.as_ptr(), nn),
+                            )
+                        } else {
+                            (
+                                wukong_sum_bf16_parallel(xb.as_ptr(), nn),
+                                wukong_dot_bf16_parallel(xb.as_ptr(), yb.as_ptr(), nn),
+                            )
+                        };
+                        let tag = if is_f16 { "f16" } else { "bf16" };
+                        assert_eq!(
+                            sum.to_bits(),
+                            f32_tree(&xw, RED_SUM),
+                            "{tag} sum n={n} special={special}"
+                        );
+                        assert_eq!(
+                            dot.to_bits(),
+                            f32_tree(&yw, RED_DOT),
+                            "{tag} dot n={n} special={special}"
+                        );
+                        for &op in &[RED_MAX, RED_MIN, RED_MAXABS] {
+                            let got = if is_f16 {
+                                wukong_reduce_f16_parallel(xb.as_ptr(), nn, op)
+                            } else {
+                                wukong_reduce_bf16_parallel(xb.as_ptr(), nn, op)
+                            };
+                            assert_eq!(
+                                got.to_bits(),
+                                f32_tree(&xw, op),
+                                "{tag} reduce op={op} n={n} special={special}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2868,7 +2766,7 @@ mod tests {
 
     #[test]
     fn parallel_reductions_fork_on_the_unified_pool() {
-        // `par_chunk_reduce` can be a process's FIRST rayon touch (a bf16 model whose first parallel
+        // `reduce::chunk_tree` (every `_parallel` half reduction's driver) can be a process's FIRST rayon touch (a bf16 model whose first parallel
         // op is a reduction). Forking `into_par_iter()` straight from there builds rayon's DEFAULT
         // global registry — 2 MiB worker stacks — and the runtime's later `ensure_global_pool()` then
         // loses the race silently (`build_global` → GlobalPoolAlreadyInitialized, discarded at
@@ -2885,21 +2783,16 @@ mod tests {
         let want = crate::wuk_pool_width();
         let n = 4 * crate::reduce::RCHUNK + 7;
         let seen = std::sync::Mutex::new(std::collections::BTreeSet::new());
-        let got = par_chunk_reduce(
-            n,
-            0.0,
-            |lo, hi| {
-                seen.lock().unwrap().insert(rayon::current_num_threads());
-                (hi - lo) as f32
-            },
-            |a, b| a + b,
-        );
+        let got = crate::reduce::chunk_tree(n, crate::reduce::RED_SUM, true, |lo, hi| {
+            seen.lock().unwrap().insert(rayon::current_num_threads());
+            (hi - lo) as f32
+        });
         // Every chunk ran exactly once (so the widths below are the whole story, not a sample).
         assert_eq!(got, n as f32, "chunk coverage");
         assert_eq!(
             seen.into_inner().unwrap(),
             std::collections::BTreeSet::from([want]),
-            "par_chunk_reduce forked off the unified kernel pool (width {want})"
+            "chunk_tree forked off the unified kernel pool (width {want})"
         );
     }
 
@@ -2912,8 +2805,9 @@ mod tests {
         // would hang rather than fail, so pin it explicitly.
         let n = 4 * crate::reduce::RCHUNK + 7;
         let flat = |lo: usize, hi: usize| (hi - lo) as f32;
-        let outer = par_chunk_reduce(n, 0.0, flat, |a, b| a + b);
-        let inner = crate::run_on_wuk_pool(|| par_chunk_reduce(n, 0.0, flat, |a, b| a + b));
+        let sum = crate::reduce::RED_SUM;
+        let outer = crate::reduce::chunk_tree(n, sum, true, flat);
+        let inner = crate::run_on_wuk_pool(|| crate::reduce::chunk_tree(n, sum, true, flat));
         assert_eq!(outer.to_bits(), inner.to_bits(), "nested != top-level");
         assert_eq!(outer, n as f32, "chunk coverage");
     }

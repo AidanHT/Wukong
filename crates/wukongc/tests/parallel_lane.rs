@@ -44,6 +44,20 @@
 //! The set of programs is read from `tests/recognizer-census.txt`, which `recognizer_census.rs`
 //! holds byte-identical to what the compiler emits, so this lane cannot drift from the real
 //! dispatch surface without that gate failing first.
+//!
+//! ## The `@parallel` reduction order (P13.7)
+//!
+//! A `@parallel` `f32` reduction loop on its own has one value whichever way it runs: the multicore
+//! kernel, its serial twin, or the compiler's chunk-buffer lowering of a spelling no kernel matches.
+//! (A reduction that is the inner loop of a nest a multi-loop kernel takes — a matmul, a column
+//! reduction, a norm — has that kernel's order when it fires; the language guide documents it, and
+//! this sweep does not cover it.)
+//! [`parallel_reductions_do_not_depend_on_threads_backend_or_recognition`] runs the programs that
+//! spell one reduction several ways ([`REDUCTION_ORDER_PROGRAMS`]) on the interpreter and native at
+//! `-O0` and `-O2`, on 1, 2, 3 and 8 runtime threads (`WUKONG_NUM_THREADS`), with recognition off
+//! (`WUKONG_NO_RECOGNIZE=1`, which sends even the kernel shape through the chunk-buffer lowering)
+//! and with the fork gates forced open, and requires one output from all of them. Each program's
+//! own EXPECT-OUT lines pin that output to the hand-evaluated tree.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -198,8 +212,16 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// A run's exit code, stdout and stderr.
+type RunOutput = (Option<i32>, String, String);
+
 /// One `--run -O2` of `path` on `backend`, with `env` on top of a scrubbed environment.
-fn run(path: &Path, backend: &str, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+fn run(path: &Path, backend: &str, env: &[(&str, &str)]) -> RunOutput {
+    run_at(path, backend, "-O2", env)
+}
+
+/// One `--run` of `path` at `opt` on `backend`, with `env` on top of a scrubbed environment.
+fn run_at(path: &Path, backend: &str, opt: &str, env: &[(&str, &str)]) -> RunOutput {
     let dir = scratch();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
     for k in AMBIENT {
@@ -209,7 +231,7 @@ fn run(path: &Path, backend: &str, env: &[(&str, &str)]) -> (Option<i32>, String
         cmd.env(k, v);
     }
     let out = cmd
-        .args(["--run", "-O2", &format!("--backend={backend}")])
+        .args(["--run", opt, &format!("--backend={backend}")])
         .arg(path)
         .current_dir(&dir)
         .output()
@@ -358,5 +380,74 @@ fn forced_parallel_native_matches_default_native_and_the_interpreter() {
          interpreter, native (default gates) and native (gates forced open): all identical",
         programs.len(),
         kernels.len()
+    );
+}
+
+/// The programs that spell one `@parallel` reduction several ways (kernel shape, `..=`, `step`, a
+/// shifted index, `@generic`, a region body, the uncast half spelling, ...) and print each result's
+/// bits. See the module docs, "The `@parallel` reduction order".
+const REDUCTION_ORDER_PROGRAMS: &[&str] =
+    &["parallel_reduce_order.wk", "parallel_reduce_order_lowp.wk"];
+
+/// Every column of one reduction-order program, against the interpreter at `-O0`.
+fn reduction_order_columns(name: &str) -> Result<usize, String> {
+    let path = run_dir().join(name);
+    let reference = run_at(&path, "interp", "-O0", &[]);
+    if reference.0 != Some(0) || reference.1.is_empty() {
+        return Err(format!(
+            "{name}: the interpreter reference run failed: {:?} {:?}\n{}",
+            reference.0, reference.1, reference.2
+        ));
+    }
+    let mut columns: Vec<(String, RunOutput)> = Vec::new();
+    for opt in ["-O0", "-O2"] {
+        for threads in ["1", "2", "3", "8"] {
+            columns.push((
+                format!("native {opt} WUKONG_NUM_THREADS={threads}"),
+                run_at(&path, "native", opt, &[("WUKONG_NUM_THREADS", threads)]),
+            ));
+        }
+        for backend in ["interp", "native"] {
+            columns.push((
+                format!("{backend} {opt} WUKONG_NO_RECOGNIZE=1"),
+                run_at(&path, backend, opt, &[("WUKONG_NO_RECOGNIZE", "1")]),
+            ));
+        }
+    }
+    columns.push((
+        "native -O2 with the fork gates forced open".to_string(),
+        run_at(&path, "native", "-O2", FORCE_PARALLEL),
+    ));
+    for (label, got) in &columns {
+        if got.0 != reference.0 || got.1 != reference.1 {
+            return Err(format!(
+                "{name}: {label} differs from the interpreter at -O0 -- a `@parallel` reduction \
+                 whose value depends on how it ran\n    interp -O0 = {:?} {:?}\n    {label} = \
+                 {:?} {:?}\n    stderr: {}",
+                reference.0, reference.1, got.0, got.1, got.2
+            ));
+        }
+    }
+    Ok(columns.len())
+}
+
+#[test]
+fn parallel_reductions_do_not_depend_on_threads_backend_or_recognition() {
+    let results: Vec<Result<usize, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = REDUCTION_ORDER_PROGRAMS
+            .iter()
+            .map(|name| s.spawn(move || reduction_order_columns(name)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("reduction-order worker panicked"))
+            .collect()
+    });
+    let failures: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+    let columns: usize = results.iter().filter_map(|r| r.as_ref().ok()).sum();
+    eprintln!(
+        "reduction order: {} program(s), {columns} column(s) against the interpreter: all identical",
+        REDUCTION_ORDER_PROGRAMS.len()
     );
 }

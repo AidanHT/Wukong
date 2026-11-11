@@ -181,22 +181,88 @@ pub(crate) fn hcombine8(a: [f32; 8], op: i64) -> f32 {
     )
 }
 
-/// Reduce `x[lo..hi]` (and `y[lo..hi]` for the binary ops) to a scalar partial. Pure function of its
-/// chunk, so it returns the same bits no matter which thread (or the serial loop) calls it.
-///
-/// # Safety
-/// `x` and `y` must be valid for reads on `[lo, hi)`.
-#[inline]
-unsafe fn reduce_chunk(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if crate::isa::avx2() && crate::isa::fma() {
-            // SAFETY: features detected; range validity is the caller's contract.
-            return unsafe { reduce_chunk_avx2(x, y, lo, hi, op) };
-        }
+/// An element type the reduction tree reads: `f32` itself, or a stored half (`bf16`/`f16` bits)
+/// that is **widened exactly** to the `f32` the tree folds. The tree — chunks, partition, combine —
+/// is the same for every element type; only the load differs, so a `bf16`/`f16` reduction is
+/// bit-for-bit the `f32` reduction of its widened values (`lowp_parallel_is_the_f32_tree_of_the_
+/// widened_values` pins that). This is what lets one documented order be *the* `@parallel`
+/// reduction order, whatever the element type and whichever entry ran it (P13.7).
+pub(crate) trait TreeElem: Copy + Send + Sync + 'static {
+    /// The exact `f32` value of one stored element (the scalar twin's load).
+    fn widen(self) -> f32;
+    /// Reduce `x[lo..hi]` (and `y[lo..hi]` for the binary ops) to the chunk partial, on the best
+    /// ISA path available; every path returns the scalar twin's bits.
+    ///
+    /// # Safety
+    /// `x` and `y` must be valid for reads on `[lo, hi)`.
+    unsafe fn reduce_chunk(x: *const Self, y: *const Self, lo: usize, hi: usize, op: i64) -> f32;
+}
+
+impl TreeElem for f32 {
+    #[inline(always)]
+    fn widen(self) -> f32 {
+        self
     }
-    // SAFETY: range validity is the caller's contract.
-    unsafe { reduce_chunk_scalar(x, y, lo, hi, op) }
+    #[inline]
+    unsafe fn reduce_chunk(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::isa::avx2() && crate::isa::fma() {
+                // SAFETY: features detected; range validity is the caller's contract.
+                return unsafe { reduce_chunk_avx2(x, y, lo, hi, op) };
+            }
+        }
+        // SAFETY: range validity is the caller's contract.
+        unsafe { reduce_chunk_scalar(x, y, lo, hi, op) }
+    }
+}
+
+/// A stored `bf16` (its 16 bits). Widened by the lossless `<< 16` bit extend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct Bf16(pub u16);
+
+impl TreeElem for Bf16 {
+    #[inline(always)]
+    fn widen(self) -> f32 {
+        crate::bf16_bits_to_f32(self.0)
+    }
+    #[inline]
+    unsafe fn reduce_chunk(x: *const Bf16, y: *const Bf16, lo: usize, hi: usize, op: i64) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::isa::avx2() && crate::isa::fma() {
+                // SAFETY: features detected; range validity is the caller's contract.
+                return unsafe { reduce_chunk_bf16_avx2(x, y, lo, hi, op) };
+            }
+        }
+        // SAFETY: range validity is the caller's contract.
+        unsafe { reduce_chunk_scalar_t(x, y, lo, hi, op) }
+    }
+}
+
+/// A stored IEEE `f16` (its 16 bits). Widened exactly (`vcvtph2ps` / [`crate::f16_bits_to_f32`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct F16(pub u16);
+
+impl TreeElem for F16 {
+    #[inline(always)]
+    fn widen(self) -> f32 {
+        crate::f16_bits_to_f32(self.0)
+    }
+    #[inline]
+    unsafe fn reduce_chunk(x: *const F16, y: *const F16, lo: usize, hi: usize, op: i64) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::isa::avx2() && crate::isa::fma() && crate::isa::f16c() {
+                // SAFETY: features detected; range validity is the caller's contract.
+                return unsafe { reduce_chunk_f16_avx2(x, y, lo, hi, op) };
+            }
+        }
+        // SAFETY: range validity is the caller's contract.
+        unsafe { reduce_chunk_scalar_t(x, y, lo, hi, op) }
+    }
 }
 
 /// The fixed halving tree over the `RUNROLL` accumulator vectors: `acc[t] = fold2(acc[t + h], acc[t])`
@@ -228,6 +294,27 @@ fn combine_tree(acc: &mut [[f32; 8]; RUNROLL], op: i64) {
 /// # Safety
 /// `x`/`y` valid on `[lo, hi)`.
 unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
+    // SAFETY: forwarded contract.
+    unsafe { reduce_chunk_scalar_t(x, y, lo, hi, op) }
+}
+
+/// [`reduce_chunk_scalar`] over any [`TreeElem`]: every element is widened exactly at its load and
+/// then folded by the identical partition, so a half chunk is the `f32` chunk of its widened values.
+///
+/// # Safety
+/// `x`/`y` valid on `[lo, hi)`.
+#[inline]
+unsafe fn reduce_chunk_scalar_t<T: TreeElem>(
+    x: *const T,
+    y: *const T,
+    lo: usize,
+    hi: usize,
+    op: i64,
+) -> f32 {
+    // SAFETY: every index the walk below passes is in [lo, hi), valid by the caller's contract.
+    let xs = |k: usize| unsafe { *x.add(k) }.widen();
+    // SAFETY: as above, for `y`.
+    let ys = |k: usize| unsafe { *y.add(k) }.widen();
     let mut acc = [[ident(op); 8]; RUNROLL];
     let mut i = lo;
     // Blocked body: element `i + 8t + j` folds into accumulator `t`, lane `j`.
@@ -235,8 +322,7 @@ unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize
         for (t, at) in acc.iter_mut().enumerate() {
             for (j, a) in at.iter_mut().enumerate() {
                 let k = i + 8 * t + j;
-                // SAFETY: k < i + RBLOCK <= hi.
-                *a = contrib(*a, unsafe { *x.add(k) }, unsafe { *y.add(k) }, op);
+                *a = contrib(*a, xs(k), ys(k), op);
             }
         }
         i += RBLOCK;
@@ -244,8 +330,7 @@ unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize
     // `< RBLOCK` remainder, whole 8-element steps, all into accumulator 0.
     while i + 8 <= hi {
         for (j, a) in acc[0].iter_mut().enumerate() {
-            // SAFETY: i + j < i + 8 <= hi.
-            *a = contrib(*a, unsafe { *x.add(i + j) }, unsafe { *y.add(i + j) }, op);
+            *a = contrib(*a, xs(i + j), ys(i + j), op);
         }
         i += 8;
     }
@@ -253,116 +338,242 @@ unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize
     // Tail (< 8 elements) folds into lanes 0.. in order — identical to the AVX2 store-then-tail.
     let mut lanes = acc[0];
     for (j, a) in lanes.iter_mut().enumerate().take(hi - i) {
-        // SAFETY: i + j < hi.
-        *a = contrib(*a, unsafe { *x.add(i + j) }, unsafe { *y.add(i + j) }, op);
+        *a = contrib(*a, xs(i + j), ys(i + j), op);
     }
     hcombine8(lanes, op)
 }
 
-/// AVX2 chunk reduce: dispatch once on `op` to the monomorphized body, so the per-step op `match`
-/// is a compile-time constant inside the loop. An unknown op runs the scalar twin, which folds
-/// nothing (`contrib`'s `_ => a`) and returns the identity combine — the same `0.0` the old in-loop
-/// `_ => acc` arm produced.
-///
-/// # Safety
-/// `x`/`y` valid on `[lo, hi)`; AVX2+FMA must be available.
+// Eight consecutive elements at `$p + $i`, widened exactly to an `__m256` — the AVX2 spelling of
+// `TreeElem::widen` for each element type. Macros, not `#[target_feature]` helpers, so each expands
+// inline in the kernel that uses it (a target-feature helper does not reliably inline on stable).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
-    match op {
-        RED_DOT => reduce_chunk_avx2_mono::<RED_DOT>(x, y, lo, hi),
-        RED_SSD => reduce_chunk_avx2_mono::<RED_SSD>(x, y, lo, hi),
-        RED_SUM => reduce_chunk_avx2_mono::<RED_SUM>(x, y, lo, hi),
-        RED_SUMSQ => reduce_chunk_avx2_mono::<RED_SUMSQ>(x, y, lo, hi),
-        RED_MAX => reduce_chunk_avx2_mono::<RED_MAX>(x, y, lo, hi),
-        RED_MIN => reduce_chunk_avx2_mono::<RED_MIN>(x, y, lo, hi),
-        RED_MAXABS => reduce_chunk_avx2_mono::<RED_MAXABS>(x, y, lo, hi),
-        RED_SUMABS => reduce_chunk_avx2_mono::<RED_SUMABS>(x, y, lo, hi),
-        RED_ABSDIFF => reduce_chunk_avx2_mono::<RED_ABSDIFF>(x, y, lo, hi),
-        _ => reduce_chunk_scalar(x, y, lo, hi, op),
-    }
+macro_rules! load8_f32 {
+    ($p:expr, $i:expr) => {
+        _mm256_loadu_ps(($p as *const f32).add($i))
+    };
+}
+// The lossless bf16 widen: zero-extend 8 x u16 to 8 x u32, shift the bits into the f32 high half.
+#[cfg(target_arch = "x86_64")]
+macro_rules! load8_bf16 {
+    ($p:expr, $i:expr) => {
+        _mm256_castsi256_ps(_mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(($p as *const u16).add($i) as *const __m128i)),
+            16,
+        ))
+    };
+}
+// The exact F16C widen (`vcvtph2ps`), the same instruction the f16 kernels in `lowp.rs` use.
+#[cfg(target_arch = "x86_64")]
+macro_rules! load8_f16 {
+    ($p:expr, $i:expr) => {
+        _mm256_cvtph_ps(_mm_loadu_si128(($p as *const u16).add($i) as *const __m128i))
+    };
 }
 
-/// The AVX2 chunk reduce for one op, `RUNROLL` independent `__m256` chains over the module header's
-/// partition, then the same tree, tail and horizontal combine as [`reduce_chunk_scalar`] — so the two
-/// are bit-identical.
+/// Define one element type's AVX2 chunk reducer: `$dispatch` matches the op once and calls the
+/// monomorphized `$mono::<OP>`, whose body is `RUNROLL` independent `__m256` chains over the module
+/// header's partition, then the same halving tree, tail and horizontal combine as
+/// [`reduce_chunk_scalar_t`] — so every element type's AVX2 path is bit-identical to its twin, and
+/// the only difference between element types is the `$load` widen. An unknown op runs the scalar
+/// twin, which folds nothing (`contrib`'s `_ => a`) and returns the identity combine.
+#[cfg(target_arch = "x86_64")]
+macro_rules! avx2_chunk_reducer {
+    ($dispatch:ident, $mono:ident, $T:ty, $feat:literal, $load:ident) => {
+        /// AVX2 chunk reduce (see `avx2_chunk_reducer!`).
+        ///
+        /// # Safety
+        /// `x`/`y` valid on `[lo, hi)`; the enabled target features must be available.
+        #[target_feature(enable = $feat)]
+        unsafe fn $dispatch(x: *const $T, y: *const $T, lo: usize, hi: usize, op: i64) -> f32 {
+            match op {
+                RED_DOT => $mono::<RED_DOT>(x, y, lo, hi),
+                RED_SSD => $mono::<RED_SSD>(x, y, lo, hi),
+                RED_SUM => $mono::<RED_SUM>(x, y, lo, hi),
+                RED_SUMSQ => $mono::<RED_SUMSQ>(x, y, lo, hi),
+                RED_MAX => $mono::<RED_MAX>(x, y, lo, hi),
+                RED_MIN => $mono::<RED_MIN>(x, y, lo, hi),
+                RED_MAXABS => $mono::<RED_MAXABS>(x, y, lo, hi),
+                RED_SUMABS => $mono::<RED_SUMABS>(x, y, lo, hi),
+                RED_ABSDIFF => $mono::<RED_ABSDIFF>(x, y, lo, hi),
+                _ => reduce_chunk_scalar_t(x, y, lo, hi, op),
+            }
+        }
+
+        /// The AVX2 chunk reduce for one op (see `avx2_chunk_reducer!`).
+        ///
+        /// # Safety
+        /// `x`/`y` valid on `[lo, hi)`; the enabled target features must be available.
+        #[target_feature(enable = $feat)]
+        unsafe fn $mono<const OP: i64>(x: *const $T, y: *const $T, lo: usize, hi: usize) -> f32 {
+            use std::arch::x86_64::*;
+            let neg0 = _mm256_set1_ps(-0.0);
+            // One element-block's contribution folded into `$acc` — the lane op `contrib` mirrors
+            // (mul_add↔fmadd, `(a > xi) ? a : xi`↔`max_ps(acc, xv)`, `f32::abs`↔`andnot(-0.0, v)`).
+            // A macro, not a `#[target_feature]` helper, so it is guaranteed to expand inline.
+            macro_rules! step {
+                ($acc:expr, $i:expr) => {{
+                    let i = $i;
+                    let xv = $load!(x, i);
+                    match OP {
+                        RED_DOT => _mm256_fmadd_ps(xv, $load!(y, i), $acc),
+                        RED_SSD => {
+                            let d = _mm256_sub_ps(xv, $load!(y, i));
+                            _mm256_fmadd_ps(d, d, $acc)
+                        }
+                        RED_SUM => _mm256_add_ps(xv, $acc),
+                        RED_SUMSQ => _mm256_fmadd_ps(xv, xv, $acc),
+                        RED_MAX => _mm256_max_ps($acc, xv),
+                        RED_MIN => _mm256_min_ps($acc, xv),
+                        RED_MAXABS => _mm256_max_ps($acc, _mm256_andnot_ps(neg0, xv)),
+                        RED_SUMABS => _mm256_add_ps($acc, _mm256_andnot_ps(neg0, xv)),
+                        RED_ABSDIFF => {
+                            let d = _mm256_sub_ps(xv, $load!(y, i));
+                            _mm256_add_ps($acc, _mm256_andnot_ps(neg0, d))
+                        }
+                        _ => $acc,
+                    }
+                }};
+            }
+            // `set1(ident)` is `setzero` for the additive ops (+0.0 = all-zero bits), ∓∞ for max/min.
+            let mut acc = [_mm256_set1_ps(ident(OP)); RUNROLL];
+            let mut i = lo;
+            while i + RBLOCK <= hi {
+                for (t, at) in acc.iter_mut().enumerate() {
+                    *at = step!(*at, i + 8 * t);
+                }
+                i += RBLOCK;
+            }
+            while i + 8 <= hi {
+                acc[0] = step!(acc[0], i);
+                i += 8;
+            }
+            // The halving tree, `fold2(acc[t + h], acc[t])` lane-wise (see `combine_tree`).
+            let mut w = RUNROLL;
+            while w > 1 {
+                let h = w / 2;
+                for t in 0..h {
+                    acc[t] = match OP {
+                        RED_MAX | RED_MAXABS => _mm256_max_ps(acc[t + h], acc[t]),
+                        RED_MIN => _mm256_min_ps(acc[t + h], acc[t]),
+                        _ => _mm256_add_ps(acc[t + h], acc[t]),
+                    };
+                }
+                w = h;
+            }
+            let mut lanes = [ident(OP); 8];
+            _mm256_storeu_ps(lanes.as_mut_ptr(), acc[0]);
+            // Scalar tail into the same lanes, exactly as the twin.
+            for (j, a) in lanes.iter_mut().enumerate().take(hi - i) {
+                *a = contrib(*a, (*x.add(i + j)).widen(), (*y.add(i + j)).widen(), OP);
+            }
+            hcombine8(lanes, OP)
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+avx2_chunk_reducer!(
+    reduce_chunk_avx2,
+    reduce_chunk_avx2_mono,
+    f32,
+    "avx2,fma",
+    load8_f32
+);
+#[cfg(target_arch = "x86_64")]
+avx2_chunk_reducer!(
+    reduce_chunk_bf16_avx2,
+    reduce_chunk_bf16_avx2_mono,
+    Bf16,
+    "avx2,fma",
+    load8_bf16
+);
+#[cfg(target_arch = "x86_64")]
+avx2_chunk_reducer!(
+    reduce_chunk_f16_avx2,
+    reduce_chunk_f16_avx2_mono,
+    F16,
+    "avx2,fma,f16c",
+    load8_f16
+);
+
+/// Fold the chunk partials in ascending chunk order from the identity — the outer level of the
+/// tree, shared by every entry so serial, parallel and every element type fold identically.
+#[inline]
+fn fold_partials(partials: impl IntoIterator<Item = f32>, op: i64) -> f32 {
+    let mut acc = ident(op);
+    for p in partials {
+        acc = fold2(acc, p, op);
+    }
+    acc
+}
+
+/// **The reduction tree** over `[0, n)` for any element type: cut into fixed `RCHUNK` chunks, reduce
+/// each with [`TreeElem::reduce_chunk`], fold the partials ascending from the identity
+/// ([`fold_partials`]). With `parallel`, chunks are reduced on the unified kernel pool
+/// ([`chunk_tree`]); the partial of chunk `c` lands in slot `c` whatever ran it, so `parallel`
+/// changes the schedule and never a bit. An empty or negative `n` returns the identity.
 ///
 /// # Safety
-/// `x`/`y` valid on `[lo, hi)`; AVX2+FMA must be available.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn reduce_chunk_avx2_mono<const OP: i64>(
-    x: *const f32,
-    y: *const f32,
-    lo: usize,
-    hi: usize,
+/// `x` and `y` must each be valid for `n` elements.
+pub(crate) unsafe fn tree<T: TreeElem>(
+    x: *const T,
+    y: *const T,
+    n: i64,
+    op: i64,
+    parallel: bool,
 ) -> f32 {
-    use std::arch::x86_64::*;
-    let neg0 = _mm256_set1_ps(-0.0);
-    // One element-block's contribution folded into `$acc` — the lane op `contrib` mirrors
-    // (mul_add↔fmadd, `(a > xi) ? a : xi`↔`max_ps(acc, xv)`, `f32::abs`↔`andnot(-0.0, v)`). A macro,
-    // not a `#[target_feature]` helper, so it is guaranteed to expand inline in this loop.
-    macro_rules! step {
-        ($acc:expr, $i:expr) => {{
-            let i = $i;
-            let xv = _mm256_loadu_ps(x.add(i));
-            match OP {
-                RED_DOT => _mm256_fmadd_ps(xv, _mm256_loadu_ps(y.add(i)), $acc),
-                RED_SSD => {
-                    let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
-                    _mm256_fmadd_ps(d, d, $acc)
-                }
-                RED_SUM => _mm256_add_ps(xv, $acc),
-                RED_SUMSQ => _mm256_fmadd_ps(xv, xv, $acc),
-                RED_MAX => _mm256_max_ps($acc, xv),
-                RED_MIN => _mm256_min_ps($acc, xv),
-                RED_MAXABS => _mm256_max_ps($acc, _mm256_andnot_ps(neg0, xv)),
-                RED_SUMABS => _mm256_add_ps($acc, _mm256_andnot_ps(neg0, xv)),
-                RED_ABSDIFF => {
-                    let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
-                    _mm256_add_ps($acc, _mm256_andnot_ps(neg0, d))
-                }
-                _ => $acc,
-            }
-        }};
+    if n <= 0 {
+        return ident(op);
     }
-    // `set1(ident)` is `setzero` for the additive ops (+0.0 = all-zero bits), and ∓∞ for max/min.
-    let mut acc = [_mm256_set1_ps(ident(OP)); RUNROLL];
-    let mut i = lo;
-    while i + RBLOCK <= hi {
-        for (t, at) in acc.iter_mut().enumerate() {
-            *at = step!(*at, i + 8 * t);
-        }
-        i += RBLOCK;
+    // Raw pointers cross the rayon closure boundary as integers (same pattern as the parallel GEMM);
+    // every access is a disjoint read-only chunk.
+    let (xa, ya) = (x as usize, y as usize);
+    chunk_tree(n as usize, op, parallel, move |lo, hi| {
+        // SAFETY: [lo, hi) ⊆ [0, n); buffers valid for n by contract.
+        unsafe { T::reduce_chunk(xa as *const T, ya as *const T, lo, hi, op) }
+    })
+}
+
+/// The chunk driver under [`tree`]: `chunk(lo, hi)` for each fixed `RCHUNK` chunk of `[0, n)`,
+/// folded ascending from `ident(op)`. Serial when `parallel` is false, when there is one chunk, or
+/// when the pool is one wide (`RAYON_NUM_THREADS=1`) — the serial path never consults the pool, so a
+/// serial entry never builds it. Otherwise the chunks fork on the unified kernel pool
+/// (`run_on_wuk_pool`, which also runs inline when called from a worker of that pool, i.e. from an
+/// outlined region body) through `par::map_units` (rayon's indexed collect by default, the claim
+/// queue under `WUKONG_KERNEL_DYN=1`): either way partial `c` lands in slot `c`, so the fold is the
+/// same index-order fold.
+pub(crate) fn chunk_tree(
+    n: usize,
+    op: i64,
+    parallel: bool,
+    chunk: impl Fn(usize, usize) -> f32 + Sync + Send,
+) -> f32 {
+    let nchunks = n.div_ceil(RCHUNK);
+    let bounds = move |c: usize| (c * RCHUNK, ((c + 1) * RCHUNK).min(n));
+    if !parallel || nchunks < 2 || crate::wuk_pool_width() <= 1 {
+        return fold_partials(
+            (0..nchunks).map(|c| {
+                let (lo, hi) = bounds(c);
+                chunk(lo, hi)
+            }),
+            op,
+        );
     }
-    while i + 8 <= hi {
-        acc[0] = step!(acc[0], i);
-        i += 8;
-    }
-    // The halving tree, `fold2(acc[t + h], acc[t])` lane-wise (see `combine_tree`).
-    let mut w = RUNROLL;
-    while w > 1 {
-        let h = w / 2;
-        for t in 0..h {
-            acc[t] = match OP {
-                RED_MAX | RED_MAXABS => _mm256_max_ps(acc[t + h], acc[t]),
-                RED_MIN => _mm256_min_ps(acc[t + h], acc[t]),
-                _ => _mm256_add_ps(acc[t + h], acc[t]),
-            };
-        }
-        w = h;
-    }
-    let mut lanes = [ident(OP); 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc[0]);
-    // Scalar tail into the same lanes, exactly as the twin.
-    for (j, a) in lanes.iter_mut().enumerate().take(hi - i) {
-        *a = contrib(*a, *x.add(i + j), *y.add(i + j), OP);
-    }
-    hcombine8(lanes, OP)
+    let chunk = &chunk;
+    let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
+        crate::par::map_units(nchunks, |c| {
+            let (lo, hi) = bounds(c);
+            chunk(lo, hi)
+        })
+    });
+    fold_partials(partials, op)
 }
 
 /// `sum_i f(x[i], y[i])` for `i in 0..n` (serial). For `RED_SUM`/`RED_SUMSQ`, `y` is ignored (callers
-/// pass `y == x`). The chunk decomposition matches [`wukong_sreduce_f32_parallel`] exactly.
+/// pass `y == x`). The chunk decomposition matches [`wukong_sreduce_f32_parallel`] exactly — both are
+/// [`tree`] — so this is the **serial twin** of the parallel kernel: the interpreter calls it, an
+/// outlined `@parallel` region body calls it, and the compiler's materializing fallback for a
+/// `@parallel` reduction no kernel matches calls it once per chunk (P13.7).
 ///
 /// # Safety
 /// `x` and `y` must each be valid for `n` `f32` elements.
@@ -373,19 +584,8 @@ pub unsafe extern "C" fn wukong_sreduce_f32(x: *const f32, y: *const f32, n: i64
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(y, n);
-    if n <= 0 {
-        return ident(op);
-    }
-    let n = n as usize;
-    let nchunks = n.div_ceil(RCHUNK);
-    let mut acc = ident(op);
-    for c in 0..nchunks {
-        let lo = c * RCHUNK;
-        let hi = ((c + 1) * RCHUNK).min(n);
-        // SAFETY: [lo, hi) ⊆ [0, n); buffers valid for n by contract.
-        acc = fold2(acc, unsafe { reduce_chunk(x, y, lo, hi, op) }, op);
-    }
-    acc
+    // SAFETY: same contract.
+    unsafe { tree(x, y, n, op, false) }
 }
 
 /// Multicore `sum_i f(x[i], y[i])` — **bit-identical** to [`wukong_sreduce_f32`]. Each fixed chunk is
@@ -408,38 +608,8 @@ pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
     // P14.5: debug-build contract checks (the `# Safety` section above).
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(y, n);
-    if n <= 0 {
-        return ident(op);
-    }
-    let n = n as usize;
-    let nchunks = n.div_ceil(RCHUNK);
-    // One chunk, or a width-1 pool (RAYON_NUM_THREADS=1): nothing to parallelize — run the serial
-    // sibling (bit-identical: fixed chunks + ordered fold).
-    if nchunks < 2 || crate::wuk_pool_width() <= 1 {
-        // SAFETY: same contract.
-        return unsafe { wukong_sreduce_f32(x, y, n as i64, op) };
-    }
-    // Raw pointers cross the rayon closure boundary as integers (same pattern as the parallel GEMM);
-    // every access is a disjoint read-only chunk. Forks on the unified kernel pool
-    // (`run_on_wuk_pool`) — the fixed-`RCHUNK` decomposition and the ordered serial fold below are
-    // what make the result thread-count- and pool-independent.
-    let (xa, ya) = (x as usize, y as usize);
-    // The partial map is `par::map_units` (rayon's indexed collect by default, the claim queue under
-    // `WUKONG_KERNEL_DYN=1`): either way partial `c` lands in slot `c`, so the fold below is the
-    // same index-order fold.
-    let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
-        crate::par::map_units(nchunks, |c| {
-            let lo = c * RCHUNK;
-            let hi = ((c + 1) * RCHUNK).min(n);
-            // SAFETY: disjoint read-only chunk; pointers valid for n by contract.
-            unsafe { reduce_chunk(xa as *const f32, ya as *const f32, lo, hi, op) }
-        })
-    });
-    let mut acc = ident(op);
-    for p in partials {
-        acc = fold2(acc, p, op);
-    }
-    acc
+    // SAFETY: same contract.
+    unsafe { tree(x, y, n, op, true) }
 }
 
 // --- arg-reductions (argmax / argmin) -------------------------------------------------------------
@@ -762,10 +932,34 @@ mod tests {
         )
     }
 
+    /// Every length class the tree distinguishes: empty, sub-8, the 8-step remainder, the 64-element
+    /// block edges, one chunk short / exact / one over, several whole chunks, and odd multi-chunk
+    /// lengths with every remainder class at once.
+    const TREE_LENGTHS: [usize; 18] = [
+        0,
+        1,
+        7,
+        8,
+        9,
+        63,
+        64,
+        65,
+        211,
+        RCHUNK - 1,
+        RCHUNK,
+        RCHUNK + 1,
+        2 * RCHUNK,
+        2 * RCHUNK + 63,
+        3 * RCHUNK + 13,
+        5 * RCHUNK + 4097,
+        12_345,
+        100_003,
+    ];
+
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
-        // Sizes that exercise multiple chunks, a partial final chunk, and a non-multiple-of-8 tail.
-        for &n in &[1usize, 7, 8, 9, 8192, 8193, 3 * 8192 + 13, 100_003] {
+        // The serial twin and the multicore kernel, on every length class.
+        for n in TREE_LENGTHS {
             let (x, y) = fill(n);
             for &op in &OPS {
                 // For the unary ops the recognizer passes y == x; mirror that here.
@@ -866,6 +1060,144 @@ mod tests {
                         s.to_bits(),
                         v.to_bits(),
                         "scalar != avx2 n={n} case={case} op={op}: {s} vs {v}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The kernel's partials do not depend on which thread computed them or in what order: the
+    /// partials of `tree` are computed here on `t` plain OS threads (chunk `c` on thread `c % t`,
+    /// each thread walking its chunks in DESCENDING order, so completion order is scrambled) and
+    /// folded in slot order -- and must equal the serial twin bit for bit for every thread count.
+    /// `chunk_tree` and the `_parallel` entries are exactly this computation scheduled by rayon.
+    #[test]
+    fn tree_is_independent_of_thread_count_and_completion_order() {
+        for n in TREE_LENGTHS {
+            let (x, y) = fill(n);
+            for &op in &OPS {
+                let yp = if unary(op) { &x } else { &y };
+                // SAFETY: `x`/`yp` hold n f32.
+                let serial = unsafe { wukong_sreduce_f32(x.as_ptr(), yp.as_ptr(), n as i64, op) };
+                let nchunks = n.div_ceil(RCHUNK);
+                for t in [1usize, 2, 3, 5, 8, 16] {
+                    let slots: Vec<std::sync::OnceLock<f32>> =
+                        (0..nchunks).map(|_| std::sync::OnceLock::new()).collect();
+                    std::thread::scope(|sc| {
+                        for k in 0..t {
+                            let (x, yp, slots) = (&x, yp, &slots);
+                            sc.spawn(move || {
+                                for c in (0..nchunks).rev().filter(|c| c % t == k) {
+                                    let (lo, hi) = (c * RCHUNK, ((c + 1) * RCHUNK).min(n));
+                                    // SAFETY: [lo, hi) is inside [0, n).
+                                    let p = unsafe {
+                                        f32::reduce_chunk(x.as_ptr(), yp.as_ptr(), lo, hi, op)
+                                    };
+                                    slots[c].set(p).expect("each chunk runs once");
+                                }
+                            });
+                        }
+                    });
+                    let got = fold_partials(slots.into_iter().map(|s| s.into_inner().unwrap()), op);
+                    assert_eq!(
+                        got.to_bits(),
+                        serial.to_bits(),
+                        "n={n} op={op} threads={t}: {got} vs serial {serial}"
+                    );
+                }
+                // And the production driver, which forks whenever there are two chunks.
+                let got = chunk_tree(n, op, true, |lo, hi| {
+                    // SAFETY: [lo, hi) is inside [0, n).
+                    unsafe { f32::reduce_chunk(x.as_ptr(), yp.as_ptr(), lo, hi, op) }
+                });
+                assert_eq!(got.to_bits(), serial.to_bits(), "chunk_tree n={n} op={op}");
+            }
+        }
+    }
+
+    /// The tree as the language guide states it ("Reduction order", P13.7), spelled from that text
+    /// alone: fixed 8,192-element chunks; in a chunk, element `64b + 8t + j` of each whole 64-element
+    /// block into accumulator `t`, lane `j`; whole 8-element groups of the `< 64` remainder into
+    /// accumulator 0; `acc[t] = acc[t + h] (+) acc[t]` for `h = 4, 2, 1`; the `< 8` tail into lanes
+    /// `0..`; lanes as `((l0 (+) l1) (+) (l2 (+) l3)) (+) ((l4 (+) l5) (+) (l6 (+) l7))`; partials folded
+    /// ascending from the identity. `(+)` is `+`, or `a > b ? a : b` / `a < b ? a : b`; an element
+    /// contributes `fma(x, y, acc)` for the product forms. The kernel must be this, bit for bit.
+    // Index loops on purpose: this spells the documented positions, not an idiomatic walk.
+    #[allow(clippy::needless_range_loop)]
+    fn documented_tree(x: &[f32], y: &[f32], op: i64) -> f32 {
+        let g = |a: f32, b: f32| fold2(a, b, op);
+        let f = |a: f32, k: usize| contrib(a, x[k], y[k], op);
+        let mut total = ident(op);
+        let mut c0 = 0;
+        while c0 < x.len() {
+            let hi = (c0 + 8192).min(x.len());
+            let mut acc = [[ident(op); 8]; 8];
+            let mut i = c0;
+            while hi - i >= 64 {
+                for (t, at) in acc.iter_mut().enumerate() {
+                    for (j, a) in at.iter_mut().enumerate() {
+                        *a = f(*a, i + 8 * t + j);
+                    }
+                }
+                i += 64;
+            }
+            while hi - i >= 8 {
+                for j in 0..8 {
+                    acc[0][j] = f(acc[0][j], i + j);
+                }
+                i += 8;
+            }
+            for h in [4usize, 2, 1] {
+                for t in 0..h {
+                    for j in 0..8 {
+                        acc[t][j] = g(acc[t + h][j], acc[t][j]);
+                    }
+                }
+            }
+            for j in 0..hi - i {
+                acc[0][j] = f(acc[0][j], i + j);
+            }
+            let l = acc[0];
+            let partial = g(
+                g(g(l[0], l[1]), g(l[2], l[3])),
+                g(g(l[4], l[5]), g(l[6], l[7])),
+            );
+            total = g(total, partial);
+            c0 = hi;
+        }
+        total
+    }
+
+    #[test]
+    fn the_kernel_is_the_documented_tree() {
+        for n in TREE_LENGTHS {
+            let (mut x, y) = fill(n);
+            // Exceptional values in different chains, the remainder and the tail.
+            for (k, v) in x.iter_mut().enumerate() {
+                match k % 101 {
+                    5 => *v = -0.0,
+                    44 => *v = 0.0,
+                    77 if k % 2 == 0 => *v = f32::NAN,
+                    90 => *v = f32::INFINITY,
+                    _ => {}
+                }
+            }
+            for &op in &OPS {
+                let yp = if unary(op) { &x } else { &y };
+                let want = documented_tree(&x, yp, op);
+                for parallel in [false, true] {
+                    // SAFETY: `x`/`yp` hold n f32.
+                    let got = unsafe {
+                        if parallel {
+                            wukong_sreduce_f32_parallel(x.as_ptr(), yp.as_ptr(), n as i64, op)
+                        } else {
+                            wukong_sreduce_f32(x.as_ptr(), yp.as_ptr(), n as i64, op)
+                        }
+                    };
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "n={n} op={op} parallel={parallel}: {got} vs documented {want}"
                     );
                 }
             }

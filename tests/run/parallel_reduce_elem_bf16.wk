@@ -13,8 +13,11 @@ module tests.run.parallel_reduce_elem_bf16
 // marshal, printed 64).
 //
 // The cast spelling `acc + (x[k] as f32)` is the one that belongs on the half kernel and is gated by
-// tests/run/parallel_reduce_lowp.wk; this file pins the uncast form to the scalar loop. Run on the
-// native backend for the reason given in tests/run/scan_elem_lowp.wk.
+// tests/run/parallel_reduce_lowp.wk; this file pins the uncast form off the f32 kernel. It lowers
+// through the compiler's chunk-buffer form of the `@parallel` reduction tree instead (P13.7: the
+// addends are widened into an f32 buffer and handed to `wukong_sreduce_f32` per chunk), which gives
+// the cast spelling's bits (tests/run/parallel_reduce_order_lowp.wk). Run on the native backend for
+// the reason given in tests/run/scan_elem_lowp.wk.
 @parallel
 fn total(x: [bf16; 64]) -> f32 {
     let mut acc: f32 = 0.0;
